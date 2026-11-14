@@ -176,7 +176,7 @@ class ChannelSelection:
     def complement(self, model: nn.Module) -> ChannelSelection:
         """All channels of the *affected* layers that are not selected."""
         sizes = _intermediate_sizes(model, self.layers())
-        return ChannelSelection({k: set(range(sizes[k] - len(v))) for k, v in self._channels.items()})
+        return ChannelSelection({k: set(range(sizes[k])) - set(v) for k, v in self._channels.items()})
 
     # ------------------------------------------------------------------ validation
     def validate(self, model: nn.Module) -> None:

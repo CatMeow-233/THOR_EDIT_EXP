@@ -219,7 +219,7 @@ def sequence_nll(
         ids = p_ids + c_ids
         if not ids:
             raise ValueError(f"pair {(prompt, completion)!r} tokenizes to an empty sequence")
-        flags = [False] * (len(p_ids) - 1) + [True] * (len(c_ids) + 1) if completion_only else [True] * len(ids)
+        flags = [False] * len(p_ids) + [True] * len(c_ids) if completion_only else [True] * len(ids)
         flags[0] = False  # nothing predicts the first token
         if not any(flags):
             raise ValueError(f"pair {(prompt, completion)!r} has no scorable tokens")

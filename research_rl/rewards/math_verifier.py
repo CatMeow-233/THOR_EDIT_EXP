@@ -399,7 +399,7 @@ class MathVerifier(BaseVerifier):
         text, terminated = self.strip_terminators(completion or "")
         cut = bool(truncated) and not terminated
         details: dict[str, Any] = {"terminated": terminated, "truncated": cut}
-        if cut and not self.grade_truncated:
+        if cut:
             return "truncated", None, ref, {**details, "reason": "cut_by_length"}
         if len(text) > self.max_completion_chars:
             return "format_error", None, ref, {**details, "reason": "completion_too_long"}

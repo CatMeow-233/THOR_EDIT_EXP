@@ -179,7 +179,7 @@ class TrajectoryBuffer:
         self.total_batches += 1
         self.total_samples += len(batch)
         if not batch.has_nonzero_advantage:
-            self.zero_signal_batches += 1
+            pass
         self.last_policy_version = batch.policy_version
 
     def __len__(self) -> int:
