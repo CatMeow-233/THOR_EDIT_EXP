@@ -39,7 +39,7 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "B905", "SIM108"]
 
 [tool.mypy]
 python_version = "3.13"
-files = ["research_rl"]
+files = ["research_rl", "scripts/gpu", "examples"]
 ignore_missing_imports = true
 follow_imports = "silent"
 warn_unused_ignores = false

@@ -96,8 +96,20 @@ def main() -> int:
     checks["loss_finite"] = bool(torch.isfinite(loss).item())
     checks["mask_bit_exact_on_gpu"] = bool(torch.equal(frozen_before, w.detach()[w.shape[0] // 2 :]))
     checks["peak_memory_mib"] = round(torch.cuda.max_memory_allocated(dev) / 2**20, 2)
+    # 4. a real TRL step with MaskRule + P2PriorRule: Accelerate moves optimizer/rule state to the GPU
+    from research_rl.utils.smoke import trl_rules_smoke
+
+    trl = trl_rules_smoke(out.parent / "cuda_smoke_trl", steps=2, bf16=True)
+    checks["trl_rules"] = trl
     report["checks"] = checks
-    ok = checks["bf16_matmul_ok"] and checks["loss_finite"] and checks["mask_bit_exact_on_gpu"]
+    ok = (
+        checks["bf16_matmul_ok"]
+        and checks["loss_finite"]
+        and checks["mask_bit_exact_on_gpu"]
+        and trl["mask_bit_exact"]
+        and trl["p2_coefficients_moved"]
+        and trl["device"].startswith("cuda")
+    )
     report["status"] = "PASSED" if ok else "FAILED"
     report["measured_on"] = "cuda"
     out.write_text(json.dumps(report, indent=2))

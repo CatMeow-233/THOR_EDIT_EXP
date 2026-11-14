@@ -853,7 +853,9 @@ class P2PriorRule(UpdateRule):
         self.exp_avg_sq = state["exp_avg_sq"].detach().clone().float().cpu()
         self.step_count = int(state["step"])
         traj = state.get("trajectory")
-        self.trajectory = list(traj.unbind(0)) if isinstance(traj, torch.Tensor) and traj.numel() else []
+        self.trajectory = (
+            list(traj.detach().cpu().unbind(0)) if isinstance(traj, torch.Tensor) and traj.numel() else []
+        )
         self.nonfinite_skips = int(state.get("nonfinite_skips", 0))
         self._delta = None
 

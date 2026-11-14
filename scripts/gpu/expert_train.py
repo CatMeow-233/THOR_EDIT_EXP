@@ -71,7 +71,8 @@ def main(argv: list[str] | None = None) -> dict:
         run_name=f"{args.expert}-seed{args.seed}",
         seed=args.seed,
         output_dir=str(out_dir),
-        model=ModelSpec(name_or_path=model_path, dtype="bfloat16" if args.bf16 else "float32"),
+        # FP32 master weights + BF16 autocast (--bf16): AdamW updates on BF16 weights would be rounded away.
+        model=ModelSpec(name_or_path=model_path, dtype="float32"),
         data=DataSpec(name=args.dataset or "toy-arithmetic", split=args.split),
         trainer=TrainerSpec(
             algorithm="sft",

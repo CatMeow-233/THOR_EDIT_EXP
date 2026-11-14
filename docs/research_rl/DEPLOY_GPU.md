@@ -41,7 +41,7 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 Log in to Hugging Face only through the CLI / environment (never commit tokens):
 
 ```bash
-huggingface-cli login
+hf auth login
 ```
 
 Optional sanity check that the CPU suite passes on the host too:
