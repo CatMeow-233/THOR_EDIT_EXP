@@ -26,6 +26,7 @@ from typing import Any
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 from datasets import Dataset
+from transformers import GenerationConfig
 
 from research_rl.core.config import ExperimentConfig
 from research_rl.models.tiny import save_tiny_model
@@ -47,6 +48,20 @@ def arithmetic_dataset(n: int, seed: int) -> Dataset:
         question = f"What is {a}{op}{b}? Put the final answer in \\boxed{{}}."
         rows.append({"prompt": [{"role": "user", "content": question}], "answer": str(value)})
     return Dataset.from_list(rows)
+
+
+def eos_token_ids(exp: ExperimentConfig, tokenizer: Any) -> list[int]:
+    """EOS ids the way TRL collects them: the tokenizer's plus ``generation_config.eos_token_id``."""
+    ids = [tokenizer.eos_token_id]
+    try:
+        gen = GenerationConfig.from_pretrained(exp.model.name_or_path, revision=exp.model.revision)
+    except (OSError, ValueError):  # no generation_config.json: the tokenizer's EOS is all TRL uses as well
+        return ids
+    extra = gen.eos_token_id
+    for i in [extra] if isinstance(extra, int) else list(extra or []):
+        if i not in ids:
+            ids.append(int(i))
+    return ids
 
 
 def parse_args(argv: list[str] | None, algorithm: str) -> argparse.Namespace:
@@ -86,7 +101,9 @@ def main(argv: list[str] | None = None, algorithm: str = "grpo") -> dict[str, An
         exp.model.name_or_path = str(save_tiny_model(Path(exp.output_dir) / "tiny_model", seed=exp.seed))
 
     tokenizer = load_tokenizer(exp.model)
-    reward = as_trl_reward_func(MathVerifier(), answer_key="answer", eos_token_ids=[tokenizer.eos_token_id])
+    reward = as_trl_reward_func(
+        MathVerifier(), answer_key="answer", eos_token_ids=eos_token_ids(exp, tokenizer)
+    )
     dataset = arithmetic_dataset(int(exp.extra.get("num_train_examples", 64)), exp.seed)
 
     run = build_run(exp, train_dataset=dataset, processing_class=tokenizer, reward_funcs=[reward])

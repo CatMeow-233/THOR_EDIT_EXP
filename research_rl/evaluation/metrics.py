@@ -241,7 +241,7 @@ def sequence_nll(
             target_mask = torch.zeros(len(chunk), width, dtype=torch.bool)
             for row, (ids, flags) in enumerate(zip(chunk, flags_chunk)):
                 input_ids[row, : len(ids)] = torch.tensor(ids)
-                attention[row, : len(ids)] = 1
+                attention[row, :] = 1
                 target_mask[row, : len(ids)] = torch.tensor(flags)
             logits = model(input_ids=input_ids.to(device), attention_mask=attention.to(device)).logits
             logp = torch.log_softmax(logits[:, :-1].double(), dim=-1).cpu()

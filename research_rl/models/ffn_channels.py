@@ -222,7 +222,7 @@ def _intermediate_sizes(model: nn.Module, layers: Iterable[int]) -> dict[int, in
 def _rank_entries(
     entries: list[tuple[float, int, int]], k: int, *, per_layer: bool, largest: bool
 ) -> dict[int, list[int]]:
-    sign = -1.0 if largest else 1.0
+    sign = -1.0
     ordered = sorted(entries, key=lambda e: (sign * e[0], e[1], e[2]))
     out: dict[int, list[int]] = {}
     taken = 0

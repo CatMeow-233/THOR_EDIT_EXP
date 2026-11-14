@@ -270,3 +270,26 @@ def test_rloo_has_no_rollout_func_in_this_trl():
     from trl import RLOOTrainer
 
     assert "rollout_func" not in inspect.signature(RLOOTrainer.__init__).parameters
+
+
+def test_trajectory_log_unbatches_rows(tokenizer, tmp_path):
+    """RolloutBatch.trajectories(): prompt left-padding removed, rows/scores aligned with TRL's output."""
+    trainer = grpo_trainer(tokenizer, tmp_path, rollout_func=make_rollout(tokenizer, ROLLOUT_ROWS))
+    batch_inputs = inputs_for(len(ROLLOUT_ROWS))
+    out = trainer._generate_and_score_completions(batch_inputs)
+    logged = trainer.trajectory_buffer.latest()
+    assert logged is not None and len(trainer.trajectory_buffer) == 1
+    trajectories = logged.trajectories()
+    assert len(trajectories) == len(ROLLOUT_ROWS)
+    for i, traj in enumerate(trajectories):
+        assert traj.prompt_ids == tokenizer(batch_inputs[i]["prompt"], add_special_tokens=False)["input_ids"]
+        assert traj.completion_ids == out["completion_ids"][i].tolist()
+        assert traj.completion_mask == out["completion_mask"][i].tolist()
+        assert traj.num_loss_tokens == len(ROLLOUT_ROWS[i])
+        assert traj.reward == float(len(ROLLOUT_ROWS[i]))  # length_reward on the unpadded ids
+        assert traj.advantage == pytest.approx(float(out["advantages"][i]))
+        assert traj.policy_version == 0
+    stats = logged.stats()
+    assert stats["num_samples"] == 6 and stats["num_loss_tokens"] == sum(len(r) for r in ROLLOUT_ROWS)
+    assert stats["mean_reward"] == pytest.approx(sum(len(r) for r in ROLLOUT_ROWS) / 6)
+    assert int(out["policy_version"]) == 0

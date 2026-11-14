@@ -439,6 +439,28 @@ def test_alternating_windows_with_grad_accum_one(tokenizer, tmp_path, monkeypatc
 
 
 @pytest.mark.integration
+def test_num_iterations_reuses_generation_with_growing_lag(tokenizer, tmp_path, monkeypatch):
+    # num_iterations 2, steps_per_generation 2, grad_accum 1: one generation feeds 4 steps
+    # [varied, const, varied, const] -> apply, skip, apply, skip; lag counts updates since generation.
+    run, _ = window_run(
+        tokenizer,
+        tmp_path,
+        monkeypatch,
+        ["v0", "c1"],
+        ga=1,
+        spg=2,
+        max_steps=4,
+        run_name="d",
+        num_iterations=2,
+    )
+    run.train()
+    opt = run.hooked_optimizer
+    assert (opt.nominal_steps, opt.applied_updates, opt.skipped_steps) == (4, 2, 2)
+    assert run.trainer.trajectory_buffer.policy_versions() == [0]
+    assert lags(run) == [0, 1, 1, 2]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
 def test_constant_reward_skip_keeps_parameters_bit_identical(tokenizer, tmp_path, algorithm):
     results = {}

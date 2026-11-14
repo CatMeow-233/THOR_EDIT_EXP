@@ -256,7 +256,7 @@ class RolloutRecordCallback(TrainerCallback):
         self.buffer = buffer
 
     def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        self.recorder.record["rollout"] = self.buffer.counters()
+        self.recorder.set_extra("rollout", self.buffer.counters())
 
 
 class RLTrainerAdapter(TrainerAdapter):
@@ -284,6 +284,6 @@ class RLTrainerAdapter(TrainerAdapter):
         run = super().build(exp, **kwargs)
         run.info["is_reinforcement_learning"] = True
         if run.recorder is not None:
-            run.recorder.record["rollout"] = run.trainer.trajectory_buffer.counters()
+            run.recorder.set_extra("rollout", run.trainer.trajectory_buffer.counters())
             run.trainer.add_callback(RolloutRecordCallback(run.recorder, run.trainer.trajectory_buffer))
         return run
