@@ -74,8 +74,7 @@ class DistillationAdapter(TrainerAdapter):
         run = super().build(exp, **kwargs)
         teacher = getattr(run.trainer, "teacher_model", None)
         if run.recorder is not None and teacher is not None:
-            run.recorder.record["teacher_model"] = model_identity(
-                run.trainer.accelerator.unwrap_model(teacher)
+            run.recorder.set_extra(
+                "teacher_model", model_identity(run.trainer.accelerator.unwrap_model(teacher))
             )
-            run.recorder._flush()
         return run

@@ -90,10 +90,10 @@ class DPOAdapter(TrainerAdapter):
         run = super().build(exp, train_dataset=train_dataset, model=model, ref_model=ref_model, **kwargs)
         ref = getattr(run.trainer, "ref_model", None)
         if run.recorder is not None:
-            run.recorder.record["reference_model"] = (
+            run.recorder.set_extra(
+                "reference_model",
                 model_identity(run.trainer.accelerator.unwrap_model(ref))
                 if ref is not None
-                else "policy with PEFT adapters disabled"
+                else "policy with PEFT adapters disabled",
             )
-            run.recorder._flush()
         return run

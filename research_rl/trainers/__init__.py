@@ -20,13 +20,14 @@ from research_rl.trainers.base import (
     research_trainer_class,
 )
 
-ADAPTER_MODULES = (
-    "research_rl.trainers.sft_adapter",
-    "research_rl.trainers.dpo_adapter",
-    "research_rl.trainers.grpo_adapter",
-    "research_rl.trainers.rloo_adapter",
-    "research_rl.trainers.distillation_adapter",
-)
+BUILTIN_ADAPTERS = {
+    "sft": "research_rl.trainers.sft_adapter",
+    "dpo": "research_rl.trainers.dpo_adapter",
+    "grpo": "research_rl.trainers.grpo_adapter",
+    "rloo": "research_rl.trainers.rloo_adapter",
+    "distillation": "research_rl.trainers.distillation_adapter",
+}
+ADAPTER_MODULES = tuple(BUILTIN_ADAPTERS.values())
 
 
 def load_builtin_adapters() -> None:
@@ -35,8 +36,9 @@ def load_builtin_adapters() -> None:
 
 
 def get_adapter(algorithm: str) -> TrainerAdapter:
-    if algorithm not in TRAINERS:
-        load_builtin_adapters()
+    """Return the adapter for ``algorithm``; only the needed built-in module is imported."""
+    if algorithm not in TRAINERS and algorithm in BUILTIN_ADAPTERS:
+        importlib.import_module(BUILTIN_ADAPTERS[algorithm])
     adapter = TRAINERS.build(algorithm)
     assert isinstance(adapter, TrainerAdapter)
     return adapter

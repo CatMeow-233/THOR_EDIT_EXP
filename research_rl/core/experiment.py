@@ -136,6 +136,10 @@ class ExperimentRecorder:
             "algorithm": config.trainer.algorithm,
             "seed": config.seed,
             "config_version": config.config_version,
+            "config": config.to_dict(),
+            "config_sha256": hashlib.sha256(
+                json.dumps(_jsonable(config.to_dict()), sort_keys=True).encode()
+            ).hexdigest(),
             "status": "created",
             "created_unix": time.time(),
             "model": None,
@@ -190,6 +194,14 @@ class ExperimentRecorder:
             "skipped_steps": int(skipped),
             "global_step": int(global_step),
         }
+
+    def set_extra(self, key: str, value: Any) -> None:
+        """Store an algorithm-specific top-level field (e.g. reference/teacher model identity)."""
+        reserved = {"record_version", "study_id", "run_name", "config", "config_sha256", "steps", "hardware"}
+        if key in reserved:
+            raise KeyError(f"{key!r} is a reserved record field")
+        self.record[key] = _jsonable(value)
+        self._flush()
 
     def add_checkpoint(self, path: str | Path, step: int) -> None:
         entry = {"path": str(path), "global_step": int(step)}
