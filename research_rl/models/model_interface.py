@@ -117,5 +117,5 @@ def fingerprint(tensors: dict[str, torch.Tensor] | nn.Module, names: Iterable[st
         h.update(name.encode())
         h.update(str(tuple(t.shape)).encode())
         h.update(str(t.dtype).encode())
-        h.update(t.view(torch.uint8).numpy().tobytes() if t.numel() else b"")
+        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes() if t.numel() else b"")
     return h.hexdigest()

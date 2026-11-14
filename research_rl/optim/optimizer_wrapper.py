@@ -157,7 +157,10 @@ class HookedOptimizer(Optimizer):
                 rule.on_skip(ctx)
             return None
 
-        named = [(n, p) for n, p in self._named if p.requires_grad]
+        # Every optimised parameter, not only requires_grad=True ones: a parameter frozen via
+        # requires_grad=False that still holds a stale .grad would otherwise be moved by the inner
+        # optimizer behind the rules' back.
+        named = list(self._named)
         for rule in self.rules:
             if _overrides(rule, "post_grad"):
                 rule.post_grad(ctx, named)

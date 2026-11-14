@@ -349,3 +349,36 @@ def test_lr_scheduler_drives_inner_optimizer():
         sched.step()
     assert opt.inner.param_groups[0]["lr"] == pytest.approx(1e-2 * 0.5**3)
     assert opt.param_groups is opt.inner.param_groups
+
+
+def test_mask_covers_requires_grad_false_param_with_stale_grad():
+    """A param disabled via requires_grad=False but holding a stale grad must still obey the mask."""
+    model = make_model()
+    opt = HookedOptimizer(adamw(model), model.named_parameters())
+    backward(model, 0)
+    opt.step()  # warm moments everywhere
+    mask = first_layer_mask(model)
+    opt.add_rule(MaskRule(mask))
+    backward(model, 1)  # leaves grads on layer 0
+    model[0].weight.requires_grad_(False)  # disabled, stale grad still present
+    before = model[0].weight.detach().clone()
+    opt.step()
+    assert torch.equal(before[3:], model[0].weight.detach()[3:])
+
+
+def test_mask_state_is_digest_only_and_verified_on_resume():
+    model = make_model()
+    opt = HookedOptimizer(adamw(model), model.named_parameters(), [MaskRule(first_layer_mask(model))])
+    backward(model, 0)
+    opt.step()
+    buf = io.BytesIO()
+    torch.save(opt.state_dict(), buf)
+    rule_state = opt.state_dict()["research_rl"]["rules"]["0:mask"]
+    assert set(rule_state) == {"mask_sha256"}  # no full bool tensors in the checkpoint
+    buf.seek(0)
+    sd = torch.load(buf, weights_only=True)
+    other = first_layer_mask(model)
+    other.set("0.bias", torch.ones(8, dtype=torch.bool))  # a different mask
+    opt2 = HookedOptimizer(adamw(make_model()), make_model().named_parameters(), [MaskRule(other)])
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        opt2.load_state_dict(sd)

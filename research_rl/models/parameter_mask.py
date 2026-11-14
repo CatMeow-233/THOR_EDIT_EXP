@@ -50,9 +50,14 @@ class ParameterMask:
 
     # ----------------------------------------------------------------- algebra
     def union(self, other: ParameterMask) -> ParameterMask:
-        out = ParameterMask(self._masks)
-        for name, m in other.items():
-            out._masks[name] = out._masks[name] | m if name in out._masks else m
+        """Element may change if it may change in either mask.
+
+        A name missing from one operand is unconstrained there, so it is unconstrained (absent)
+        in the union as well — consistent with :meth:`intersection`.
+        """
+        out = ParameterMask()
+        for name in set(self._masks) & set(other._masks):
+            out._masks[name] = self._masks[name] | other._masks[name]
         return out
 
     def intersection(self, other: ParameterMask) -> ParameterMask:

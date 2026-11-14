@@ -104,9 +104,14 @@ class MaskRule(UpdateRule):
 
     name = "mask"
 
-    def __init__(self, mask: ParameterMask, *, mask_gradients: bool = True) -> None:
+    def __init__(
+        self, mask: ParameterMask, *, mask_gradients: bool = True, store_mask_in_checkpoint: bool = False
+    ) -> None:
         self.mask = mask
         self.mask_gradients = mask_gradients
+        # Full bool masks can be as large as the model (1 byte/element); by default only a SHA-256 of the
+        # mask is checkpointed and verified on resume (the caller re-creates the same mask).
+        self.store_mask_in_checkpoint = store_mask_in_checkpoint
         self._device_cache: dict[tuple[str, torch.device], torch.Tensor] = {}
 
     def _m(self, name: str, device: torch.device) -> torch.Tensor:
@@ -132,13 +137,27 @@ class MaskRule(UpdateRule):
     ) -> torch.Tensor | None:
         return torch.where(self._m(name, new.device), new, old)
 
+    def mask_digest(self) -> str:
+        from research_rl.models.model_interface import fingerprint
+
+        return fingerprint(self.mask.state_dict())
+
     def state_dict(self) -> dict[str, Any]:
-        return {"mask": self.mask.state_dict()}
+        state: dict[str, Any] = {"mask_sha256": self.mask_digest()}
+        if self.store_mask_in_checkpoint:
+            state["mask"] = self.mask.state_dict()
+        return state
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if "mask" in state:
             self.mask = ParameterMask.from_state_dict(state["mask"])
             self._device_cache.clear()
+        saved = state.get("mask_sha256")
+        if saved is not None and saved != self.mask_digest():
+            raise ValueError(
+                "MaskRule: the mask passed at resume differs from the one used when the checkpoint was "
+                "written (SHA-256 mismatch). Re-create the original mask or pass store_mask_in_checkpoint=True."
+            )
 
 
 @UPDATE_RULES.register("displacement_ledger")

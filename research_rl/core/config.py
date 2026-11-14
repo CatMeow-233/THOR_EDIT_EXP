@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,14 @@ _SUPPORTED_DTYPES = ("float32", "bfloat16", "float16", "auto")
 
 class ConfigError(ValueError):
     pass
+
+
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$")
+
+
+def _is_safe_path_component(value: str) -> bool:
+    """study_id / run_name become directory names: no separators, no '..', no leading dot."""
+    return bool(_SAFE_COMPONENT.match(value)) and ".." not in value
 
 
 @dataclass
@@ -85,8 +94,10 @@ class ExperimentConfig:
     config_version: str = CONFIG_VERSION
 
     def __post_init__(self) -> None:
-        if not self.study_id or "/" in self.study_id or self.study_id.strip() != self.study_id:
-            raise ConfigError(f"invalid study_id {self.study_id!r}")
+        if not _is_safe_path_component(self.study_id):
+            raise ConfigError(f"invalid study_id {self.study_id!r} (letters, digits, '-', '_', '.' only)")
+        if self.run_name is not None and not _is_safe_path_component(self.run_name):
+            raise ConfigError(f"invalid run_name {self.run_name!r} (letters, digits, '-', '_', '.' only)")
         if self.config_version != CONFIG_VERSION:
             raise ConfigError(
                 f"config_version {self.config_version!r} is not supported (expected {CONFIG_VERSION!r})"

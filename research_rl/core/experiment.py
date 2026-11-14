@@ -173,6 +173,8 @@ class ExperimentRecorder:
         with self.metrics_path.open("a") as f:
             f.write(json.dumps(row) + "\n")
         for k, v in logs.items():
+            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                v = v.item()
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 self._history.setdefault(k, []).append(float(v))
         if "num_tokens" in logs:
@@ -224,7 +226,7 @@ class ExperimentRecorder:
         self.record["status"] = status
         self.record["finished_unix"] = time.time()
         self._flush()
-        return self.record
+        return _jsonable(self.record)
 
     def _flush(self) -> None:
         (self.run_dir / "record.json").write_text(json.dumps(_jsonable(self.record), indent=2))
