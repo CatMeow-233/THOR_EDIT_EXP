@@ -1,6 +1,7 @@
 # Supervised fine-tuning (not RL). Load with ExperimentConfig.load; run with examples/sft_tiny.py.
 # model.name_or_path "research_rl:tiny" is a sentinel understood by the example script: it writes a random,
 # offline tiny Llama + char tokenizer into the output dir. Pass --model <hf id or path> for a real model.
+config_version: "1.0"
 study_id: example-sft-tiny
 seed: 0
 output_dir: runs

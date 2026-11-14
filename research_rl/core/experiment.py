@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from research_rl.core.config import ExperimentConfig
@@ -35,8 +36,11 @@ RECORD_VERSION = "1.0"
 
 
 def _jsonable(value: Any) -> Any:
+    """Best-effort JSON conversion for logs/records (NaN/inf -> strings, tensors/numpy -> numbers)."""
     if isinstance(value, torch.Tensor):
-        return value.item() if value.numel() == 1 else value.tolist()
+        return _jsonable(value.item() if value.numel() == 1 else value.tolist())
+    if isinstance(value, (np.generic, np.ndarray)):
+        return _jsonable(value.tolist())
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return str(value)
     if isinstance(value, Mapping):
@@ -46,6 +50,29 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return repr(value)
+
+
+class _NotCanonical(TypeError):
+    pass
+
+
+def _canonical(value: Any) -> Any:
+    """Strict, deterministic conversion used for content hashes (no repr() of arbitrary objects)."""
+    if isinstance(value, torch.Tensor):
+        return {"__tensor__": str(value.dtype), "data": _canonical(value.tolist())}
+    if isinstance(value, (np.generic, np.ndarray)):
+        return _canonical(value.tolist())
+    if isinstance(value, float):
+        return repr(value) if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, Mapping):
+        return {str(k): _canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        return {"__bytes__": hashlib.sha256(value).hexdigest()}
+    raise _NotCanonical(f"cannot hash a {type(value).__qualname__} deterministically")
 
 
 def dataset_identity(
@@ -68,10 +95,14 @@ def dataset_identity(
         ident["hf_fingerprint"] = hf_fp
     if n <= max_rows_for_hash:
         h = hashlib.sha256()
-        for i in range(n):
-            h.update(json.dumps(_jsonable(dataset[i]), sort_keys=True, ensure_ascii=False).encode())
-            h.update(b"\n")
-        ident["content_sha256"] = h.hexdigest()
+        try:
+            for i in range(n):
+                h.update(json.dumps(_canonical(dataset[i]), sort_keys=True, ensure_ascii=False).encode())
+                h.update(b"\n")
+            ident["content_sha256"] = h.hexdigest()
+        except _NotCanonical as exc:
+            ident["content_sha256"] = None
+            ident["note"] = f"no content hash: {exc}"
     else:
         ident["content_sha256"] = None
     return ident

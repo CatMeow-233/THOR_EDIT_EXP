@@ -110,6 +110,10 @@ class ExperimentConfig:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> ExperimentConfig:
         raw = dict(raw)
+        if "config_version" not in raw:
+            raise ConfigError(
+                f"config has no 'config_version' (expected {CONFIG_VERSION!r}); pre-versioning configs are rejected"
+            )
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = set(raw) - known
         if unknown:

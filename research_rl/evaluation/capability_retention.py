@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers import GenerationConfig
 
 from research_rl.evaluation.metrics import exact_match, normalize_answer
 
@@ -93,6 +94,21 @@ def _device(model: nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def _neutralise_generation_configs(model: nn.Module) -> list[tuple[nn.Module, GenerationConfig]]:
+    """Swap every ``GenerationConfig`` stored on ``model``'s modules for a default one.
+
+    Returns ``(module, original)`` pairs so the caller can restore them.
+    """
+    saved: list[tuple[nn.Module, GenerationConfig]] = []
+    for module in model.modules():
+        original = module.__dict__.get("generation_config")
+        if isinstance(original, GenerationConfig):
+            saved.append((module, original))
+    for module, _ in saved:
+        module.generation_config = GenerationConfig()
+    return saved
+
+
 @torch.no_grad()
 def greedy_generate(
     model: nn.Module,
@@ -104,9 +120,16 @@ def greedy_generate(
 ) -> list[str]:
     """Deterministic greedy continuations of ``prompts`` (decoded, EOS and everything after removed).
 
-    Sampling, beam search and repetition penalties that a model's ``generation_config`` may carry
-    are explicitly disabled. With ``batch_size > 1`` prompts are left-padded (built here; the
-    tokenizer's ``padding_side`` is not touched). The model's training mode is restored.
+    This is plain argmax decoding: the only stopping rules are the tokenizer's EOS and
+    ``max_new_tokens``. Whatever the model's ``generation_config`` carries (sampling, beams,
+    repetition penalties, ``no_repeat_ngram_size``, ``suppress_tokens``, ``bad_words_ids``,
+    ``min_length`` / ``min_new_tokens``, ``stop_strings``, forced tokens, ...) is ignored: HF
+    ``generate`` fills every unset field of a passed config from ``self.generation_config``, so for
+    the duration of the call every ``GenerationConfig`` held by ``model`` or one of its submodules
+    (this also reaches the inner model of a PEFT wrapper) is replaced by a default one and restored
+    afterwards. Not thread-safe with concurrent use of the same model. With ``batch_size > 1``
+    prompts are left-padded (built here; the tokenizer's ``padding_side`` is not touched). The
+    model's training mode is restored.
     """
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be >= 1")
@@ -118,6 +141,14 @@ def greedy_generate(
         raise ValueError("tokenizer needs a pad_token_id or eos_token_id for generation")
     device = _device(model)
     was_training = model.training
+    config = GenerationConfig(
+        do_sample=False,
+        num_beams=1,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos,
+        pad_token_id=int(pad),
+    )
+    saved = _neutralise_generation_configs(model)
     model.eval()
     outputs: list[str] = []
     try:
@@ -134,12 +165,7 @@ def greedy_generate(
             generated = model.generate(  # type: ignore[operator]
                 input_ids=input_ids.to(device),
                 attention_mask=attention.to(device),
-                do_sample=False,
-                num_beams=1,
-                repetition_penalty=1.0,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=eos,
-                pad_token_id=int(pad),
+                generation_config=config,
             )
             for row in generated[:, width:].tolist():
                 if eos is not None and eos in row:
@@ -147,7 +173,20 @@ def greedy_generate(
                 outputs.append(tokenizer.decode(row, skip_special_tokens=True))
     finally:
         model.train(was_training)
+        for owner, original in saved:
+            owner.generation_config = original
     return outputs
+
+
+def _kl_terms(lp: torch.Tensor, lq: torch.Tensor) -> torch.Tensor:
+    """Elementwise ``p (log p - log q)`` with the limits ``0 log 0 = 0`` and ``p log(p / 0) = +inf``.
+
+    The naive product is NaN where ``log p = -inf`` (masked / constrained vocab heads).
+    """
+    zero_p = torch.isneginf(lp)
+    terms = lp.exp() * (lp - lq)
+    terms = torch.where(torch.isneginf(lq) & ~zero_p, torch.full_like(terms, math.inf), terms)
+    return torch.where(zero_p, torch.zeros_like(terms), terms)
 
 
 @torch.no_grad()
@@ -157,6 +196,8 @@ def logit_kl(base_model: nn.Module, model: nn.Module, tokenizer: Any, prompts: I
     At position ``t`` both models predict the next token from ``prompt[: t + 1]``;
     ``KL = sum_v p_base(v) (log p_base(v) - log p_model(v))`` is computed in float64. Each prompt is
     run unpadded, so the value does not depend on batching. Identical models give exactly 0.
+    Vocabulary entries with ``p_base = 0`` (logit ``-inf``) contribute 0; an entry with ``p_base > 0``
+    but ``p_model = 0`` makes the KL ``+inf``.
     """
     per_prompt: list[float] = []
     total, count = 0.0, 0
@@ -173,7 +214,7 @@ def logit_kl(base_model: nn.Module, model: nn.Module, tokenizer: Any, prompts: I
                 base_model(input_ids=x.to(_device(base_model))).logits[0].double().cpu(), -1
             )
             lq = torch.log_softmax(model(input_ids=x.to(_device(model))).logits[0].double().cpu(), -1)
-            kl = float((lp.exp() * (lp - lq)).sum())
+            kl = float(_kl_terms(lp, lq).sum())
             per_prompt.append(kl)
             total += kl
             count += len(ids)
@@ -185,6 +226,9 @@ def logit_kl(base_model: nn.Module, model: nn.Module, tokenizer: Any, prompts: I
     return KLResult(mean_kl=total / count, num_tokens=count, per_prompt_kl=tuple(per_prompt))
 
 
+ALL_TASKS_KEY = "all"  # key of the token-weighted aggregate in RetentionSuite.logit_kl()
+
+
 class RetentionSuite:
     """A set of :class:`ProbeTask` evaluated with deterministic greedy decoding."""
 
@@ -194,6 +238,8 @@ class RetentionSuite:
             raise ValueError("RetentionSuite needs at least one task")
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate probe task names: {names}")
+        if ALL_TASKS_KEY in names:
+            raise ValueError(f"probe task name {ALL_TASKS_KEY!r} is reserved for the aggregate in logit_kl()")
         self.tasks = list(tasks)
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
@@ -223,7 +269,7 @@ class RetentionSuite:
             out[task.name] = res.mean_kl
             total += sum(res.per_prompt_kl)
             count += res.num_tokens
-        out["all"] = total / count
+        out[ALL_TASKS_KEY] = total / count
         return out
 
     def report(

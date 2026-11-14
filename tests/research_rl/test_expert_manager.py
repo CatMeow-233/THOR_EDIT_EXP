@@ -17,7 +17,12 @@ from datasets import Dataset
 from transformers import LlamaForCausalLM, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-from research_rl.core.checkpoint import COMPONENTS_FILE, checkpoint_inventory
+from research_rl.core.checkpoint import (
+    COMPONENTS_FILE,
+    checkpoint_inventory,
+    load_components,
+    save_components,
+)
 from research_rl.models.expert_manager import (
     BackboneChangedError,
     ExpertCompatibilityError,
@@ -397,6 +402,19 @@ def test_per_sample_routing_matches_rowwise_reference(tokenizer):
         keep = mask[i].bool()
         torch.testing.assert_close(out_p[i, keep], ref[0, keep], rtol=1e-5, atol=1e-5)
 
+    # Every row routed to ONE expert that differs from `active` (the single-group shortcut): the
+    # routing, not `active`, must decide.
+    mgr.activate("base")
+    base_out = logits(model, ids[:3])
+    for rows, name in ((3, "b"), (1, "a")):
+        with mgr.using(name):
+            ref_uniform = logits(model, ids[:rows])
+        with mgr.routed([name] * rows):
+            out_uniform = logits(model, ids[:rows])
+        assert mgr.active == "base" and mgr.routing is None
+        torch.testing.assert_close(out_uniform, ref_uniform, rtol=1e-5, atol=1e-5)
+        assert not torch.allclose(out_uniform, base_out[:rows], atol=1e-3)
+
     with mgr.routed(["a", "b"]), pytest.raises(ExpertError, match="batch size"):
         logits(model, ids)
 
@@ -486,6 +504,10 @@ def test_attached_checkpoint_pitfall_and_expert_aware_loader(tokenizer, tmp_path
         load_model_with_experts(path)
     (path / "research_rl_experts.json").write_text(json.dumps(dict(sidecar, experts=["base", "a", "b", "c"])))
     with pytest.raises(ExpertCompatibilityError, match="missing keys"):
+        load_model_with_experts(path)
+    detached_state = ExpertManager(build_tiny_llama(len(tokenizer))).state_dict()
+    (path / "research_rl_experts.json").write_text(json.dumps(detached_state))
+    with pytest.raises(ExpertCompatibilityError, match="detached"):
         load_model_with_experts(path)
     (path / "research_rl_experts.json").unlink()
     weights = st.load_file(str(path / "model.safetensors"))
@@ -620,3 +642,199 @@ def test_find_swiglu_ffns_resolves_experts_for_channel_tools(tiny_model):
         find_swiglu_ffns(tiny_model, [0], expert="missing")
     with pytest.raises(ModelInterfaceError):
         find_swiglu_ffns(tiny_model, [1], expert="a")
+
+
+# ---------------------------------------------------------------------- review regressions
+def test_switching_experts_never_rebaselines_a_corrupted_backbone(tokenizer, tmp_path):
+    model, mgr = managed(tokenizer, layers=(0,))
+    ref = mgr.freeze_backbone()
+    mgr.set_trainable("a")
+    mgr.set_trainable("b")  # clean switch: same reference, verified, not re-recorded
+    assert mgr.freeze_backbone() == ref and mgr._backbone_ref == ref
+    mgr.set_trainable("a")
+
+    with torch.no_grad():
+        model.model.norm.weight[0] += 1.0  # backbone corrupted while training "a"
+    with pytest.raises(BackboneChangedError):
+        mgr.set_trainable("b")
+    # the failed switch changed nothing
+    assert mgr.trainable_expert == "a" and mgr.active == "a"
+    assert sorted(mgr.trainable_parameter_names()) == sorted(mgr.expert_parameter_names("a"))
+    with pytest.raises(BackboneChangedError):
+        mgr.freeze_backbone()
+    with pytest.raises(BackboneChangedError):
+        mgr.set_trainable(None)
+    with pytest.raises(BackboneChangedError):
+        mgr.assert_backbone_unchanged()  # still detected after the failed attempts
+
+    # explicit, intentional reset
+    mgr.set_trainable("b", rebaseline=True)
+    assert mgr.trainable_expert == "b" and mgr._backbone_ref != ref
+    mgr.assert_backbone_unchanged()
+    with torch.no_grad():
+        model.model.norm.weight[0] -= 1.0
+    assert mgr.freeze_backbone(rebaseline=True) == ref
+
+    # a restored reference (sidecar) is checked against the loaded weights, not recorded anew
+    path = mgr.save_pretrained(tmp_path / "attached")
+    loaded, lmgr = load_model_with_experts(path)
+    lmgr.assert_backbone_unchanged()
+    lmgr.set_trainable("a")
+    assert lmgr._backbone_ref == ref
+    with torch.no_grad():
+        loaded.model.embed_tokens.weight[3, 0] += 1.0
+    with pytest.raises(BackboneChangedError):
+        lmgr.set_trainable("b")
+
+
+def test_load_state_dict_restores_unfrozen_state_routing_and_validates(tokenizer):
+    _, src = managed(tokenizer, layers=(0,))
+    src.set_routing(["a", "base", "b"])
+    unfrozen = src.state_dict()
+    assert unfrozen["frozen"] is False and unfrozen["routing"] == ["a", "base", "b"]
+
+    # into a manager that froze everything for "a": the manager's own freezing is undone
+    model, mgr = managed(tokenizer, layers=(0,))
+    mgr.set_trainable("a")
+    mgr.load_state_dict(unfrozen)
+    assert mgr.trainable_expert is None and mgr._frozen is False
+    assert all(p.requires_grad for p in model.parameters())
+    assert mgr.routing == ("a", "base", "b") and mgr.active == "base"
+    mgr.create_expert("c")  # not frozen any more: nothing is re-frozen
+    assert all(p.requires_grad for p in model.parameters())
+
+    # into a fresh manager: a user's own freezing is left alone
+    fresh = build_tiny_llama(len(tokenizer), seed=0)
+    fresh.model.embed_tokens.weight.requires_grad_(False)
+    fmgr = ExpertManager(fresh)
+    fmgr.load_state_dict(unfrozen)
+    assert fmgr.expert_names == ["base", "a", "b"] and fmgr.routing == ("a", "base", "b")
+    assert not fresh.model.embed_tokens.weight.requires_grad
+    assert all(p.requires_grad for n, p in fresh.named_parameters() if "embed_tokens" not in n)
+
+    # a frozen state restores requires_grad exactly
+    src.clear_routing()
+    src.set_trainable("b")
+    fmgr.load_state_dict(src.state_dict())
+    assert sorted(fmgr.trainable_parameter_names()) == sorted(fmgr.expert_parameter_names("b"))
+
+    # invalid states are rejected before anything changes
+    good = src.state_dict()
+    before = fmgr.state_dict()
+    for bad, match in (
+        (dict(good, trainable="nope"), "trainable"),
+        (dict(good, trainable="base"), "trainable"),
+        (dict(good, frozen=False), "trainable"),
+        (dict(good, active="nope"), "unknown experts"),
+        (dict(good, routing=["a", "nope"]), "unknown experts"),
+        (dict(good, experts=["a", "base", "b"]), "expert list"),
+        (dict(good, format="other"), "format"),
+    ):
+        with pytest.raises(ExpertCompatibilityError, match=match):
+            fmgr.load_state_dict(bad)
+        assert fmgr.state_dict() == before
+    # the model has an expert the state does not know
+    fmgr.create_expert("extra")
+    with pytest.raises(ExpertCompatibilityError, match="does not know"):
+        fmgr.load_state_dict(good)
+
+
+def test_detached_manager_state_and_reset(tokenizer, tmp_path):
+    _, mgr = managed(tokenizer, layers=(0,))
+    mgr.set_trainable("a")
+    trained = mgr.expert_parameters("a")
+    mgr.detach("a")
+    assert mgr.trainable_expert is None and not mgr.attached
+    # still usable as a registered checkpoint component
+    out = save_components(tmp_path, {"experts": mgr})
+    assert out is not None
+    state = torch.load(out, weights_only=True)["experts"]
+    assert state["layers"] == [] and state["experts"] == []
+    assert load_components(tmp_path, {"experts": ExpertManager(build_tiny_llama(len(tokenizer)))}) == [
+        "experts"
+    ]
+    mgr.load_state_dict(state)  # detached -> detached: no-op
+    assert not mgr.attached
+    with pytest.raises(ExpertError, match="no experts attached"):
+        mgr.save_pretrained(tmp_path / "x")
+
+    # re-attach: no stale reference / frozen flag from the previous session
+    mgr.attach([0])
+    with pytest.raises(ExpertError, match="no backbone reference"):
+        mgr.assert_backbone_unchanged()
+    assert all(p.requires_grad for p in trained)  # the trained FFN is the new "base"
+    mgr.create_expert("c")  # a stale frozen flag would re-freeze everything here
+    assert all(p.requires_grad for p in trained)
+    with pytest.raises(ExpertCompatibilityError, match="detached"):
+        mgr.load_state_dict(state)
+
+
+def test_config_hash_ignores_token_ids_and_dropout(tokenizer, tmp_path):
+    model, mgr = managed(tokenizer, layers=(0,))
+    good = mgr.save_expert("a", tmp_path / "a.safetensors")
+    h = config_hash(model.config)
+    target = build_tiny_llama(len(tokenizer), seed=0)
+    target.config.pad_token_id = 5
+    target.config.eos_token_id = [2, 3]
+    target.config.bos_token_id = None
+    target.config.attention_dropout = 0.1
+    target.config.initializer_range = 0.5
+    assert config_hash(target.config) == h
+    tmgr = ExpertManager(target)
+    tmgr.attach([0])
+    assert tmgr.load_expert(good) == "a"
+    assert tmgr.expert_fingerprint("a") == mgr.expert_fingerprint("a")
+    for key, value in (("intermediate_size", 48), ("tie_word_embeddings", True), ("rms_norm_eps", 1e-5)):
+        cfg = copy.deepcopy(model.config)
+        setattr(cfg, key, value)
+        assert config_hash(cfg) != h, key
+
+
+def test_model_class_mismatch_is_rejected(tokenizer, tmp_path):
+    _, mgr = managed(tokenizer, layers=(0,))
+    good = mgr.save_expert("a", tmp_path / "a.safetensors")
+    tensors, meta = ExpertManager.read_expert_file(good)
+    meta["model_class"] = "transformers.models.mistral.modeling_mistral.MistralForCausalLM"
+    edited = tmp_path / "edited.safetensors"
+    st.save_file(tensors, str(edited), metadata=meta)  # tensors unchanged: checksum still valid
+    _, tmgr = managed(tokenizer, layers=(0,), experts=())
+    with pytest.raises(ExpertCompatibilityError, match="model_class"):
+        tmgr.load_expert(edited)
+    assert tmgr.load_expert(good) == "a"
+
+
+def test_bf16_attached_checkpoint_reloads_bit_exact_in_eval_mode(tokenizer, tmp_path):
+    model, mgr = managed(tokenizer)
+    model.to(torch.bfloat16)
+    model.generation_config.max_new_tokens = 7
+    routing = ["a", "b", "base", "a"]
+    mgr.set_routing(routing)
+    path = mgr.save_pretrained(tmp_path / "bf16")
+    assert (path / "generation_config.json").exists()
+
+    loaded, lmgr = load_model_with_experts(path)
+    assert {p.dtype for p in loaded.parameters()} == {torch.bfloat16}
+    src_sd = model.state_dict()
+    for name, tensor in loaded.state_dict().items():
+        assert torch.equal(tensor, src_sd[name]), name
+    assert not loaded.training
+    assert loaded.generation_config.max_new_tokens == 7
+    assert lmgr.routing == tuple(routing)  # restored from the sidecar
+
+    # Independent reference: HF's own loader on the vanilla export of each expert. (The source model's
+    # ``.to(bf16)`` also cast the non-persistent RoPE ``inv_freq`` buffer, which a fresh load keeps in
+    # fp32, so the source model itself is not a bit-exact logits reference.)
+    ids = batch()
+    refs = {}
+    for name in ("base", "a", "b"):
+        vanilla = LlamaForCausalLM.from_pretrained(str(mgr.export_merged(name, tmp_path / f"v_{name}")))
+        assert vanilla.dtype == torch.bfloat16
+        refs[name] = logits(vanilla, ids)
+        with lmgr.using(name):
+            assert torch.equal(logits(loaded, ids), refs[name]), name
+    out = logits(loaded, ids)
+    assert not torch.allclose(refs["a"], refs["b"], atol=0.05) and not torch.allclose(
+        refs["a"], refs["base"], atol=0.05
+    )
+    for row, name in enumerate(routing):  # rows are batched per expert: close, not necessarily bit-equal
+        torch.testing.assert_close(out[row], refs[name][row], rtol=1e-2, atol=1e-2)

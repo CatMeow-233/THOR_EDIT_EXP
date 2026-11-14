@@ -382,3 +382,37 @@ def test_mask_state_is_digest_only_and_verified_on_resume():
     opt2 = HookedOptimizer(adamw(make_model()), make_model().named_parameters(), [MaskRule(other)])
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         opt2.load_state_dict(sd)
+
+
+class VetoRule(UpdateRule):
+    name = "veto"
+
+    def __init__(self, opt_ref):
+        self.opt_ref = opt_ref
+        self.skips = 0
+
+    def post_grad(self, ctx, named_params):
+        self.opt_ref[0].request_skip()
+
+    def on_skip(self, ctx):
+        self.skips += 1
+
+
+def test_post_grad_hook_can_skip_the_current_step():
+    model = make_model()
+    ref = [None]
+    rule = VetoRule(ref)
+    opt = HookedOptimizer(adamw(model), model.named_parameters())
+    ref[0] = opt
+    backward(model, 0)
+    opt.step()  # warm state
+    opt.add_rule(rule)
+    params_before = [p.detach().clone() for p in model.parameters()]
+    state_before = {k: {kk: vv.clone() for kk, vv in v.items()} for k, v in opt.state.items()}
+    backward(model, 1)
+    opt.step()
+    assert all(torch.equal(a, b) for a, b in zip(params_before, model.parameters()))
+    for k, v in opt.state.items():
+        for kk, vv in v.items():
+            assert torch.equal(vv, state_before[k][kk])
+    assert (opt.nominal_steps, opt.applied_updates, opt.skipped_steps, rule.skips) == (2, 1, 1, 1)

@@ -2,9 +2,10 @@
 
 This module is about a **parameter prior**: the student's weights are constrained to / steered
 along directions spanned by *task vectors* τ_k = θ_expert_k − θ_base of fine-tuned experts.
-It is **not** multi-teacher distillation; the distillation loss of P²-MOPD (multi-teacher
-routed reverse KL) is provided separately by :mod:`research_rl.trainers.multi_teacher` and the
-TRL distillation trainer. Every rule here works with *any* loss.
+It is **not** multi-teacher distillation, and the P²-MOPD distillation loss (per-prompt routed,
+support-restricted reverse KL) is **not** implemented in ResearchRL: :mod:`research_rl.trainers.multi_teacher`
+only provides building blocks (offline routed aggregation + KL helpers, and a static-weight
+teacher ensemble for TRL's full-vocabulary JSD). Every rule here works with *any* loss.
 
 What is implemented (and numerically tested):
 
@@ -26,7 +27,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -44,6 +45,15 @@ Coefficients: TypeAlias = Mapping[str, float | torch.Tensor] | Sequence[float | 
 PROJECTION_PATTERN = re.compile(r"(^|\.)(q|k|v|o|gate|up|down)_proj\.weight$")
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _CLIP_EPS = 1e-6  # same epsilon as torch.nn.utils.clip_grad_norm_
+
+
+def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """fp32 for half/bf16/fp32 tensors, the tensor's own dtype if wider (float64)."""
+    return torch.promote_types(dtype, torch.float32)
+
+
+def _overrides(rule: UpdateRule, method: str) -> bool:
+    return getattr(type(rule), method) is not getattr(UpdateRule, method)
 
 
 # ====================================================================================== task vectors
@@ -273,17 +283,20 @@ class TaskVectorPrior:
         return list(self.task_vectors)
 
     def combine(self, coefficients: Coefficients) -> dict[str, torch.Tensor]:
-        """Effective parameters θ_base + Σ_i α_i τ_i (accumulated in fp32, returned in the base dtype).
+        """Effective parameters θ_base + Σ_i α_i τ_i, returned in the base dtype.
 
-        With tensor coefficients that require grad the result is differentiable w.r.t. α.
+        Accumulated in ``promote_types(base dtype, float32)``: fp32 for half/bf16/fp32 bases, float64
+        for float64 bases (so α = 0 restores any base bit-for-bit). With tensor coefficients that
+        require grad the result is differentiable w.r.t. α.
         """
         coeffs = _coefficient_list(coefficients, self.task_names)
         out: dict[str, torch.Tensor] = {}
         for k, b in self.base.items():
-            acc = b.float()
+            cd = _compute_dtype(b.dtype)
+            acc = b.to(cd)
             for a, tv in zip(coeffs, self.task_vectors.values()):
                 if k in tv:
-                    acc = acc + a * tv[k].to(device=acc.device, dtype=torch.float32)
+                    acc = acc + a * tv[k].to(device=acc.device, dtype=cd)
             out[k] = acc.to(b.dtype)
         return out
 
@@ -442,6 +455,14 @@ class PriorSubspaceRule(UpdateRule):
 
 
 # ====================================================================================== P²-MOPD rule
+def _finite_grad_norm(named_params: Iterable[tuple[str, torch.nn.Parameter]]) -> bool:
+    """Whether the global L2 norm of all ``.grad`` (fp32, as ``clip_grad_norm_`` computes it) is finite."""
+    norms = [torch.linalg.vector_norm(p.grad.detach().float()) for _, p in named_params if p.grad is not None]
+    if not norms:
+        return True
+    return bool(torch.isfinite(torch.linalg.vector_norm(torch.stack([n.cpu() for n in norms]))))
+
+
 def default_prior_modules(names: Iterable[str]) -> list[str]:
     """Parameter names of the linear projections q/k/v/o and gate/up/down (``*_proj.weight``)."""
     return [n for n in names if PROJECTION_PATTERN.search(n)]
@@ -468,23 +489,40 @@ class P2PriorRule(UpdateRule):
 
     The optimizer keeps the *materialised* W (so the forward pass is the unmodified model). One step:
 
+    0. non-finite guard (paper App. B): if the global weight-gradient norm or the coefficient
+       gradient is non-finite, the **whole step is skipped** (``skip_nonfinite=True``) via
+       ``HookedOptimizer.request_skip()`` from ``post_grad``: the inner optimizer, its state, the
+       weights, α, its Adam moments and step count are untouched, and the step is counted as
+       skipped (not as an applied update); ``nonfinite_skips`` counts these steps. With
+       ``skip_nonfinite=False`` only the coefficient channel is skipped (α is never poisoned).
     1. ``post_grad``: g_c = Σ_{(k,m)→c} <G_m, τ_{k,m}> from the **unclipped** weight gradient G
        (chain rule ∂L/∂α_{k,m} = <∂L/∂W_m, τ_{k,m}>; tied coefficients sum their contributions).
     2. weight channel (inner optimizer): G clipped to global norm c_W, AdamW step on W. This is an
        AdamW step on B because ∂L/∂B = G — valid **only with weight decay 0 on prior modules**
        (decay would shrink B + Σατ instead of B). :meth:`attach` validates this and raises.
     3. coefficient channel: g clipped to norm ``clip_norm`` (c_α; scale ``min(1, c_α/(‖g‖+1e-6))``
-       like ``clip_grad_norm_``), then Adam (own β1, β2, eps, lr η_α, no decay) on the free
-       coefficients. If no prior module received a gradient the coefficient step is skipped
-       (as torch skips parameters whose ``grad`` is ``None``).
-    4. ``pre_write``: W_{t+1,m} = W_after_AdamW + Σ_k (α_{t+1} − α_t)_{k,m} τ_{k,m} (fp32).
+       like ``clip_grad_norm_``), then Adam (own β1, β2, eps, no decay) on the free coefficients
+       with learning rate η_α(t) = ``lr`` · factor(t), where t is the HookedOptimizer's 1-based
+       nominal step (the counter HF's LR scheduler follows; skipped steps advance it, as in App. B
+       step 7, but not Adam's bias-correction count). factor = ``lr_lambda(t)`` if given, else
+       ``min(1, t / warmup_steps)`` (paper Table 10 reports a warm-up then constant η_α; the linear
+       ramp is this implementation's choice, and unlike HF's linear warm-up step 1 is not lr 0), else 1. The callable is configuration and is
+       not saved; the position is restored with the optimizer state. If no prior module received a
+       gradient the coefficient step is skipped (as torch skips parameters whose grad is None).
+    4. ``pre_write``: W_{t+1,m} = W_after_AdamW + Σ_k (α_{t+1} − α_t)_{k,m} τ_{k,m}, computed in
+       ``promote_types(param dtype, float32)`` (fp32 for bf16/fp16/fp32 weights) and rounded once.
 
     Requirements (documented, partly validated):
 
     * Clipping of W must happen **after** step 1: run HF/TRL with ``max_grad_norm=0`` and let the
-      wrapper clip (``clip_in_wrapper=c_W`` → ``HookedOptimizer(clip_norm=c_W)``). If HF clips first,
-      g is computed from clipped gradients (not detectable from inside the rule).
+      wrapper clip (``clip_in_wrapper=c_W`` → ``HookedOptimizer(clip_norm=c_W)``). The rule refuses
+      to run when the trainer mixin reports ``hf_max_grad_norm > 0``.
     * Rules registered *before* this one may edit gradients first; register it first for raw G.
+    * No other rule may rewrite a prior module's update (``transform_update`` / ``pre_write``, e.g.
+      :class:`~research_rl.optim.update_interface.MaskRule` or :class:`PriorSubspaceRule`): after
+      such a rule W ≠ B + Σ α τ (or a frozen element moves). This is checked at attach and at every
+      step and raises unless ``allow_foreign_writes=True`` (then the identity is the caller's
+      responsibility). Rules that only observe (``post_step``) or touch other parameters are fine.
     * The rule must be attached to its optimizer (:meth:`attach`, or :meth:`callback` for TRL,
       which attaches at ``on_train_begin``); an unattached rule raises at the first step.
 
@@ -493,10 +531,22 @@ class P2PriorRule(UpdateRule):
     e.g. ``1/K`` for a task-arithmetic start; the model must then hold the TA merge, see
     :meth:`materialize`) or ``None`` for α = 0 (model holds the base).
 
-    State (coefficients, Adam moments, step count, trajectory) is tensors/primitives only and lives
-    in the optimizer state file, so HF checkpoint resume restores it. Task vectors are configuration
-    and are not saved. This is the parameter-prior optimisation of P²-MOPD only; the MOPD
-    distillation loss is provided separately (:mod:`research_rl.trainers.multi_teacher`).
+    Memory: the task vectors are held as ``[K, *shape]`` tensors in ``tau_dtype`` (default fp32) on
+    CPU for every prior module, i.e. K × (#prior params) × 4 bytes (Qwen3-4B projections, K=4:
+    ≈ 58 GB). With ``cache_tau_on_device=True`` (default) a second copy is cached per device on first
+    use and never evicted — on an accelerator that is the same amount of device memory on top of
+    the model and its AdamW state. ``cache_tau_on_device=False`` moves each module's τ to the device
+    inside the per-module loop and drops it (one module resident at a time, more host→device
+    traffic); ``tau_dtype=torch.bfloat16`` halves both copies (τ is rounded once at construction and
+    the prior is then *defined* by the rounded τ; all arithmetic is still fp32). Memory-mapped
+    streaming from checkpoints (paper App. B) is not implemented. Device behaviour is NOT_TESTED
+    (CPU only).
+
+    State (coefficients, Adam moments, step count, trajectory, skip count) is tensors/primitives
+    only and lives in the optimizer state file, so HF checkpoint resume restores it. Task vectors
+    are configuration and are not saved. This is the parameter-prior optimisation of P²-MOPD only;
+    it works with any loss (the MOPD distillation loss is not implemented in ResearchRL, see
+    :mod:`research_rl.trainers.multi_teacher` for the available building blocks).
     """
 
     name = "p2_prior"
@@ -513,6 +563,12 @@ class P2PriorRule(UpdateRule):
         eps: float = 1e-8,
         clip_norm: float | None = None,
         record_trajectory: bool = True,
+        warmup_steps: int = 0,
+        lr_lambda: Callable[[int], float] | None = None,
+        skip_nonfinite: bool = True,
+        allow_foreign_writes: bool = False,
+        tau_dtype: torch.dtype = torch.float32,
+        cache_tau_on_device: bool = True,
     ) -> None:
         if granularity not in ("module", "layer", "model"):
             raise ValueError(f"granularity must be module/layer/model, got {granularity!r}")
@@ -526,7 +582,19 @@ class P2PriorRule(UpdateRule):
         self.eps = float(eps)
         self.clip_norm = clip_norm
         self.record_trajectory = record_trajectory
-        self._tau = _stack_task_vectors(task_vectors, names)  # name -> [K, *shape] fp32
+        if warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0")
+        if warmup_steps and lr_lambda is not None:
+            raise ValueError("pass either warmup_steps or lr_lambda, not both")
+        self.warmup_steps = int(warmup_steps)
+        self.lr_lambda = lr_lambda
+        self.skip_nonfinite = skip_nonfinite
+        self.allow_foreign_writes = allow_foreign_writes
+        self.cache_tau_on_device = cache_tau_on_device
+        if not tau_dtype.is_floating_point:
+            raise ValueError("tau_dtype must be a floating-point dtype")
+        # name -> [K, *shape] in tau_dtype (CPU)
+        self._tau = {n: t.to(tau_dtype) for n, t in _stack_task_vectors(task_vectors, names).items()}
         self.num_tasks = int(next(iter(self._tau.values())).shape[0])
         k = self.num_tasks
 
@@ -556,6 +624,8 @@ class P2PriorRule(UpdateRule):
         self.trajectory: list[torch.Tensor] = [self.coefficients.clone()] if record_trajectory else []
         self.last_grad: torch.Tensor | None = None
         self.last_clipped_grad: torch.Tensor | None = None
+        self.last_lr: float | None = None
+        self.nonfinite_skips = 0
         self._delta: torch.Tensor | None = None
         self._tau_cache: dict[tuple[str, torch.device], torch.Tensor] = {}
         self._optimizer: HookedOptimizer | None = None
@@ -568,8 +638,9 @@ class P2PriorRule(UpdateRule):
 
         ``optimizer`` may be a :class:`HookedOptimizer` or any wrapper around one (accelerate).
         Raises if this rule is not in its rules, a prior module is not optimised or has
-        ``requires_grad=False``, or a param group holding a prior module has non-zero
-        ``weight_decay``. The frozen/decay checks are repeated at every step.
+        ``requires_grad=False``, a param group holding a prior module has non-zero
+        ``weight_decay``, or another rule rewrites a prior module's update (unless
+        ``allow_foreign_writes``). The frozen/decay/foreign-write checks are repeated at every step.
         """
         hooked = unwrap_hooked(optimizer)
         if hooked is None:
@@ -604,6 +675,19 @@ class P2PriorRule(UpdateRule):
                     f"param group {i} holds P2-prior modules with weight_decay={group['weight_decay']}; it must "
                     "be 0 (with decay, optimising the materialised W is no longer equivalent to optimising B)"
                 )
+        if self.allow_foreign_writes:
+            return
+        for rule in self._optimizer.rules:
+            if rule is self or not (_overrides(rule, "transform_update") or _overrides(rule, "pre_write")):
+                continue
+            clash = [n for n, p in zip(self.modules, self._prior_params) if rule.tracks(n, p)]
+            if clash:
+                raise ValueError(
+                    f"rule {rule.name!r} rewrites the update of P2-prior modules {clash[:3]} (transform_update/"
+                    "pre_write): in either order this breaks W = B + sum(alpha*tau) or the other rule's guarantee "
+                    "(e.g. a MaskRule's frozen elements move). Drop those modules from one of the rules, or pass "
+                    "allow_foreign_writes=True if you have checked the composition yourself."
+                )
 
     def on_attach(self, optimizer: Any) -> None:
         """HookedOptimizer calls this when the rule is registered: validate immediately (fail closed)."""
@@ -619,12 +703,16 @@ class P2PriorRule(UpdateRule):
         params = dict(model.named_parameters())
         for n in self.modules:
             p = params[n]
-            alpha = self.coefficients[self._index[n]].to(p.device)
-            tau = self._tau_on(n, p.device)
-            w = base[n].to(device=p.device, dtype=torch.float32) + torch.tensordot(alpha, tau, dims=1)
+            cd = _compute_dtype(p.dtype)
+            alpha = self.coefficients[self._index[n]].to(device=p.device, dtype=cd)
+            tau = self._tau_on(n, p.device).to(cd)
+            w = base[n].to(device=p.device, dtype=cd) + torch.tensordot(alpha, tau, dims=1)
             p.copy_(w.to(p.dtype))
 
     def _tau_on(self, name: str, device: torch.device) -> torch.Tensor:
+        """τ of ``name`` on ``device`` (in ``tau_dtype``); cached only with ``cache_tau_on_device``."""
+        if not self.cache_tau_on_device:
+            return self._tau[name].to(device)
         key = (name, device)
         if key not in self._tau_cache:
             self._tau_cache[key] = self._tau[name].to(device)
@@ -651,7 +739,7 @@ class P2PriorRule(UpdateRule):
         g = torch.zeros(self.num_free, dtype=torch.float32)
         for n, p in named_params:
             if n in self._index and p.grad is not None:
-                tau = self._tau_on(n, p.grad.device)
+                tau = self._tau_on(n, p.grad.device).float()
                 contrib = tau.reshape(self.num_tasks, -1) @ p.grad.detach().float().reshape(-1)
                 g.index_add_(0, self._index[n], contrib.cpu())
         return g
@@ -674,14 +762,25 @@ class P2PriorRule(UpdateRule):
             )
         self._validate()
         self._delta = None
+        if self.skip_nonfinite and not _finite_grad_norm(named_params):
+            self._skip_step(named_params)
+            return
         if not any(n in self._index and p.grad is not None for n, p in named_params):
             return
         g = self.coefficient_gradient(named_params)
         self.last_grad = g.clone()
+        if not bool(torch.isfinite(g).all()):
+            if self.skip_nonfinite:
+                self._skip_step(named_params)
+            else:
+                self.nonfinite_skips += 1  # coefficient channel only; the weight step still runs
+            return
         if self.clip_norm is not None and self.clip_norm > 0:
             total = torch.linalg.vector_norm(g)
             g = g * torch.clamp(self.clip_norm / (total + _CLIP_EPS), max=1.0)
         self.last_clipped_grad = g.clone()
+        lr = self.lr * self.lr_factor(ctx.nominal_step)
+        self.last_lr = lr
         # Adam (no decay), same arithmetic as torch.optim.Adam.
         b1, b2 = self.betas
         self.step_count += 1
@@ -690,11 +789,26 @@ class P2PriorRule(UpdateRule):
         bc1 = 1 - b1**self.step_count
         bc2 = 1 - b2**self.step_count
         denom = (self.exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(self.eps)
-        new = self.coefficients - (self.lr / bc1) * (self.exp_avg / denom)
+        new = self.coefficients - (lr / bc1) * (self.exp_avg / denom)
         self._delta = new - self.coefficients
         self.coefficients = new
         if self.record_trajectory:
             self.trajectory.append(new.clone())
+
+    def lr_factor(self, step: int) -> float:
+        """Multiplier of ``lr`` at 1-based optimizer step ``step`` (``lr_lambda`` / warm-up / 1)."""
+        if self.lr_lambda is not None:
+            return float(self.lr_lambda(step))
+        if self.warmup_steps > 0:
+            return min(1.0, step / self.warmup_steps)
+        return 1.0
+
+    def _skip_step(self, named_params: list[tuple[str, torch.nn.Parameter]]) -> None:
+        """Non-finite gradient: veto the current optimizer step; keep α/moments."""
+        assert self._optimizer is not None
+        self._optimizer.request_skip()
+        self.nonfinite_skips += 1
+        self._delta = None
 
     def pre_write(
         self, ctx: StepContext, name: str, param: torch.nn.Parameter, old: torch.Tensor, new: torch.Tensor
@@ -704,8 +818,11 @@ class P2PriorRule(UpdateRule):
         d = self._delta[self._index[name]]
         if not bool(d.any()):
             return None
-        corr = torch.tensordot(d.to(new.device), self._tau_on(name, new.device), dims=1)
-        return (new.float() + corr).to(new.dtype)
+        cd = _compute_dtype(new.dtype)
+        corr = torch.tensordot(
+            d.to(device=new.device, dtype=cd), self._tau_on(name, new.device).to(cd), dims=1
+        )
+        return (new.to(cd) + corr).to(new.dtype)
 
     def on_skip(self, ctx: StepContext) -> None:
         self._delta = None
@@ -721,6 +838,7 @@ class P2PriorRule(UpdateRule):
             "granularity": self.granularity,
             "group_names": list(self.group_names),
             "num_tasks": self.num_tasks,
+            "nonfinite_skips": self.nonfinite_skips,
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -736,6 +854,7 @@ class P2PriorRule(UpdateRule):
         self.step_count = int(state["step"])
         traj = state.get("trajectory")
         self.trajectory = list(traj.unbind(0)) if isinstance(traj, torch.Tensor) and traj.numel() else []
+        self.nonfinite_skips = int(state.get("nonfinite_skips", 0))
         self._delta = None
 
 

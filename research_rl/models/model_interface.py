@@ -123,15 +123,20 @@ def snapshot(model: nn.Module, names: Iterable[str] | None = None) -> dict[str, 
 
 @torch.no_grad()
 def fingerprint(tensors: dict[str, torch.Tensor] | nn.Module, names: Iterable[str] | None = None) -> str:
-    """SHA-256 over names, shapes, dtypes and raw bytes. Bit-exact identity check."""
+    """SHA-256 over names, shapes, dtypes and raw bytes. Bit-exact identity check.
+
+    Streams one tensor at a time (only one CPU copy alive), so it is usable on large models.
+    """
+    keep = set(names) if names is not None else None
     if isinstance(tensors, nn.Module):
-        tensors = snapshot(tensors, names)
-    elif names is not None:
-        keep = set(names)
-        tensors = {k: v for k, v in tensors.items() if k in keep}
+        source: dict[str, torch.Tensor] = {
+            n: p for n, p in tensors.named_parameters() if keep is None or n in keep
+        }
+    else:
+        source = {k: v for k, v in tensors.items() if keep is None or k in keep}
     h = hashlib.sha256()
-    for name in sorted(tensors):
-        t = tensors[name].detach().cpu().contiguous()
+    for name in sorted(source):
+        t = source[name].detach().cpu().contiguous()
         h.update(name.encode())
         h.update(str(tuple(t.shape)).encode())
         h.update(str(t.dtype).encode())

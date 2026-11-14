@@ -104,3 +104,22 @@ def test_credit_assignment_math_vs_manual():
     lone = EpisodeLog()
     lone.set_final_reward(3.0)
     assert lone.rewards().tolist() == [3.0]
+
+
+def test_get_reward_computes_terminal_reward_once_per_episode():
+    class Counting(ResearchEnvironment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def _terminal_reward(self) -> float:
+            self.calls += 1
+            return 0.5 * self.calls  # would change if recomputed
+
+    env = Counting()
+    env.reset()
+    env._record("a", "o", reward=0.25)
+    assert env.get_reward() == pytest.approx(0.75)
+    assert env.get_reward() == pytest.approx(0.75) and env.calls == 1  # cached, not recomputed/added twice
+    env.reset()  # a new episode recomputes
+    assert env.get_reward() == pytest.approx(1.0) and env.calls == 2

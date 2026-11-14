@@ -7,7 +7,8 @@ channel ``c`` *owns* row ``c`` of ``gate_proj.weight``/``up_proj.weight``, colum
 by channel ``c`` changes the FFN output only through channel ``c``'s additive contribution
 ``W_down[:, c] * act(g_c) * u_c``.
 
-Everything in this module is implemented and covered by numerical tests:
+Every function below is implemented (no contract-only parts) and exercised by the numerical tests in
+``tests/research_rl/test_ffn_channels.py``:
 
 * :class:`ChannelSelection` – validated ``layer -> sorted unique channels`` sets with algebra and
   top-k selection from scores.
@@ -20,6 +21,12 @@ Everything in this module is implemented and covered by numerical tests:
 * :func:`rollback_channels` / :func:`ablate_channels` – in-place, dtype-preserving writes of only
   the selected channel slices.
 * :func:`verify_modification_scope` – element-exact report of every change outside an allowed region.
+
+Expert containers (:mod:`research_rl.models.expert_manager`): every op takes ``expert=`` and, like
+:func:`find_swiglu_ffns`, defaults to the container's *active* expert (``routing`` only affects the
+forward pass, not which expert these ops address). :class:`LayerChannels` records the module path it
+was taken from; :func:`rollback_channels` / :func:`channel_diff` refuse a reference taken from a
+different module path (e.g. another expert) unless ``allow_path_mismatch=True``.
 
 Not handled: tensor-parallel / FSDP-sharded or quantised weights (the ops index full local
 ``nn.Linear`` weights), and optimizer state (rollback restores weights, not Adam moments).
@@ -89,14 +96,31 @@ class ChannelSelection:
     def from_dict(
         cls, d: Mapping[int | str, Iterable[int]], *, intermediate_size: int | None = None
     ) -> ChannelSelection:
-        """Build from a (possibly JSON-loaded, string-keyed) dict."""
-        return cls(
-            {_as_index(int(k), "layer index"): v for k, v in d.items()}, intermediate_size=intermediate_size
-        )
+        """Build from a (possibly JSON-loaded, string-keyed) dict.
+
+        ``str`` keys must be integer literals (``"3"``); every other key goes through the same
+        int-only check as the constructor (bools and floats are rejected, not truncated).
+        """
+        clean: dict[int, Iterable[int]] = {}
+        for k, v in d.items():
+            if isinstance(k, str):
+                try:
+                    key = _as_index(int(k), "layer index")
+                except ValueError as e:
+                    raise ChannelSelectionError(f"layer key {k!r} is not an integer literal") from e
+            else:
+                key = _as_index(k, "layer index")
+            if key in clean:
+                raise ChannelSelectionError(f"layer {key} appears more than once in {list(d)!r}")
+            clean[key] = v
+        return cls(clean, intermediate_size=intermediate_size)
 
     @classmethod
-    def all_channels(cls, model: nn.Module, layers: Iterable[int] | None = None) -> ChannelSelection:
-        return cls({r.layer_index: range(r.intermediate_size) for r in find_swiglu_ffns(model, layers)})
+    def all_channels(
+        cls, model: nn.Module, layers: Iterable[int] | None = None, *, expert: str | None = None
+    ) -> ChannelSelection:
+        refs = find_swiglu_ffns(model, layers, expert=expert)
+        return cls({r.layer_index: range(r.intermediate_size) for r in refs})
 
     @classmethod
     def top_k_from_scores(
@@ -173,14 +197,14 @@ class ChannelSelection:
     def difference(self, other: ChannelSelection) -> ChannelSelection:
         return ChannelSelection({k: set(v) - set(other.channels(k)) for k, v in self._channels.items()})
 
-    def complement(self, model: nn.Module) -> ChannelSelection:
+    def complement(self, model: nn.Module, *, expert: str | None = None) -> ChannelSelection:
         """All channels of the *affected* layers that are not selected."""
-        sizes = _intermediate_sizes(model, self.layers())
+        sizes = _intermediate_sizes(model, self.layers(), expert)
         return ChannelSelection({k: set(range(sizes[k])) - set(v) for k, v in self._channels.items()})
 
     # ------------------------------------------------------------------ validation
-    def validate(self, model: nn.Module) -> None:
-        sizes = _intermediate_sizes(model, self.layers())
+    def validate(self, model: nn.Module, *, expert: str | None = None) -> None:
+        sizes = _intermediate_sizes(model, self.layers(), expert)
         for layer, chans in self._channels.items():
             if chans[-1] >= sizes[layer]:
                 raise ChannelSelectionError(
@@ -208,12 +232,12 @@ def _as_index(value: object, what: str) -> int:
     return out
 
 
-def _intermediate_sizes(model: nn.Module, layers: Iterable[int]) -> dict[int, int]:
+def _intermediate_sizes(model: nn.Module, layers: Iterable[int], expert: str | None) -> dict[int, int]:
     layers = list(layers)
     if not layers:
         return {}
     try:
-        refs = find_swiglu_ffns(model, layers)
+        refs = find_swiglu_ffns(model, layers, expert=expert)
     except ValueError as e:
         raise ChannelSelectionError(str(e)) from e
     return {r.layer_index: r.intermediate_size for r in refs}
@@ -261,17 +285,19 @@ def _ffn_params(ref: SwiGLURef) -> list[tuple[str, str, nn.Parameter, bool]]:
     return out
 
 
-def channel_mask(model: nn.Module, selection: ChannelSelection, *, trainable: bool = True) -> ParameterMask:
-    """Mask over the gate/up/down weights (and biases) of every affected layer.
+def channel_mask(
+    model: nn.Module, selection: ChannelSelection, *, trainable: bool = True, expert: str | None = None
+) -> ParameterMask:
+    """Mask over the gate/up/down weights (and biases) of every affected layer (of ``expert``).
 
     ``trainable=True``: selected channel slices True, every other element of those tensors False
     (``down_proj.bias`` is owned by no channel and is therefore False).
     ``trainable=False``: the complement – selected slices False, the rest of those FFNs True.
     Parameters outside the affected FFNs are not in the mask (unconstrained, see ParameterMask).
     """
-    selection.validate(model)
+    selection.validate(model, expert=expert)
     mask = ParameterMask()
-    for ref in find_swiglu_ffns(model, selection.layers()):
+    for ref in find_swiglu_ffns(model, selection.layers(), expert=expert):
         idx = selection.index_tensor(ref.layer_index)
         for name, proj, p, is_bias in _ffn_params(ref):
             owned = _owned_slice(proj, idx, p.shape, bias=is_bias)
@@ -279,9 +305,9 @@ def channel_mask(model: nn.Module, selection: ChannelSelection, *, trainable: bo
     return mask
 
 
-def freeze_mask(model: nn.Module, selection: ChannelSelection) -> ParameterMask:
+def freeze_mask(model: nn.Module, selection: ChannelSelection, *, expert: str | None = None) -> ParameterMask:
     """Selected channels frozen; everything else in the affected FFNs may change."""
-    return channel_mask(model, selection, trainable=False)
+    return channel_mask(model, selection, trainable=False, expert=expert)
 
 
 # ============================================================================== training setup
@@ -317,20 +343,28 @@ def setup_channel_training(
     freeze_rest: bool = True,
     disable_grad_outside: bool = False,
     gradient_masks: bool = True,
+    expert: str | None = None,
 ) -> ChannelTrainingHandle:
-    """Prepare ``model`` so that only the selected channel slices can change.
+    """Prepare ``model`` so that only the selected channel slices (of ``expert``) can change.
 
     * The returned :class:`MaskRule` restores every frozen element after each optimizer step with
       ``torch.where`` (exact under Adam momentum and decoupled weight decay).
     * ``gradient_masks``: backward-time hooks zero frozen gradient elements so they never enter
       HF gradient clipping or the logged ``grad_norm``.
-    * ``freeze_rest``: every parameter outside the affected FFNs gets an all-False mask as well
-      (costs one bool per element of the model, stored in the optimizer checkpoint via
-      ``MaskRule.state_dict``). With ``freeze_rest=False`` those parameters are unconstrained.
+    * ``freeze_rest``: every parameter outside the affected FFNs gets an all-False mask as well.
+      Cost: the masks themselves (one bool per model element, in memory), and, because every
+      masked parameter is *tracked* by the rule, :class:`HookedOptimizer` snapshots the whole model
+      (one clone in its working dtype) on every step. Only a SHA-256 of the mask is checkpointed
+      (``MaskRule(store_mask_in_checkpoint=False)``), so at resume the caller must re-create the
+      same selection; a different one is rejected by the digest check. For large models prefer
+      ``disable_grad_outside=True``. With ``freeze_rest=False`` those parameters are unconstrained.
     * ``disable_grad_outside``: every parameter outside the affected FFNs (non-FFN parameters
-      *and* the FFN weights of unselected layers) gets ``requires_grad=False``
-      and ``grad=None`` (torch optimizers skip ``grad is None`` parameters, so stale Adam moments
-      cannot move them); they are then left out of the MaskRule's mask, saving memory. Must be
+      *and* the FFN weights of unselected layers) gets ``requires_grad=False`` and ``grad=None``
+      (torch optimizers skip ``grad is None`` parameters, so stale Adam moments / weight decay
+      cannot move them); they are then left out of the MaskRule's mask, saving memory and the
+      per-step snapshot. ``grad=None`` is also applied to parameters that were already
+      ``requires_grad=False`` (a stale ``.grad`` would otherwise let the optimizer move them);
+      those are not listed in ``disabled_grad`` and stay frozen after ``remove()``. Must be
       called before the trainer builds its optimizer to also keep them out of its param groups.
       If gradient checkpointing is used with frozen embeddings, call
       ``model.enable_input_require_grads()`` yourself.
@@ -338,16 +372,16 @@ def setup_channel_training(
     from research_rl.optim.gradient_hooks import register_gradient_masks
     from research_rl.optim.update_interface import MaskRule
 
-    rule_mask = channel_mask(model, selection, trainable=True)
+    rule_mask = channel_mask(model, selection, trainable=True, expert=expert)
     params = dict(model.named_parameters())
     disabled: list[str] = []
     for name, p in params.items():
         if name in rule_mask:
             continue
         if disable_grad_outside:
+            p.grad = None  # also for parameters frozen before this call (stale grads)
             if p.requires_grad:
                 p.requires_grad_(False)
-                p.grad = None
                 disabled.append(name)
         elif freeze_rest:
             rule_mask.set(name, torch.zeros(p.shape, dtype=torch.bool))
@@ -365,7 +399,10 @@ def setup_channel_training(
 # ============================================================================== channel state
 @dataclass
 class LayerChannels:
-    """Detached copies of the slices owned by ``channels`` in one layer (original dtype)."""
+    """Detached copies of the slices owned by ``channels`` in one layer (original dtype).
+
+    ``module_path`` is the FFN module the slices were read from (``None`` = unknown, not checked).
+    """
 
     channels: torch.Tensor  # long [k]
     gate: torch.Tensor  # [k, hidden]
@@ -373,6 +410,7 @@ class LayerChannels:
     down: torch.Tensor  # [hidden, k]
     gate_bias: torch.Tensor | None = None  # [k]
     up_bias: torch.Tensor | None = None  # [k]
+    module_path: str | None = None
 
     def vectors(self, dtype: torch.dtype = torch.float64) -> torch.Tensor:
         """``[k, D]``: per channel the concatenation [gate row, up row, down col, (biases)]."""
@@ -395,6 +433,7 @@ class LayerChannels:
             down=self.down[:, rows],
             gate_bias=None if self.gate_bias is None else self.gate_bias[rows],
             up_bias=None if self.up_bias is None else self.up_bias[rows],
+            module_path=self.module_path,
         )
 
 
@@ -415,12 +454,23 @@ class ChannelState:
         return ChannelSelection({k: v.channels.tolist() for k, v in self.layers.items()})
 
 
+def _check_path(stored: str | None, target: str | None, layer: int, allow: bool) -> None:
+    if allow or stored is None or target is None or stored == target:
+        return
+    raise ChannelSelectionError(
+        f"layer {layer}: reference was taken from {stored!r} but the target is {target!r} "
+        "(another expert?); pass allow_path_mismatch=True if this is intended"
+    )
+
+
 @torch.no_grad()
-def extract_channels(model: nn.Module, selection: ChannelSelection) -> ChannelState:
+def extract_channels(
+    model: nn.Module, selection: ChannelSelection, *, expert: str | None = None
+) -> ChannelState:
     """Detached CPU copies (original dtype) of the slices owned by the selected channels."""
-    selection.validate(model)
+    selection.validate(model, expert=expert)
     out: dict[int, LayerChannels] = {}
-    for ref in find_swiglu_ffns(model, selection.layers()):
+    for ref in find_swiglu_ffns(model, selection.layers(), expert=expert):
         idx = selection.index_tensor(ref.layer_index, device=ref.gate.weight.device)
 
         def take(t: torch.Tensor, dim: int, idx: torch.Tensor = idx) -> torch.Tensor:
@@ -433,13 +483,16 @@ def extract_channels(model: nn.Module, selection: ChannelSelection) -> ChannelSt
             down=take(ref.down.weight, 1),
             gate_bias=None if ref.gate.bias is None else take(ref.gate.bias, 0),
             up_bias=None if ref.up.bias is None else take(ref.up.bias, 0),
+            module_path=ref.module_path,
         )
     return ChannelState(out)
 
 
-def channel_state(model: nn.Module, layers: Iterable[int] | None = None) -> ChannelState:
+def channel_state(
+    model: nn.Module, layers: Iterable[int] | None = None, *, expert: str | None = None
+) -> ChannelState:
     """Every channel of ``layers`` (default: all FFN layers). Use as a rollback/diff reference."""
-    return extract_channels(model, ChannelSelection.all_channels(model, layers))
+    return extract_channels(model, ChannelSelection.all_channels(model, layers, expert=expert), expert=expert)
 
 
 # ============================================================================== diff + ranking
@@ -474,16 +527,26 @@ class ChannelDiff:
 
 
 def channel_diff(
-    reference: ChannelState, current: ChannelState | nn.Module, layers: Iterable[int] | None = None
+    reference: ChannelState,
+    current: ChannelState | nn.Module,
+    layers: Iterable[int] | None = None,
+    *,
+    expert: str | None = None,
+    allow_path_mismatch: bool = False,
 ) -> dict[int, ChannelDiff]:
-    """Compare two channel states (or a state against a live model) channel by channel."""
+    """Compare two channel states (or a state against a live model) channel by channel.
+
+    ``expert`` selects the expert read from a live model (default: the active one). Comparing slices
+    taken from different module paths (e.g. expert ``a`` against ``base``) needs
+    ``allow_path_mismatch=True``.
+    """
     wanted = list(reference.layers) if layers is None else list(layers)
     for layer in wanted:
         if layer not in reference:
             raise ChannelSelectionError(f"layer {layer} missing from reference state")
     if isinstance(current, nn.Module):
         cur_state = extract_channels(
-            current, ChannelSelection({k: reference[k].channels.tolist() for k in wanted})
+            current, ChannelSelection({k: reference[k].channels.tolist() for k in wanted}), expert=expert
         )
     else:
         cur_state = current
@@ -492,6 +555,7 @@ def channel_diff(
         if layer not in cur_state:
             raise ChannelSelectionError(f"layer {layer} missing from current state")
         ref = reference[layer]
+        _check_path(ref.module_path, cur_state[layer].module_path, layer, allow_path_mismatch)
         cur = cur_state[layer].select(ref.channels.tolist())
         rv, cv = ref.vectors(), cur.vectors()
         if rv.shape != cv.shape:
@@ -521,13 +585,20 @@ def channel_diff(
 
 
 def ranked_channels(diff: Mapping[int, ChannelDiff], metric: Metric = "l2") -> list[tuple[int, int, float]]:
-    """All ``(layer, channel, score)`` sorted by score descending, ties by (layer, channel)."""
+    """All ``(layer, channel, score)`` sorted by score descending, ties by (layer, channel).
+
+    NaN scores (e.g. a weight that became NaN) are placed first, ordered by (layer, channel).
+    """
     entries = [
         (float(s), layer, int(c))
         for layer, d in diff.items()
         for c, s in zip(d.channels.tolist(), d.score(metric).tolist())
     ]
-    return [(layer, c, s) for s, layer, c in sorted(entries, key=lambda e: (-e[0], e[1], e[2]))]
+
+    def key(e: tuple[float, int, int]) -> tuple[int, float, int, int]:
+        return (0, 0.0, e[1], e[2]) if math.isnan(e[0]) else (1, -e[0], e[1], e[2])
+
+    return [(layer, c, s) for s, layer, c in sorted(entries, key=key)]
 
 
 def top_changed_channels(
@@ -538,22 +609,29 @@ def top_changed_channels(
     per_layer: bool = False,
     min_score: float | None = None,
 ) -> ChannelSelection:
-    """The ``k`` most-changed channels (globally or per layer); ``min_score`` drops scores <= it."""
-    entries = [
-        (s, layer, c) for layer, c, s in ranked_channels(diff, metric) if min_score is None or s > min_score
-    ]
-    if any(math.isnan(s) for s, _, _ in entries):
-        raise ChannelSelectionError("NaN change scores")
+    """The ``k`` most-changed channels (globally or per layer); ``min_score`` drops scores <= it.
+
+    Raises :class:`ChannelSelectionError` if any score is NaN (checked before ``min_score`` filtering).
+    """
+    ranked = ranked_channels(diff, metric)
+    nan = [(layer, c) for layer, c, s in ranked if math.isnan(s)]
+    if nan:
+        raise ChannelSelectionError(f"NaN change scores for (layer, channel) {nan[:10]}")
+    entries = [(s, layer, c) for layer, c, s in ranked if min_score is None or s > min_score]
     return ChannelSelection(_rank_entries(entries, k, per_layer=per_layer, largest=True))
 
 
 # ============================================================================== rollback / ablation
 @dataclass
 class RollbackReport:
-    """Per layer: rolled-back channels, how far they were from the reference, elements that changed."""
+    """Per layer: rolled-back channels, how far they were from the reference, elements that changed.
+
+    Both statistics compare the pre-write values with the values actually written (the reference
+    cast to the parameter dtype); NaN -> NaN counts as unchanged.
+    """
 
     channels: dict[int, list[int]]
-    delta_l2: dict[int, torch.Tensor]  # per channel ||current - reference|| before the write (float64)
+    delta_l2: dict[int, torch.Tensor]  # per channel ||current - written|| before the write (float64)
     elements_changed: dict[int, int]
     elements_written: int
 
@@ -569,60 +647,96 @@ def rollback_channels(
     selection: ChannelSelection | None = None,
     *,
     allow_cast: bool = False,
+    expert: str | None = None,
+    allow_path_mismatch: bool = False,
 ) -> RollbackReport:
     """Restore ONLY the selected channels' slices (gate row, up row, down col, biases) to ``reference``.
 
     In place, under ``no_grad``, parameter dtype/device preserved. ``selection`` defaults to every
     channel stored in ``reference``. A reference stored in another dtype is rejected unless
-    ``allow_cast`` (the cast may be lossy). Optimizer state is not touched.
+    ``allow_cast`` (the cast may be lossy). ``expert`` picks the target expert (default: active);
+    a reference taken from another module path is rejected unless ``allow_path_mismatch``.
+    Atomic with respect to validation: every check (missing layers/channels, module path, bias
+    presence, slice shapes, dtypes) runs for all layers before the first write, so a failing call
+    leaves the model untouched. Optimizer state is not touched.
     """
     selection = reference.selection() if selection is None else selection
-    selection.validate(model)
+    selection.validate(model, expert=expert)
     channels: dict[int, list[int]] = {}
     delta_l2: dict[int, torch.Tensor] = {}
     changed: dict[int, int] = {}
-    written = 0
-    for ref_ffn in find_swiglu_ffns(model, selection.layers()):
+    writes: list[tuple[nn.Parameter, int, torch.Tensor, torch.Tensor]] = []
+    # Pass 1: validate everything and stage the casted values; no parameter is written here.
+    for ref_ffn in find_swiglu_ffns(model, selection.layers(), expert=expert):
         layer = ref_ffn.layer_index
         if layer not in reference:
             raise ChannelSelectionError(f"reference has no channels for layer {layer}")
+        _check_path(reference[layer].module_path, ref_ffn.module_path, layer, allow_path_mismatch)
         chans = list(selection.channels(layer))
         src = reference[layer].select(chans)
-        before = extract_channels(model, ChannelSelection({layer: chans}))[layer]
-        delta_l2[layer] = torch.linalg.vector_norm(before.vectors() - src.vectors(), dim=1)
-        changed[layer] = int((before.vectors() != src.vectors()).sum())
-        pairs: list[tuple[nn.Parameter, torch.Tensor | None, int]] = [
-            (ref_ffn.gate.weight, src.gate, 0),
-            (ref_ffn.up.weight, src.up, 0),
-            (ref_ffn.down.weight, src.down, 1),
+        pairs: list[tuple[str, nn.Parameter, torch.Tensor | None, int]] = [
+            ("gate_proj.weight", ref_ffn.gate.weight, src.gate, 0),
+            ("up_proj.weight", ref_ffn.up.weight, src.up, 0),
+            ("down_proj.weight", ref_ffn.down.weight, src.down, 1),
         ]
-        for lin, b in ((ref_ffn.gate, src.gate_bias), (ref_ffn.up, src.up_bias)):
+        for proj, lin, b in (
+            ("gate_proj", ref_ffn.gate, src.gate_bias),
+            ("up_proj", ref_ffn.up, src.up_bias),
+        ):
             if (lin.bias is None) != (b is None):
                 raise ChannelSelectionError(
-                    f"layer {layer}: bias presence differs between model and reference"
+                    f"layer {layer}: {proj} bias presence differs between model and reference"
                 )
             if lin.bias is not None:
-                pairs.append((lin.bias, b, 0))
-        for p, value, dim in pairs:
+                pairs.append((f"{proj}.bias", lin.bias, b, 0))
+        staged: dict[str, torch.Tensor] = {}
+        for what, p, value, dim in pairs:
             assert value is not None
+            want = list(p.shape)
+            want[dim] = len(chans)
+            if list(value.shape) != want:
+                raise ChannelSelectionError(
+                    f"layer {layer} {what}: reference slice shape {tuple(value.shape)} != {tuple(want)}"
+                )
             if value.dtype != p.dtype and not allow_cast:
                 raise ChannelSelectionError(
                     f"layer {layer}: reference dtype {value.dtype} != parameter dtype {p.dtype} "
                     "(pass allow_cast=True to cast)"
                 )
             idx = torch.tensor(chans, dtype=torch.long, device=p.device)
-            p.index_copy_(dim, idx, value.to(device=p.device, dtype=p.dtype))
-            written += value.numel()
+            v = value.to(device=p.device, dtype=p.dtype)
+            writes.append((p, dim, idx, v))
+            staged[what] = v.detach().cpu()
+        before = extract_channels(model, ChannelSelection({layer: chans}), expert=expert)[layer]
+        target = LayerChannels(
+            channels=src.channels,
+            gate=staged["gate_proj.weight"],
+            up=staged["up_proj.weight"],
+            down=staged["down_proj.weight"],
+            gate_bias=staged.get("gate_proj.bias"),
+            up_bias=staged.get("up_proj.bias"),
+        )
+        bv, tv = before.vectors(), target.vectors()
+        diff = _changed(bv, tv)
+        delta_l2[layer] = torch.linalg.vector_norm(torch.where(diff, bv - tv, 0.0), dim=1)
+        changed[layer] = int(diff.sum())
         channels[layer] = chans
+    # Pass 2: write.
+    written = 0
+    for p, dim, idx, v in writes:
+        p.index_copy_(dim, idx, v)
+        written += v.numel()
     return RollbackReport(
         channels=channels, delta_l2=delta_l2, elements_changed=changed, elements_written=written
     )
 
 
 @torch.no_grad()
-def ablate_channels(model: nn.Module, selection: ChannelSelection) -> ChannelState:
+def ablate_channels(
+    model: nn.Module, selection: ChannelSelection, *, expert: str | None = None
+) -> ChannelState:
     """Zero the selected channels' slices in place; returns their previous values (for rollback)."""
-    previous = extract_channels(model, selection)
+    previous = extract_channels(model, selection, expert=expert)
     zeros = ChannelState(
         {
             layer: LayerChannels(
@@ -632,11 +746,12 @@ def ablate_channels(model: nn.Module, selection: ChannelSelection) -> ChannelSta
                 down=torch.zeros_like(lc.down),
                 gate_bias=None if lc.gate_bias is None else torch.zeros_like(lc.gate_bias),
                 up_bias=None if lc.up_bias is None else torch.zeros_like(lc.up_bias),
+                module_path=lc.module_path,
             )
             for layer, lc in previous.layers.items()
         }
     )
-    rollback_channels(model, zeros, selection)
+    rollback_channels(model, zeros, selection, expert=expert)
     return previous
 
 
@@ -690,16 +805,18 @@ def verify_modification_scope(
     *,
     unlisted: Literal["frozen", "free"] = "frozen",
     strict: bool = False,
+    expert: str | None = None,
 ) -> ScopeReport:
     """Report every element of ``before`` that differs in ``after`` outside ``allowed``.
 
     ``allowed`` as a :class:`ChannelSelection` means exactly the selected channel slices may change.
     Parameters absent from the allowed mask are treated as frozen (``unlisted="frozen"``, the
     default for scope checks) or ignored (``"free"``). NaN==NaN counts as unchanged. ``strict``
-    raises :class:`ScopeViolationError` on any violation.
+    raises :class:`ScopeViolationError` on any violation. ``expert`` resolves a ChannelSelection
+    against that expert's FFNs (default: the active one).
     """
     after_t = snapshot(after) if isinstance(after, nn.Module) else after
-    mask = channel_mask(model, allowed) if isinstance(allowed, ChannelSelection) else allowed
+    mask = channel_mask(model, allowed, expert=expert) if isinstance(allowed, ChannelSelection) else allowed
     missing = sorted(set(before) ^ set(after_t))
     if missing:
         raise KeyError(f"snapshots disagree on parameter names: {missing[:10]}")

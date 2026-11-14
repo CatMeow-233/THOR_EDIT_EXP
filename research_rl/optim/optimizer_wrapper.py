@@ -27,6 +27,7 @@ Design guarantees (each covered by a numerical test):
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -137,7 +138,11 @@ class HookedOptimizer(Optimizer):
         rule.on_attach(self)
 
     def request_skip(self) -> None:
-        """Make the next ``step()`` a no-op (counted in ``skipped_steps``)."""
+        """Make a ``step()`` a no-op (counted in ``skipped_steps``, not in ``applied_updates``).
+
+        Called before ``step()`` it skips that step; called from a rule's ``post_grad`` hook it skips
+        the *current* step (before clipping, the inner optimizer and the write hooks).
+        """
         self._skip_next = True
 
     @property
@@ -158,11 +163,7 @@ class HookedOptimizer(Optimizer):
             extras=dict(self.step_extras),
         )
         if self._skip_next:
-            self._skip_next = False
-            self.skipped_steps += 1
-            for rule in self.rules:
-                rule.on_skip(ctx)
-            return None
+            return self._skip(ctx)
 
         # Every optimised parameter, not only requires_grad=True ones: a parameter frozen via
         # requires_grad=False that still holds a stale .grad would otherwise be moved by the inner
@@ -171,12 +172,15 @@ class HookedOptimizer(Optimizer):
         for rule in self.rules:
             if _overrides(rule, "post_grad"):
                 rule.post_grad(ctx, named)
+        if self._skip_next:  # a post_grad hook may veto THIS step (e.g. non-finite gradients)
+            return self._skip(ctx)
 
         if self.clip_norm is not None and self.clip_norm > 0:
             grads = [p for _, p in named if p.grad is not None]
             total = torch.nn.utils.clip_grad_norm_(grads, self.clip_norm) if grads else torch.tensor(0.0)
             self.last_grad_norm = float(total)
             ctx.grad_norm = self.last_grad_norm
+            ctx.extras["nonfinite_grad_norm"] = not math.isfinite(self.last_grad_norm)
 
         # Per-parameter list of rules that track it, in registration order.
         tracked: list[tuple[str, torch.nn.Parameter, list[UpdateRule]]] = []
@@ -223,6 +227,13 @@ class HookedOptimizer(Optimizer):
                 rule.post_step(ctx, displacements)
         self.applied_updates += 1
         return loss
+
+    def _skip(self, ctx: StepContext) -> None:
+        self._skip_next = False
+        self.skipped_steps += 1
+        for rule in self.rules:
+            rule.on_skip(ctx)
+        return None
 
     # ------------------------------------------------------------------ persistence
     def _rule_key(self, i: int, rule: UpdateRule) -> str:

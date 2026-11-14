@@ -164,3 +164,17 @@ def test_controller_contract_errors_and_registry():
         True,
         True,
     ]
+
+
+def test_threshold_halting_boundary_is_strict():
+    """‖Δh‖ exactly equal to eps does NOT halt (strict ``<``); just below does; min_depth gates both."""
+    eps = 0.5  # exactly representable, as are the displacements below
+    ctrl = ThresholdHalting(eps, min_depth=2)
+    prev = torch.zeros(4, 2, 3)
+    cur = torch.zeros(4, 2, 3)
+    cur[0, 0, 0] = 0.5  # norm == eps
+    cur[1, 1, 2] = -0.25  # norm < eps
+    cur[2, 0, 1] = 0.75  # norm > eps
+    # row 3 unchanged (norm 0)
+    assert ctrl.halt(2, prev, cur).tolist() == [False, True, False, True]
+    assert ctrl.halt(1, prev, cur).tolist() == [False, False, False, False]  # below min_depth

@@ -1,6 +1,7 @@
 # Direct Preference Optimisation: offline preference optimisation on fixed (prompt, chosen, rejected) pairs,
 # not RL. Load with ExperimentConfig.load; run with examples/dpo_tiny.py.
 # model.name_or_path "research_rl:tiny" is a sentinel understood by the example script (offline tiny Llama).
+config_version: "1.0"
 study_id: example-dpo-tiny
 seed: 0
 output_dir: runs

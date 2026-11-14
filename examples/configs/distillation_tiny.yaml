@@ -3,6 +3,7 @@
 # "research_rl:tiny" (student or teacher) is a sentinel understood by examples/distillation_tiny.py: it writes a
 # random offline tiny Llama into the output dir. Pass --model / --teacher <hf id or path> for real models
 # (they must share the vocabulary).
+config_version: "1.0"
 study_id: example-distillation-tiny
 seed: 0
 output_dir: runs

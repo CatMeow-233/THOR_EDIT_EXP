@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
+import math
 
 import pytest
 import torch
@@ -11,9 +13,12 @@ from datasets import Dataset
 from transformers import TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
+from research_rl.models.expert_manager import ExpertManager
 from research_rl.models.ffn_channels import (
+    ChannelDiff,
     ChannelSelection,
     ChannelSelectionError,
+    ChannelState,
     ScopeViolationError,
     ablate_channels,
     channel_diff,
@@ -89,7 +94,10 @@ def test_selection_normalises_validates_and_combines(tiny_model):
     assert s.union(t).to_dict() == {0: [7, 8], 1: [0, 3, 5, 6]}
     assert s.intersection(t).to_dict() == {1: [5]}
     assert s.difference(t).to_dict() == {0: [7], 1: [0, 3]}
-    assert s.complement(tiny_model).count() == 2 * INTER - 4
+    assert s.complement(tiny_model).to_dict() == {
+        0: [c for c in range(INTER) if c != 7],
+        1: [c for c in range(INTER) if c not in (0, 3, 5)],
+    }
     s.validate(tiny_model)
     for bad in ({0: [INTER]}, {LAYERS: [0]}):
         with pytest.raises(ChannelSelectionError):
@@ -99,6 +107,13 @@ def test_selection_normalises_validates_and_combines(tiny_model):
             ChannelSelection(bad)
     with pytest.raises(ChannelSelectionError):
         ChannelSelection({0: [64]}, intermediate_size=64)
+
+
+def test_from_dict_rejects_non_integer_layer_keys():
+    assert ChannelSelection.from_dict({2: [1], "0": [4]}).to_dict() == {0: [4], 2: [1]}
+    for bad in ({1.9: [0]}, {True: [0]}, {"x": [0]}, {"1.0": [0]}, {"-1": [0]}, {"1": [0], 1: [1]}):
+        with pytest.raises(ChannelSelectionError):
+            ChannelSelection.from_dict(bad)
 
 
 def test_top_k_from_scores_matches_sorted_reference():
@@ -117,6 +132,10 @@ def test_top_k_from_scores_matches_sorted_reference():
     assert ChannelSelection.top_k_from_scores(scores, 1).to_dict() == {0: [2]}
     per = ChannelSelection.top_k_from_scores(scores, 2, per_layer=True)
     assert per.to_dict() == {k: sorted(torch.topk(v, 2).indices.tolist()) for k, v in scores.items()}
+    low: dict[int, list[int]] = {}
+    for _, layer, c in sorted(flat, key=lambda e: (e[0], e[1], e[2]))[:4]:
+        low.setdefault(layer, []).append(c)
+    assert ChannelSelection.top_k_from_scores(scores, 4, largest=False) == ChannelSelection(low)
     with pytest.raises(ChannelSelectionError):
         ChannelSelection.top_k_from_scores({0: torch.tensor([1.0, float("nan")])}, 1)
 
@@ -135,32 +154,65 @@ def test_channel_mask_and_freeze_mask_match_manual(tiny_model):
         assert torch.equal(frozen.get(name), ~ref[name]), name
 
 
-def test_bias_entries_are_owned_by_channels():
-    lin_model = build_tiny_llama(40, seed=1)
-    mlp = lin_model.model.layers[0].mlp
+def biased_model(seed: int = 1):
+    """Tiny Llama whose layer-0 FFN projections all carry biases."""
+    model = build_tiny_llama(40, seed=seed).double()
+    mlp = model.model.layers[0].mlp
+    g = torch.Generator().manual_seed(seed)
     for proj in PROJ:
         old = getattr(mlp, proj)
-        new = torch.nn.Linear(old.in_features, old.out_features, bias=True)
+        new = torch.nn.Linear(old.in_features, old.out_features, bias=True, dtype=torch.float64)
+        with torch.no_grad():
+            new.weight.copy_(old.weight)
+            new.bias.copy_(torch.randn(old.out_features, generator=g, dtype=torch.float64))
         setattr(mlp, proj, new)
-    sel = ChannelSelection({0: [2, 5]})
-    mask = channel_mask(lin_model, sel)
-    gb = mask.get("model.layers.0.mlp.gate_proj.bias")
-    assert gb.tolist() == [i in (2, 5) for i in range(INTER)]
-    assert not mask.get("model.layers.0.mlp.down_proj.bias").any()  # hidden-space bias: no owner
-    assert freeze_mask(lin_model, sel).get("model.layers.0.mlp.down_proj.bias").all()
-    # rollback restores bias entries too
-    base = channel_state(lin_model, [0])
-    with torch.no_grad():
-        mlp.up_proj.bias.add_(1.0)
-    diff = channel_diff(base, lin_model)[0]
-    torch.testing.assert_close(diff.per_projection_l2["bias"], torch.ones(INTER, dtype=torch.float64))
-    assert all(not diff.per_projection_l2[p].any() for p in PROJ)
-    torch.testing.assert_close(diff.l2, diff.max_abs, rtol=1e-15, atol=0)
-    before = mlp.up_proj.bias.detach().clone()
-    rollback_channels(lin_model, base, sel)
-    expected = before.clone()
-    expected[[2, 5]] = base[0].up_bias[[2, 5]]
-    assert torch.equal(mlp.up_proj.bias, expected)
+    return model
+
+
+def test_bias_entries_are_owned_by_channels():
+    model = biased_model()
+    chans = [2, 5]
+    sel = ChannelSelection({0: chans})
+    owned = torch.tensor([i in chans for i in range(INTER)])
+    mask = channel_mask(model, sel)
+    bname = "model.layers.0.mlp.{}.bias".format
+    assert torch.equal(mask.get(bname("gate_proj")), owned)
+    assert torch.equal(mask.get(bname("up_proj")), owned)
+    assert not mask.get(bname("down_proj")).any()  # hidden-space bias: no owner
+    frozen = freeze_mask(model, sel)
+    assert torch.equal(frozen.get(bname("up_proj")), ~owned) and frozen.get(bname("down_proj")).all()
+
+    base_sd, base = snapshot(model), channel_state(model, [0])
+    assert torch.equal(base[0].gate_bias, base_sd[bname("gate_proj")])
+    trained = perturbed_copy(model, seed=13)  # every weight AND bias element moves
+    trained_sd = snapshot(trained)
+    diff = channel_diff(base, trained)[0]
+    manual_bias = torch.stack(
+        [trained_sd[bname(p)] - base_sd[bname(p)] for p in ("gate_proj", "up_proj")], dim=1
+    )
+    torch.testing.assert_close(
+        diff.per_projection_l2["bias"], torch.linalg.vector_norm(manual_bias, dim=1), rtol=1e-12, atol=0
+    )
+    report = rollback_channels(trained, base, sel)
+    # hybrid reference: owned weight slices AND owned gate/up bias entries back to base; down bias stays
+    allowed = manual_allowed({0: chans}, model)
+    allowed[bname("gate_proj")] = owned.clone()
+    allowed[bname("up_proj")] = owned.clone()
+    after = snapshot(trained)
+    for n in base_sd:
+        assert torch.equal(after[n], torch.where(allowed[n], base_sd[n], trained_sd[n])), n
+    assert report.elements_written == len(chans) * (3 * HIDDEN + 2)
+    assert report.total_elements_changed == len(chans) * (3 * HIDDEN + 2)
+
+
+def test_rollback_rejects_bias_presence_mismatch_without_writing():
+    with_bias, plain = biased_model(seed=2), build_tiny_llama(40, seed=2).double()
+    sel = ChannelSelection({0: [1]})
+    for model, ref in ((with_bias, channel_state(plain)), (plain, channel_state(with_bias))):
+        before = snapshot(model)
+        with pytest.raises(ChannelSelectionError, match="bias presence"):
+            rollback_channels(model, ref, sel)
+        assert all(torch.equal(before[n], t) for n, t in snapshot(model).items())
 
 
 # ---------------------------------------------------------------------------------- (a) localisation
@@ -311,12 +363,72 @@ def test_rollback_is_dtype_preserving_and_exact_in_bf16(tokenizer):
     assert all(p.dtype == torch.bfloat16 for p in trained.parameters())
 
 
-def test_rollback_requires_reference_channels(tiny_model):
-    partial = extract_channels(tiny_model, ChannelSelection({0: [1, 2]}))
-    with pytest.raises(ChannelSelectionError):
-        rollback_channels(tiny_model, partial, ChannelSelection({0: [3]}))
-    with pytest.raises(ChannelSelectionError):
-        rollback_channels(tiny_model, partial, ChannelSelection({1: [1]}))
+def test_failed_rollback_leaves_model_untouched(tiny_model):
+    """Every validation runs for all layers before the first write (layer 0 valid, layer 1 bad)."""
+    full = channel_state(tiny_model)
+    with torch.no_grad():
+        for p in tiny_model.parameters():
+            p.add_(1.0)  # the valid layer-0 part of each rollback below WOULD change the model
+    sel = ChannelSelection({0: [1, 2], 1: [5]})
+    l1 = full[1]
+    bad_refs = {
+        "missing layer": ChannelState({0: full[0]}),
+        "missing channel": ChannelState({0: full[0], 1: l1.select([0, 1])}),
+        "dtype": ChannelState({0: full[0], 1: dataclasses.replace(l1, gate=l1.gate.double())}),
+        "bias presence": ChannelState({0: full[0], 1: dataclasses.replace(l1, up_bias=torch.zeros(INTER))}),
+        "shape": ChannelState({0: full[0], 1: dataclasses.replace(l1, down=l1.down[:-1])}),
+        "module path": ChannelState({0: full[0], 1: dataclasses.replace(l1, module_path="other.mlp")}),
+    }
+    before = snapshot(tiny_model)
+    for what, ref in bad_refs.items():
+        with pytest.raises(ChannelSelectionError):
+            rollback_channels(tiny_model, ref, sel)
+        after = snapshot(tiny_model)
+        assert all(torch.equal(before[n], after[n]) for n in before), what
+    # positive control: the same call with a valid reference does write layer 0
+    rollback_channels(tiny_model, full, sel)
+    assert not torch.equal(before[wname(0, "gate_proj")], tiny_model.model.layers[0].mlp.gate_proj.weight)
+
+
+def test_rollback_report_counts_only_elements_that_really_change(tokenizer):
+    base = make_model(tokenizer, torch.float64)
+    ref = channel_state(base)
+    model = copy.deepcopy(base)
+    sel = ChannelSelection({0: [3, 9], 1: [7]})
+    with torch.no_grad():  # only some selected elements differ from the reference (+ unselected ones)
+        model.model.layers[0].mlp.gate_proj.weight[3, :5] += 1.0
+        model.model.layers[0].mlp.down_proj.weight[2, 9] -= 3.0
+        model.model.layers[1].mlp.up_proj.weight[7, 0] += 0.5
+        model.model.layers[1].mlp.up_proj.weight[8] += 1.0  # unselected channel
+    pre = snapshot(model)
+    report = rollback_channels(model, ref, sel)
+    post = snapshot(model)
+    actual = sum(int((pre[n] != post[n]).sum()) for n in pre)
+    assert actual == 7 and report.total_elements_changed == actual
+    assert report.elements_changed == {0: 6, 1: 1}
+    torch.testing.assert_close(
+        report.delta_l2[0], torch.tensor([math.sqrt(5.0), 3.0], dtype=torch.float64), rtol=1e-12, atol=0
+    )
+    assert report.elements_written == 3 * 3 * HIDDEN
+    assert rollback_channels(model, ref, sel).total_elements_changed == 0  # idempotent
+
+    # lossy cast: a second identical rollback changes nothing and must report 0
+    bf = make_model(tokenizer, torch.bfloat16)
+    f32_ref = channel_state(make_model(tokenizer, torch.float32, seed=3))
+    one = ChannelSelection({0: [0]})
+    first = rollback_channels(bf, f32_ref, one, allow_cast=True)
+    assert first.total_elements_changed > 0
+    mid = snapshot(bf)
+    second = rollback_channels(bf, f32_ref, one, allow_cast=True)
+    assert all(torch.equal(mid[n], t) for n, t in snapshot(bf).items())
+    assert second.total_elements_changed == 0 and not second.delta_l2[0].any()
+
+    # NaN -> NaN is not a change (same convention as verify_modification_scope)
+    with torch.no_grad():
+        model.model.layers[0].mlp.gate_proj.weight[3, 0] = float("nan")
+    nan_ref = channel_state(model)
+    nan_report = rollback_channels(model, nan_ref, ChannelSelection({0: [3]}))
+    assert nan_report.total_elements_changed == 0 and not nan_report.delta_l2[0].isnan().any()
 
 
 # ---------------------------------------------------------------------------------- (c) channel-only training
@@ -339,21 +451,25 @@ def warmed_up(tokenizer, wd: float):
     return model, opt
 
 
+@pytest.mark.parametrize("sel", [SEL, {0: [3, 10, 40]}], ids=["both_layers", "layer1_untouched"])
 @pytest.mark.parametrize("disable_grad_outside", [False, True])
-def test_channel_only_training_after_warmup_matches_reference(tokenizer, disable_grad_outside):
+def test_channel_only_training_after_warmup_matches_reference(tokenizer, disable_grad_outside, sel):
     model, inner = warmed_up(tokenizer, wd=0.1)
     ref_model = copy.deepcopy(model)
     ref_opt = torch.optim.AdamW(ref_model.parameters(), lr=1e-2, weight_decay=0.1)
     ref_opt.load_state_dict(copy.deepcopy(inner.state_dict()))  # load_state_dict would alias tensors
+    free_model = copy.deepcopy(model)  # unmasked control run
+    free_opt = torch.optim.AdamW(free_model.parameters(), lr=1e-2, weight_decay=0.1)
+    free_opt.load_state_dict(copy.deepcopy(inner.state_dict()))
     params = dict(model.named_parameters())
     assert inner.state[params[wname(0, "gate_proj")]]["exp_avg"][11].abs().sum() > 0  # warm moments
 
     opt = HookedOptimizer(inner, model.named_parameters())
-    handle = setup_channel_training(model, ChannelSelection(SEL), disable_grad_outside=disable_grad_outside)
+    handle = setup_channel_training(model, ChannelSelection(sel), disable_grad_outside=disable_grad_outside)
     for rule in handle.rules:
         opt.add_rule(rule)
     before = snapshot(model)
-    allowed = manual_allowed(SEL, model)
+    allowed = manual_allowed(sel, model)
     for step in range(3, 7):
         opt.zero_grad(set_to_none=False)  # zero (not None) grads: stale moments would act on them
         lm_loss(model, tokenizer, step).backward()
@@ -365,12 +481,21 @@ def test_channel_only_training_after_warmup_matches_reference(tokenizer, disable
         with torch.no_grad():
             for n, p in ref_model.named_parameters():
                 p.copy_(torch.where(allowed[n], p, before[n]))
+        free_opt.zero_grad()
+        lm_loss(free_model, tokenizer, step).backward()
+        free_opt.step()
+    unmasked = snapshot(free_model)
     after = snapshot(model)
     ref_after = snapshot(ref_model)
     for n in after:
         assert torch.equal(after[n], ref_after[n]), n
-    verify_modification_scope(before, after, ChannelSelection(SEL), model, strict=True)
-    for layer, chans in SEL.items():
+    verify_modification_scope(before, after, ChannelSelection(sel), model, strict=True)
+    for layer in range(LAYERS):
+        if layer not in sel:  # an FFN layer with no selected channel is entirely frozen
+            assert all(torch.equal(before[wname(layer, p)], after[wname(layer, p)]) for p in PROJ)
+            # ...although unmasked AdamW (warm moments + weight decay) would have moved it
+            assert not torch.equal(before[wname(layer, "gate_proj")], unmasked[wname(layer, "gate_proj")])
+    for layer, chans in sel.items():
         for c in chans:
             assert not torch.equal(before[wname(layer, "gate_proj")][c], after[wname(layer, "gate_proj")][c])
             assert not torch.equal(before[wname(layer, "up_proj")][c], after[wname(layer, "up_proj")][c])
@@ -382,6 +507,31 @@ def test_channel_only_training_after_warmup_matches_reference(tokenizer, disable
     handle.remove()
     assert all(p.requires_grad for p in model.parameters())
     assert handle.gradient_hooks is None
+
+
+def test_disable_grad_outside_also_drops_stale_grads_of_already_frozen_params(tokenizer):
+    model, inner = warmed_up(tokenizer, wd=0.1)
+    params = dict(model.named_parameters())
+    embed = params["model.embed_tokens.weight"]
+    embed.requires_grad_(False)  # frozen by the user earlier: still holds a stale grad + warm moments
+    assert embed.grad is not None and embed.grad.abs().sum() > 0
+    assert inner.state[embed]["exp_avg"].abs().sum() > 0
+    opt = HookedOptimizer(inner, model.named_parameters())
+    sel = ChannelSelection({0: [3], 1: [1]})
+    handle = setup_channel_training(model, sel, disable_grad_outside=True)
+    for rule in handle.rules:
+        opt.add_rule(rule)
+    assert embed.grad is None and "model.embed_tokens.weight" not in handle.disabled_grad
+    before = snapshot(model)
+    for step in range(3, 5):
+        opt.zero_grad(set_to_none=False)
+        lm_loss(model, tokenizer, step).backward()
+        opt.step()
+    report = verify_modification_scope(before, model, sel, model, strict=True)
+    assert report.changed_allowed > 0 and torch.equal(before["model.embed_tokens.weight"], embed.detach())
+    handle.remove()
+    assert not embed.requires_grad  # stays frozen: it was not frozen by the handle
+    assert all(p.requires_grad for n, p in params.items() if n != "model.embed_tokens.weight")
 
 
 @pytest.mark.parametrize("wd", [0.0, 0.1])
@@ -545,6 +695,23 @@ def test_diff_metrics_and_ranking_match_manual(tiny_model):
         assert top.to_dict() == {
             k: sorted(torch.topk(v, 3).indices.tolist()) for k, v in scores[metric].items()
         }
+    only1 = channel_diff(channel_state(base), trained, layers=[1])
+    assert list(only1) == [1]
+    torch.testing.assert_close(only1[1].l2, scores["l2"][1], rtol=1e-12, atol=0)
+
+
+def test_nan_scores_rank_first_and_are_rejected_by_top_k():
+    l2 = torch.tensor([float("nan"), 1.0, 2.0, float("nan")], dtype=torch.float64)
+    zeros = torch.zeros(4, dtype=torch.float64)
+    d = ChannelDiff(
+        layer=0, channels=torch.arange(4), l2=l2, max_abs=zeros, ref_l2=zeros + 1, per_projection_l2={}
+    )
+    ranked = ranked_channels({0: d})
+    assert [(layer, c) for layer, c, _ in ranked] == [(0, 0), (0, 3), (0, 2), (0, 1)]
+    assert math.isnan(ranked[0][2]) and ranked[2][2] == 2.0
+    for kwargs in ({}, {"min_score": 0.0}, {"min_score": 5.0}):
+        with pytest.raises(ChannelSelectionError, match="NaN"):
+            top_changed_channels({0: d}, 2, **kwargs)
 
 
 def test_verify_scope_with_parameter_mask_and_unlisted_policy(tiny_model):
@@ -552,7 +719,7 @@ def test_verify_scope_with_parameter_mask_and_unlisted_policy(tiny_model):
     after = {n: t.clone() for n, t in before.items()}
     q = "model.layers.0.self_attn.q_proj.weight"
     after[q][0, :3] += 1.0  # allowed below
-    after[q][5, 1] += 1.0  # not allowed
+    after[q][5, 1] -= 2.0  # not allowed (negative delta: max_abs must use |Δ|)
     after["lm_head.weight"][2, 2] += 1.0  # unlisted parameter
     after["model.norm.weight"][0] = float("nan")
     before["model.norm.weight"][0] = after["model.norm.weight"][0] = float("nan")  # NaN == NaN: unchanged
@@ -564,11 +731,19 @@ def test_verify_scope_with_parameter_mask_and_unlisted_policy(tiny_model):
         q: [[5, 1]],
         "lm_head.weight": [[2, 2]],
     }
-    assert frozen.changed_allowed == 3 and frozen.violations[q].max_abs == pytest.approx(1.0)
+    assert frozen.changed_allowed == 3 and frozen.violations[q].max_abs == pytest.approx(2.0)
     free = verify_modification_scope(before, after, mask, tiny_model, unlisted="free")
     assert list(free.violations) == [q] and free.params_checked == 1
     with pytest.raises(ScopeViolationError, match="lm_head"):
         verify_modification_scope(before, after, mask, tiny_model, strict=True)
+    # malformed inputs are rejected, not silently skipped
+    with pytest.raises(KeyError, match="not in the snapshots"):
+        verify_modification_scope(before, after, ParameterMask({"no.such.weight": allowed}), tiny_model)
+    with pytest.raises(KeyError, match="disagree"):
+        verify_modification_scope(before, {n: t for n, t in after.items() if n != q}, mask, tiny_model)
+    for changed in (after[q].double(), after[q][:-1]):
+        with pytest.raises(ValueError, match="shape/dtype"):
+            verify_modification_scope(before, {**after, q: changed}, mask, tiny_model)
 
 
 def test_setup_without_freeze_rest_or_gradient_masks(tokenizer):
@@ -596,3 +771,65 @@ def test_setup_without_freeze_rest_or_gradient_masks(tokenizer):
     # parameters outside the affected FFN are unconstrained with freeze_rest=False
     assert not torch.equal(before["model.embed_tokens.weight"], after["model.embed_tokens.weight"])
     assert not torch.equal(before[wname(1, "gate_proj")], after[wname(1, "gate_proj")])
+
+
+# ---------------------------------------------------------------------------------- expert containers
+def test_channel_ops_target_one_expert_and_refuse_cross_expert_references(tiny_model):
+    model = tiny_model
+    mgr = ExpertManager(model)
+    mgr.attach()
+    mgr.create_expert("a")
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if ".experts.a." in n:
+                p.add_(1.0)
+    ename = "model.layers.{}.mlp.experts.{}.{}.weight".format
+    sel = ChannelSelection({0: [0, 4]})
+    assert set(channel_mask(model, sel, expert="a").names()) == {ename(0, "a", p) for p in PROJ}
+    ref_base = channel_state(model)  # active expert: base
+    assert ref_base[0].module_path == "model.layers.0.mlp.experts.base"
+    mgr.activate("a")
+    before = snapshot(model)
+    with pytest.raises(ChannelSelectionError, match="allow_path_mismatch"):
+        rollback_channels(model, ref_base, sel)
+    with pytest.raises(ChannelSelectionError, match="allow_path_mismatch"):
+        channel_diff(ref_base, model)
+    assert all(torch.equal(before[n], t) for n, t in snapshot(model).items())
+
+    # explicit expert= addresses base although "a" is active
+    st_base = channel_state(model, expert="base")
+    assert st_base[1].module_path == "model.layers.1.mlp.experts.base"
+    assert torch.equal(st_base[0].gate, ref_base[0].gate) and torch.equal(st_base[1].down, ref_base[1].down)
+    assert channel_diff(ref_base, model, expert="base")[0].changed_channels() == []
+    assert set(freeze_mask(model, sel, expert="base").names()) == {ename(0, "base", p) for p in PROJ}
+    assert sel.complement(model, expert="a").to_dict() == {0: [c for c in range(INTER) if c not in (0, 4)]}
+    previous = ablate_channels(model, sel, expert="base")
+    ablated = snapshot(model)
+    zeroed = {n: torch.zeros(t.shape, dtype=torch.bool) for n, t in before.items()}
+    zeroed[ename(0, "base", "gate_proj")][[0, 4]] = True
+    zeroed[ename(0, "base", "up_proj")][[0, 4]] = True
+    zeroed[ename(0, "base", "down_proj")][:, [0, 4]] = True
+    for n in before:
+        assert torch.equal(ablated[n], torch.where(zeroed[n], 0.0, before[n])), n
+    rollback_channels(model, previous, expert="base")
+    assert all(torch.equal(before[n], t) for n, t in snapshot(model).items())
+    # nothing changes (same values)
+    assert rollback_channels(model, ref_base, sel, expert="base").total_elements_changed == 0
+    diff_a = channel_diff(ref_base, model, allow_path_mismatch=True)
+    torch.testing.assert_close(diff_a[0].max_abs, torch.ones(INTER, dtype=torch.float64), rtol=0, atol=1e-6)
+    # deliberate cross-expert reset: only expert a's selected slices change, to base's values
+    rollback_channels(model, ref_base, sel, allow_path_mismatch=True)
+    after = snapshot(model)
+    allowed = {n: torch.zeros(t.shape, dtype=torch.bool) for n, t in before.items()}
+    allowed[ename(0, "a", "gate_proj")][[0, 4]] = True
+    allowed[ename(0, "a", "up_proj")][[0, 4]] = True
+    allowed[ename(0, "a", "down_proj")][:, [0, 4]] = True
+    for n in before:
+        base_n = n.replace(".experts.a.", ".experts.base.")
+        assert torch.equal(after[n], torch.where(allowed[n], before[base_n], before[n])), n
+    assert verify_modification_scope(before, after, sel, model, expert="a").ok
+    assert not verify_modification_scope(before, after, sel, model, expert="base").ok
+    handle = setup_channel_training(model, sel, expert="base", disable_grad_outside=True)
+    assert set(handle.mask.names()) == {ename(0, "base", p) for p in PROJ}
+    assert ename(0, "a", "gate_proj") in handle.disabled_grad
+    handle.remove()

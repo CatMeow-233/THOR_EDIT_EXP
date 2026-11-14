@@ -295,6 +295,72 @@ def test_greedy_generate_ignores_sampling_settings_in_generation_config(tokenize
     assert greedy_generate(model, tokenizer, PROMPTS, max_new_tokens=8) == ref
 
 
+def _first_token_id(tokenizer, text: str) -> int:
+    return ids_of(tokenizer, text[0])[0]
+
+
+# Each entry sets one logits-processor / stopping knob on the model's generation_config. Values are
+# chosen so that HF generate *would* change the output if the knob leaked into greedy_generate.
+GEN_CONFIG_KNOBS = {
+    "no_repeat_ngram_size": lambda tok, ref: 1,  # every reference below repeats a character
+    "suppress_tokens": lambda tok, ref: [_first_token_id(tok, ref[0])],
+    "begin_suppress_tokens": lambda tok, ref: [_first_token_id(tok, ref[0])],
+    "bad_words_ids": lambda tok, ref: [[_first_token_id(tok, ref[0])]],
+    "sequence_bias": lambda tok, ref: {(_first_token_id(tok, ref[0]),): -1e4},
+    "repetition_penalty": lambda tok, ref: 50.0,
+    "stop_strings": lambda tok, ref: [ref[0][1]],
+}
+
+
+@pytest.mark.parametrize("knob", sorted(GEN_CONFIG_KNOBS))
+def test_greedy_generate_ignores_logits_processors_in_generation_config(tokenizer, knob):
+    model = sharp_model(tokenizer)
+    ref = [manual_greedy(model, tokenizer, p, 8, tokenizer.eos_token_id) for p in PROMPTS]
+    assert all(len(set(r)) < len(r) for r in ref[:3])  # repeats: no_repeat_ngram_size would bite
+    value = GEN_CONFIG_KNOBS[knob](tokenizer, ref)
+    original = model.generation_config
+    setattr(original, knob, value)
+    before = original.to_dict()
+    if knob == "stop_strings":
+        leaked = model.generate(
+            input_ids=torch.tensor([ids_of(tokenizer, PROMPTS[0])]),
+            max_new_tokens=8,
+            tokenizer=tokenizer,
+            pad_token_id=0,
+        )
+    else:
+        leaked = model.generate(input_ids=torch.tensor([ids_of(tokenizer, PROMPTS[0])]), max_new_tokens=8)
+    leaked_text = tokenizer.decode(leaked[0, len(PROMPTS[0]) :].tolist())
+    assert leaked_text != ref[0]  # sanity: plain HF generate does honour the knob
+    assert greedy_generate(model, tokenizer, PROMPTS, max_new_tokens=8) == ref
+    assert greedy_generate(model, tokenizer, PROMPTS, max_new_tokens=8, batch_size=3) == ref
+    assert model.generation_config is original and original.to_dict() == before  # restored, unchanged
+
+
+@pytest.mark.parametrize(("knob", "value"), [("min_new_tokens", 8), ("min_length", 20)])
+def test_greedy_generate_ignores_min_length_in_generation_config(tokenizer, knob, value):
+    model = sharp_model(tokenizer)
+    full = manual_greedy(model, tokenizer, "12+3=", 8, None)
+    pos = next(i for i in range(2, len(full)) if full[i] not in full[:i])
+    tok = copy.deepcopy(tokenizer)
+    tok.eos_token = full[pos]  # the greedy path emits this EOS at step `pos`
+    setattr(model.generation_config, knob, value)  # would forbid EOS until 8 new tokens
+    assert greedy_generate(model, tok, ["12+3="], max_new_tokens=8) == [full[:pos]]
+
+
+def test_greedy_generate_through_peft_wrapper_ignores_inner_generation_config(tokenizer):
+    peft = pytest.importorskip("peft")
+    model = sharp_model(tokenizer)
+    ref = [manual_greedy(model, tokenizer, p, 8, tokenizer.eos_token_id) for p in PROMPTS]
+    model.generation_config.suppress_tokens = [_first_token_id(tokenizer, ref[0])]
+    model.generation_config.no_repeat_ngram_size = 1
+    inner_config = model.generation_config
+    # LoRA B is zero-initialised, so the wrapped model computes the same function as ``model``
+    wrapped = peft.get_peft_model(model, peft.LoraConfig(r=2, target_modules=["q_proj"], lora_alpha=4))
+    assert greedy_generate(wrapped, tokenizer, PROMPTS, max_new_tokens=8) == ref
+    assert model.generation_config is inner_config and inner_config.no_repeat_ngram_size == 1
+
+
 def test_greedy_generate_stops_at_tokenizer_eos(tokenizer):
     model = sharp_model(tokenizer)
     full = manual_greedy(model, tokenizer, "12+3=", 8, None)
@@ -341,6 +407,15 @@ def test_probe_task_and_suite_validation():
         RetentionSuite([t, t])
     with pytest.raises(ValueError):
         RetentionSuite([])
+    with pytest.raises(ValueError, match="reserved"):  # would collide with the logit_kl aggregate
+        RetentionSuite([ProbeTask("all", (("p", "a"),)), t])
+
+
+def test_prefix_match_scorer_normalises_whitespace():
+    assert prefix_match_scorer(" 12  3x", "12 3") == 1.0  # raw " 12  3x".startswith("12 3") is False
+    assert prefix_match_scorer("12\n3 rest", " 12 3 ") == 1.0
+    assert prefix_match_scorer("12 4", "12 3") == 0.0
+    assert prefix_match_scorer("1", "12") == 0.0
 
 
 # ---------------------------------------------------------------------------------- logit KL
@@ -360,8 +435,10 @@ def test_logit_kl_perturbed_matches_manual_reference(tokenizer):
     base = sharp_model(tokenizer)
     cur = perturbed(base)
     cur.train()
+    base.train()
     res = logit_kl(base, cur, tokenizer, KL_PROMPTS)
-    assert cur.training
+    assert cur.training and base.training  # both modes restored
+    base.eval()
     refs = [manual_kl_sum(base, cur.eval(), tokenizer, p) for p in KL_PROMPTS]
     assert res.per_prompt_kl == pytest.approx([r[0] for r in refs], rel=1e-9)
     total, count = sum(r[0] for r in refs), sum(r[1] for r in refs)
@@ -371,6 +448,55 @@ def test_logit_kl_perturbed_matches_manual_reference(tokenizer):
     assert abs(res.mean_kl - per_prompt_mean) > 1e-3 * res.mean_kl  # token-weighted, not prompt-weighted
     reverse = logit_kl(cur, base, tokenizer, KL_PROMPTS).mean_kl
     assert abs(reverse - res.mean_kl) > 1e-3 * res.mean_kl  # direction KL(base || current) matters
+
+
+class MaskedVocab(torch.nn.Module):
+    """Wraps a causal LM and sets the logits of ``masked_ids`` to -inf (a constrained vocab head)."""
+
+    def __init__(self, inner, masked_ids) -> None:
+        super().__init__()
+        self.inner = inner
+        self.masked_ids = list(masked_ids)
+
+    def forward(self, input_ids, **kwargs):
+        out = self.inner(input_ids=input_ids, **kwargs)
+        out.logits[..., self.masked_ids] = float("-inf")
+        return out
+
+
+@torch.no_grad()
+def manual_kl_sum_with_zeros(base, cur, tokenizer, prompt: str) -> float:
+    """Reference KL in float64 that skips p_base == 0 terms (0 log 0 = 0) explicitly."""
+    ids = torch.tensor([ids_of(tokenizer, prompt)])
+    pb = torch.softmax(base(input_ids=ids).logits[0].double(), -1)
+    pc = torch.softmax(cur(input_ids=ids).logits[0].double(), -1)
+    total = 0.0
+    for t in range(ids.shape[1]):
+        for v in range(pb.shape[1]):
+            p, q = float(pb[t, v]), float(pc[t, v])
+            if p == 0.0:
+                continue
+            total += math.inf if q == 0.0 else p * (math.log(p) - math.log(q))
+    return total
+
+
+def test_logit_kl_handles_minus_inf_logits(tokenizer):
+    base = sharp_model(tokenizer)
+    cur = perturbed(base)
+    masked_base = MaskedVocab(base, [5, 9])
+    both_masked = logit_kl(masked_base, MaskedVocab(cur, [5, 9]), tokenizer, KL_PROMPTS)
+    assert math.isfinite(both_masked.mean_kl)  # not NaN
+    for prompt, got in zip(KL_PROMPTS, both_masked.per_prompt_kl):
+        ref = manual_kl_sum_with_zeros(masked_base, MaskedVocab(cur, [5, 9]), tokenizer, prompt)
+        assert got == pytest.approx(ref, rel=1e-9) and ref > 0
+    same = logit_kl(masked_base, masked_base, tokenizer, KL_PROMPTS)
+    assert same.mean_kl == 0.0 and same.per_prompt_kl == (0.0, 0.0, 0.0)  # not NaN
+    base_only = logit_kl(masked_base, cur, tokenizer, KL_PROMPTS)  # p_base = 0, p_cur > 0: finite
+    refs = [manual_kl_sum_with_zeros(masked_base, cur, tokenizer, p) for p in KL_PROMPTS]
+    assert base_only.per_prompt_kl == pytest.approx(refs, rel=1e-9)
+    assert math.isfinite(base_only.mean_kl)
+    cur_only = logit_kl(base, MaskedVocab(cur, [5]), tokenizer, KL_PROMPTS)  # p_base > 0, p_cur = 0
+    assert cur_only.mean_kl == math.inf and all(v == math.inf for v in cur_only.per_prompt_kl)
 
 
 def test_suite_logit_kl_aggregates_per_task_and_overall(tokenizer):
@@ -428,6 +554,10 @@ def test_capability_retention_arithmetic_by_hand():
 
     small = CapabilityRetention.compute("s", 0.5, 0.49, 0.5, drop_tolerance=0.02)
     assert not small.degraded and small.recovery_ratio is None
+    edge = CapabilityRetention.compute("e", 0.5, 0.25, 0.5, drop_tolerance=0.25)  # drop == tolerance
+    assert edge.absolute_drop == 0.25 and not edge.degraded and edge.recovery_ratio is None
+    above = CapabilityRetention.compute("e", 0.5, 0.25, 0.5, drop_tolerance=0.125)
+    assert above.degraded and above.recovery_ratio == 1.0
     assert CapabilityRetention.compute("s", 0.5, 0.49, 0.5).recovery_ratio == pytest.approx(1.0)
 
     no_rec = CapabilityRetention.compute("n", 1.0, 0.5)
@@ -438,18 +568,19 @@ def test_capability_retention_arithmetic_by_hand():
 
 def test_retention_report_summary_by_hand():
     rep = RetentionReport.from_scores(
-        {"math": 0.8, "code": 0.5, "chat": 0.5},
-        {"math": 0.6, "code": 0.25, "chat": 0.5},
-        {"math": 0.7, "code": 0.5, "chat": 0.6},
+        {"math": 0.8, "code": 0.5, "chat": 0.5, "zero": 0.0},
+        {"math": 0.6, "code": 0.25, "chat": 0.5, "zero": 0.25},
+        {"math": 0.7, "code": 0.5, "chat": 0.6, "zero": 0.0},
     )
     s = rep.summary()
-    assert s["num_capabilities"] == 3 and s["num_degraded"] == 2
-    assert s["mean_base"] == pytest.approx(1.8 / 3)
-    assert s["mean_after_training"] == pytest.approx(1.35 / 3)
-    assert s["mean_after_recovery"] == pytest.approx(1.8 / 3)
-    assert s["mean_absolute_drop"] == pytest.approx(0.45 / 3)
+    assert s["num_capabilities"] == 4 and s["num_degraded"] == 2
+    assert s["mean_base"] == pytest.approx(1.8 / 4)
+    assert s["mean_after_training"] == pytest.approx(1.6 / 4)
+    assert s["mean_after_recovery"] == pytest.approx(1.8 / 4)
+    assert s["mean_absolute_drop"] == pytest.approx(0.2 / 4)
+    # "zero" (base == 0) has an undefined retention ratio and is excluded, not counted as 0 or 1
     assert s["mean_retention_ratio"] == pytest.approx((0.75 + 0.5 + 1.0) / 3)
-    assert s["mean_recovery_ratio"] == pytest.approx((0.5 + 1.0) / 2)  # chat (no drop) excluded
+    assert s["mean_recovery_ratio"] == pytest.approx((0.5 + 1.0) / 2)  # chat/zero (no drop) excluded
     no_rec = RetentionReport.from_scores({"a": 1.0}, {"a": 1.0}).summary()
     assert no_rec["mean_after_recovery"] is None and no_rec["mean_recovery_ratio"] is None
     with pytest.raises(ValueError):
@@ -462,24 +593,37 @@ def test_retention_report_summary_by_hand():
 def test_suite_report_logged_to_experiment_recorder(tokenizer, tmp_path):
     base = sharp_model(tokenizer)
     trained = perturbed(base, scale=1.0)
-    recovered = copy.deepcopy(base)
+    recovered = perturbed(base, seed=7, scale=0.02)  # small drift: partially restores the probes
     base_preds = {p: manual_greedy(base, tokenizer, p, 4, tokenizer.eos_token_id) for p in PROMPTS}
     trained_preds = {p: manual_greedy(trained, tokenizer, p, 4, tokenizer.eos_token_id) for p in PROMPTS}
+    recovered_preds = {p: manual_greedy(recovered, tokenizer, p, 4, tokenizer.eos_token_id) for p in PROMPTS}
     changed = [p for p in PROMPTS if base_preds[p] != trained_preds[p]]
     assert len(changed) >= 2  # the perturbation really degrades the probes
+    expected_recovered = sum(base_preds[p] == recovered_preds[p] for p in PROMPTS) / len(PROMPTS)
     probes = ProbeTask("probe", tuple((p, base_preds[p]) for p in PROMPTS))
     stable = ProbeTask("stable", ((PROMPTS[0], "##"),))  # scores 0 for every model -> base == 0
     suite = RetentionSuite([probes, stable], max_new_tokens=4)
     report = suite.report(base, trained, tokenizer, recovered)
 
     expected_trained = 1 - len(changed) / len(PROMPTS)
+    expected_ratio = (expected_recovered - expected_trained) / (1.0 - expected_trained)
+    assert expected_trained < expected_recovered < 1.0  # a partial, non-trivial recovery
     cap = report.capabilities["probe"]
-    assert cap.base == 1.0 and cap.after_recovery == 1.0
+    assert cap.base == 1.0 and cap.after_recovery == pytest.approx(expected_recovered)
     assert cap.after_training == pytest.approx(expected_trained)
-    assert cap.recovery_ratio == pytest.approx(1.0)
+    assert cap.recovery_ratio == pytest.approx(expected_ratio)
     assert report.capabilities["stable"].retention_ratio is None
-    assert report.kl_after_recovery == {"probe": 0.0, "stable": 0.0, "all": 0.0}
-    assert report.kl_after_training is not None and report.kl_after_training["all"] > 0
+    kl_rec = [manual_kl_sum(base, recovered, tokenizer, p) for p in PROMPTS]
+    rec_ref = sum(r[0] for r in kl_rec) / sum(r[1] for r in kl_rec)
+    assert report.kl_after_recovery is not None and report.kl_after_recovery["probe"] > 0
+    assert report.kl_after_recovery["probe"] == pytest.approx(rec_ref, rel=1e-9)  # KL(base || recovered)
+    reverse = [manual_kl_sum(recovered, base, tokenizer, p) for p in PROMPTS]
+    assert abs(sum(r[0] for r in reverse) / sum(r[1] for r in reverse) - rec_ref) > 1e-3 * rec_ref
+    kl_tr = [manual_kl_sum(base, trained, tokenizer, p) for p in PROMPTS]
+    assert report.kl_after_training is not None
+    assert report.kl_after_training["probe"] == pytest.approx(
+        sum(r[0] for r in kl_tr) / sum(r[1] for r in kl_tr), rel=1e-9
+    )
 
     rec = recorder(tmp_path)
     report.log_to(rec, step=7)
@@ -488,7 +632,7 @@ def test_suite_report_logged_to_experiment_recorder(tokenizer, tmp_path):
     res = stored[0]["results"]
     assert res["capabilities"]["probe"]["after_training"] == pytest.approx(expected_trained)
     assert res["capabilities"]["stable"]["retention_ratio"] is None  # stays JSON null, not "nan"
-    assert res["summary"]["mean_recovery_ratio"] == pytest.approx(1.0)
+    assert res["summary"]["mean_recovery_ratio"] == pytest.approx(expected_ratio)
     assert res["kl_after_training"]["all"] == pytest.approx(report.kl_after_training["all"])
 
 

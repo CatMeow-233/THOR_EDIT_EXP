@@ -14,13 +14,24 @@ import statistics
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
 from research_rl.core.experiment import NOT_TESTED
 
 Clock = Callable[[], float]
+Sync = Callable[[], None] | None | Literal["auto"]
+
+
+def _resolve_sync(synchronize: Sync) -> Callable[[], None] | None:
+    """``"auto"``: ``torch.cuda.synchronize`` if CUDA is available (checked now), else no sync.
+
+    ``None`` disables synchronisation; a callable is used as given.
+    """
+    if synchronize == "auto":
+        return torch.cuda.synchronize if torch.cuda.is_available() else None
+    return synchronize
 
 
 class StepTimer:
@@ -28,13 +39,16 @@ class StepTimer:
 
     Use ``with timer.step(tokens=n): ...`` or explicit ``start()`` / ``stop(tokens=n)``. The clock is
     injectable so arithmetic can be tested with a fake clock.
+
+    ``synchronize`` runs right before reading the clock at start and stop. The default ``"auto"``
+    (resolved when the timer is constructed) is ``torch.cuda.synchronize`` when CUDA is available,
+    so asynchronous kernel launches are not mistaken for step time; pass ``None`` to disable or any
+    callable (e.g. a per-device sync). The CUDA path is NOT_TESTED in CI (no GPU; mocked only).
     """
 
-    def __init__(
-        self, clock: Clock = time.perf_counter, synchronize: Callable[[], None] | None = None
-    ) -> None:
+    def __init__(self, clock: Clock = time.perf_counter, synchronize: Sync = "auto") -> None:
         self._clock = clock
-        self._sync = synchronize
+        self._sync = _resolve_sync(synchronize)
         self._t0: float | None = None
         self.durations: list[float] = []
         self.tokens: list[int | None] = []
@@ -96,10 +110,6 @@ class StepTimer:
         return out
 
 
-def _default_sync() -> Callable[[], None] | None:
-    return torch.cuda.synchronize if torch.cuda.is_available() else None
-
-
 def measure_throughput(
     fn: Callable[[], Any],
     n_steps: int,
@@ -107,19 +117,21 @@ def measure_throughput(
     tokens_per_step: int | None = None,
     *,
     clock: Clock = time.perf_counter,
-    synchronize: Callable[[], None] | None = None,
+    synchronize: Sync = "auto",
 ) -> dict[str, Any]:
     """Call ``fn`` ``warmup`` times untimed, then ``n_steps`` times timed as one block.
 
     Returns seconds per step, steps per second and (if ``tokens_per_step``) tokens per second.
-    On CUDA the device is synchronised before and after the timed block (``synchronize`` overrides
-    this; pass a no-op to disable).
+    ``synchronize`` runs before and after the timed block; as in :class:`StepTimer` the default
+    ``"auto"`` means ``torch.cuda.synchronize`` when CUDA is available (``None`` disables it). The
+    report says whether CUDA was available and whether a sync ran; it does not claim on which
+    device ``fn`` ran (this function cannot know that).
     """
     if n_steps < 1:
         raise ValueError("n_steps must be >= 1")
     if warmup < 0:
         raise ValueError("warmup must be >= 0")
-    sync = synchronize if synchronize is not None else _default_sync()
+    sync = _resolve_sync(synchronize)
     for _ in range(warmup):
         fn()
     if sync is not None:
@@ -136,7 +148,8 @@ def measure_throughput(
         "total_seconds": elapsed,
         "seconds_per_step": elapsed / n_steps,
         "steps_per_second": n_steps / elapsed if elapsed > 0 else None,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "cuda_available": torch.cuda.is_available(),
+        "synchronized": sync is not None,
     }
     if tokens_per_step is not None:
         out["tokens_per_step"] = tokens_per_step

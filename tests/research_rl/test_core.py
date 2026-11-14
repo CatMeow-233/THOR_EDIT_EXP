@@ -76,6 +76,7 @@ def test_config_round_trip(tmp_path, suffix):
 def test_config_defaults_and_paths(tmp_path):
     cfg = ExperimentConfig.from_dict(
         {
+            "config_version": CONFIG_VERSION,
             "study_id": "s",
             "model": {"name_or_path": "m"},
             "data": {"name": "d"},
@@ -373,6 +374,19 @@ def test_checkpoint_inventory_and_latest(tmp_path):
     assert ckpt.latest_checkpoint(out) == str(out / "checkpoint-10")
 
 
+# Literal names (not ckpt.WEIGHT_FILES): dropping a name from the core tuple must fail a case here.
+@pytest.mark.parametrize(
+    "weight_file",
+    ["model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "adapter_model.safetensors"],
+)
+def test_checkpoint_inventory_detects_each_weight_file_alone(tmp_path, weight_file):
+    assert not ckpt.checkpoint_inventory(tmp_path)["model_weights"]
+    (tmp_path / weight_file).write_text("x")  # e.g. a sharded checkpoint has only the index at top level
+    inv = ckpt.checkpoint_inventory(tmp_path)
+    assert inv["model_weights"]
+    assert not any(v for k, v in inv.items() if k != "model_weights")
+
+
 # ================================================================================ parameter masks
 def two_layer() -> nn.Module:
     torch.manual_seed(0)
@@ -535,3 +549,51 @@ def test_recorder_history_accepts_scalar_tensors(tmp_path):
     rec = ExperimentRecorder(cfg)
     rec.log_metrics(1, {"loss": torch.tensor(1.5)})
     assert rec.finalize()["final_metrics"]["loss"] == 1.5
+
+
+def test_mask_algebra_rejects_shape_mismatch():
+    a = ParameterMask({"w": torch.ones(2, 3, dtype=torch.bool)})
+    b = ParameterMask({"w": torch.ones(3, dtype=torch.bool)})
+    with pytest.raises(MaskError):
+        a.union(b)
+    with pytest.raises(MaskError):
+        a.intersection(b)
+
+
+def test_config_without_version_is_rejected():
+    raw = {
+        "study_id": "s",
+        "model": {"name_or_path": "m"},
+        "data": {"name": "d"},
+        "trainer": {"algorithm": "sft"},
+    }
+    with pytest.raises(ConfigError, match="config_version"):
+        ExperimentConfig.from_dict(raw)
+
+
+def test_metrics_nan_and_numpy_are_strict_json(tmp_path):
+    import numpy as np
+
+    cfg = ExperimentConfig(
+        study_id="s",
+        model=ModelSpec(name_or_path="m"),
+        data=DataSpec(name="d"),
+        trainer=TrainerSpec(algorithm="sft"),
+        output_dir=str(tmp_path),
+    )
+    rec = ExperimentRecorder(cfg)
+    rec.log_metrics(1, {"a": torch.tensor(float("nan")), "b": np.float32(0.5), "c": np.array([1, 2])})
+    line = (rec.run_dir / "metrics.jsonl").read_text().splitlines()[-1]
+    row = json.loads(line, parse_constant=lambda c: pytest.fail(f"non-strict JSON constant {c}"))
+    assert row["a"] == "nan" and row["b"] == 0.5 and row["c"] == [1, 2]
+
+
+def test_dataset_identity_never_hashes_object_reprs():
+    class Obj:
+        pass
+
+    ident = dataset_identity([{"x": Obj()}])
+    assert ident["content_sha256"] is None and "no content hash" in ident["note"]
+    assert (
+        dataset_identity([{"x": 1.5}])["content_sha256"] == dataset_identity([{"x": 1.5}])["content_sha256"]
+    )

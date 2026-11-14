@@ -30,10 +30,18 @@ Pitfall: attaching renames state-dict keys (``model.layers.i.mlp.gate_proj.weigh
 such a checkpoint only logs a warning and **re-initialises the FFN randomly**. Use
 :meth:`ExpertManager.export_merged` (vanilla keys) or :func:`load_model_with_experts`.
 
+Backbone integrity: the first :meth:`ExpertManager.freeze_backbone` (or ``set_trainable``) records
+the backbone fingerprint once; later calls *verify* the backbone against it (raising
+:class:`BackboneChangedError`) instead of silently re-recording it, so the check covers a whole
+multi-expert session. Use ``freeze_backbone(rebaseline=True)`` for an intentional reset.
+
+Channel / neuron tools: the core ``find_swiglu_ffns`` resolves an attached layer to its **active**
+expert by default (or the expert named by ``expert=``), with the real parameter path
+``...mlp.experts.<name>.*``. Calling such a tool (e.g. ``channel_mask``) *before*
+``set_trainable``/``activate`` therefore targets ``"base"``; pass ``expert=`` to be explicit.
+
 Limitations: the routing assumes the FFN input has the sample on dim 0 (true for dense HF decoder
 models; beam search / ``num_return_sequences`` change the batch and are rejected).
-``find_swiglu_ffns`` does not see attached layers (``ExpertFFN`` deliberately does not alias
-``gate_proj`` etc.), so mask/neuron tools must address a specific expert's parameter names.
 Parameters added by ``create_expert`` / ``set_trainable`` after an optimizer exists are unknown to
 that optimizer; configure experts before building the trainer.
 """
@@ -66,7 +74,10 @@ MANAGER_STATE_FORMAT = "research_rl.expert_manager/1"
 SIDECAR_FILE = "research_rl_experts.json"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
-# Config entries that do not change the architecture or drift across save/load round trips.
+# Config entries that do not change parameter shapes / the forward function of trained weights, or
+# drift across save/load round trips: special-token ids (commonly set after loading, e.g. a pad id),
+# init / dropout hyper-parameters, output flags and task metadata. Every other public entry is hashed
+# (an exclude-list, so unknown architecture fields of other model families still fail loudly).
 _CONFIG_HASH_EXCLUDE = frozenset(
     {
         "transformers_version",
@@ -80,8 +91,25 @@ _CONFIG_HASH_EXCLUDE = frozenset(
         "id2label",
         "label2id",
         "problem_type",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "sep_token_id",
+        "decoder_start_token_id",
+        "initializer_range",
+        "chunk_size_feed_forward",
+        "tokenizer_class",
+        "finetuning_task",
+        "task_specific_params",
+        "prefix",
     }
 )
+
+
+def _hashed_config_key(key: str) -> bool:
+    if key.startswith("_") or key in _CONFIG_HASH_EXCLUDE:
+        return False
+    return not ("dropout" in key or key.endswith("_dropout_prob"))
 
 
 class ExpertError(ValueError):
@@ -97,9 +125,13 @@ class BackboneChangedError(RuntimeError):
 
 
 def config_hash(config: Any) -> str:
-    """SHA-256 of the architecture-relevant part of an HF config (stable across save/load)."""
+    """SHA-256 of the architecture-relevant part of an HF config (stable across save/load).
+
+    Special-token ids, ``initializer_range`` and dropout rates are not hashed (see
+    ``_CONFIG_HASH_EXCLUDE``): they do not change which weights fit the model.
+    """
     raw = config.to_dict() if hasattr(config, "to_dict") else dict(config)
-    kept = {k: v for k, v in raw.items() if not k.startswith("_") and k not in _CONFIG_HASH_EXCLUDE}
+    kept = {k: v for k, v in raw.items() if _hashed_config_key(k)}
     return hashlib.sha256(json.dumps(kept, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -334,26 +366,45 @@ class ExpertManager:
         for n, p in self.model.named_parameters():
             p.requires_grad_(n in keep)
 
-    def freeze_backbone(self) -> str:
-        """Freeze everything except the trainable expert (if any); record and return the backbone
-        fingerprint used by :meth:`assert_backbone_unchanged`."""
-        self._require_attached()
-        self._frozen = True
-        self._apply_trainability()
-        self._backbone_ref = self.backbone_fingerprint()
+    def _check_or_record_backbone(self, rebaseline: bool) -> str:
+        """Record the backbone reference if there is none (or ``rebaseline``); otherwise verify it."""
+        if rebaseline or self._backbone_ref is None:
+            self._backbone_ref = self.backbone_fingerprint()
+        else:
+            self.assert_backbone_unchanged()
         return self._backbone_ref
 
-    def set_trainable(self, name: str | None) -> None:
+    def freeze_backbone(self, *, rebaseline: bool = False) -> str:
+        """Freeze everything except the trainable expert (if any) and return the backbone reference
+        fingerprint used by :meth:`assert_backbone_unchanged`.
+
+        The reference is recorded only the first time (or when restored by :meth:`load_state_dict`);
+        later calls first verify the current backbone against it and raise
+        :class:`BackboneChangedError` on a difference, so switching experts cannot hide a corrupted
+        backbone. ``rebaseline=True`` deliberately re-records it (e.g. after an intended change).
+        """
+        self._require_attached()
+        ref = self._check_or_record_backbone(rebaseline)
+        self._frozen = True
+        self._apply_trainability()
+        return ref
+
+    def set_trainable(self, name: str | None, *, rebaseline: bool = False) -> None:
         """Make expert ``name`` the only trainable parameters and activate it (``None``: freeze all).
 
-        The base expert is the reference copy and cannot be trained; create a new expert instead.
+        Verifies the backbone against the recorded reference first (see :meth:`freeze_backbone`);
+        on :class:`BackboneChangedError` the manager is left unchanged. The base expert is the
+        reference copy and cannot be trained; create a new expert instead.
         """
+        self._require_attached()
         if name is not None:
             self._require_expert(name)
             if name == BASE_EXPERT:
                 raise ExpertError("the base expert is the frozen reference; train a copy (create_expert)")
+        self._check_or_record_backbone(rebaseline)
         self._trainable = name
-        self.freeze_backbone()
+        self._frozen = True
+        self._apply_trainability()
         if name is not None:
             self.activate(name)
 
@@ -530,8 +581,22 @@ class ExpertManager:
 
     # ------------------------------------------------------------------ checkpoint integration
     def state_dict(self) -> dict[str, Any]:
-        """Structure only (no tensors: expert weights live in the model state dict)."""
-        self._require_attached()
+        """Structure only (no tensors: expert weights live in the model state dict).
+
+        A detached manager (never attached, or after :meth:`detach`) returns a state with
+        ``layers == []`` so it can stay registered as a checkpoint component.
+        """
+        if not self._ffns:
+            return {
+                "format": MANAGER_STATE_FORMAT,
+                "layers": [],
+                "experts": [],
+                "active": None,
+                "routing": None,
+                "trainable": None,
+                "frozen": False,
+                "backbone_fingerprint": None,
+            }
         routing = self.routing
         return {
             "format": MANAGER_STATE_FORMAT,
@@ -544,33 +609,71 @@ class ExpertManager:
             "backbone_fingerprint": self._backbone_ref,
         }
 
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Recreate the expert structure (attach, create experts, trainability, selection).
-
-        Newly created experts are copies of ``base``; the caller (e.g. HF Trainer resume, or
-        :func:`load_model_with_experts`) must load the model weights afterwards. The recorded
-        backbone fingerprint is restored, not recomputed, so integrity checks after a resume
-        still compare against the original backbone.
-        """
+    def _validate_state(self, state: Mapping[str, Any]) -> tuple[list[int], list[str]]:
         if state.get("format") != MANAGER_STATE_FORMAT:
             raise ExpertCompatibilityError(f"unknown expert manager state format {state.get('format')!r}")
         layers = [int(i) for i in state["layers"]]
-        if not self._ffns:
-            self.attach(layers)
-        elif self.layers != layers:
+        names = [str(n) for n in state["experts"]]
+        if not layers:
+            if self._ffns:
+                raise ExpertCompatibilityError(
+                    "state is of a detached manager but experts are attached here (which expert would "
+                    "be the vanilla FFN is unknown); detach() before loading it"
+                )
+            return layers, names
+        if self._ffns and self.layers != layers:
             raise ExpertCompatibilityError(f"state is for layers {layers}, manager has {self.layers}")
-        names = list(state["experts"])
+        if not names or names[0] != BASE_EXPERT or len(set(names)) != len(names):
+            raise ExpertCompatibilityError(f"invalid expert list in state: {names}")
+        for n in names:
+            _check_name(n)
         extra = set(self._expert_names) - set(names)
         if extra:
             raise ExpertCompatibilityError(f"model has experts {sorted(extra)} that the state does not know")
+        trainable, frozen = state.get("trainable"), bool(state.get("frozen"))
+        if trainable is not None and (trainable not in names or trainable == BASE_EXPERT or not frozen):
+            raise ExpertCompatibilityError(f"invalid trainable expert {trainable!r} (frozen={frozen})")
+        selected = [state.get("active"), *(state.get("routing") or [])]
+        unknown = [n for n in selected if n not in names]
+        if unknown:
+            raise ExpertCompatibilityError(f"state selects unknown experts {unknown}")
+        if state.get("routing") is not None and len(state["routing"]) == 0:
+            raise ExpertCompatibilityError("state has an empty routing")
+        return layers, names
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Recreate the expert structure (attach, create experts, trainability, selection).
+
+        The whole state is validated before anything changes. Newly created experts are copies of
+        ``base``; the caller (e.g. HF Trainer resume, or :func:`load_model_with_experts`) must load
+        the model weights afterwards. The recorded backbone fingerprint is restored, not recomputed
+        (and not checked, since the weights may not be loaded yet), so integrity checks after a
+        resume compare against the original backbone.
+
+        ``frozen=True`` restores the manager's ``requires_grad`` flags exactly. ``frozen=False``
+        means the manager did not control ``requires_grad``: if *this* manager had frozen the model,
+        its freezing is undone (every parameter trainable again); otherwise flags are left as they
+        are (so a user's own freezing survives a resume). A detached state (``layers == []``) is a
+        no-op on a detached manager and is rejected on an attached one.
+        """
+        layers, names = self._validate_state(state)
+        if not layers:
+            return
+        if not self._ffns:
+            self.attach(layers)
+        was_frozen = self._frozen
+        self._frozen = False  # create without re-freezing; trainability is applied below
         for n in names:
             if n not in self._expert_names:
                 self.create_expert(n)
         self._expert_names = names
         self._trainable = state.get("trainable")
-        if state.get("frozen"):
-            self._frozen = True
+        self._frozen = bool(state.get("frozen"))
+        if self._frozen:
             self._apply_trainability()
+        elif was_frozen:
+            for p in self.model.parameters():
+                p.requires_grad_(True)
         self.activate(state["active"])
         if state.get("routing") is not None:
             self.set_routing(state["routing"])
@@ -578,6 +681,7 @@ class ExpertManager:
 
     def save_pretrained(self, path: str | Path, **save_kwargs: Any) -> Path:
         """Save the model *with experts attached* plus a manager sidecar (see :func:`load_model_with_experts`)."""
+        self._require_attached()
         path = Path(path)
         self.model.save_pretrained(str(path), **save_kwargs)  # type: ignore[operator]
         (path / SIDECAR_FILE).write_text(json.dumps(self.state_dict(), indent=2))
@@ -649,6 +753,8 @@ def load_model_with_experts(
             if n != BASE_EXPERT:
                 manager.create_expert(n)
     else:
+        if not manager_state.get("layers"):
+            raise ExpertCompatibilityError(f"{path}: sidecar describes a detached manager (no experts)")
         manager.load_state_dict(manager_state)
 
     # Tied weights are stored once; any other missing or unexpected key is an error.

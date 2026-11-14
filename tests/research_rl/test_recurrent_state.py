@@ -113,6 +113,16 @@ def test_state_store_is_keyed_by_sample_id_and_never_shares_state():
     store.release()
     assert float(store.get("a")["fast"].abs().max()) < 50
     assert store.get("a")["fast"].data_ptr() != store.get(7)["fast"].data_ptr()
+    # an aborted gather does not leak unseen ids into the store (len / ids / checkpoints)
+    known = sorted(map(str, store.ids()))
+    store.gather(["ghost", "a"])
+    store.release()
+    assert "ghost" not in store and sorted(map(str, store.ids())) == known and len(store) == len(known)
+    assert "ghost" not in {k.partition(":")[2] for k in store.state_dict()["states"]}
+    # ...while a completed gather/scatter does store the new id
+    st = store.gather(["ghost"])
+    store.scatter(["ghost"], st)
+    assert "ghost" in store and len(store) == len(known) + 1
 
 
 def test_store_serialization_round_trip_through_checkpoint_components(tmp_path):

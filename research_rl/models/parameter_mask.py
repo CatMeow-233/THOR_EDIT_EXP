@@ -26,6 +26,11 @@ class MaskError(ValueError):
     pass
 
 
+def _check_same_shape(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
+    if a.shape != b.shape:
+        raise MaskError(f"mask shapes differ for {name!r}: {tuple(a.shape)} vs {tuple(b.shape)}")
+
+
 class ParameterMask:
     def __init__(self, masks: Mapping[str, torch.Tensor] | None = None) -> None:
         self._masks: dict[str, torch.Tensor] = {}
@@ -57,6 +62,7 @@ class ParameterMask:
         """
         out = ParameterMask()
         for name in set(self._masks) & set(other._masks):
+            _check_same_shape(name, self._masks[name], other._masks[name])
             out._masks[name] = self._masks[name] | other._masks[name]
         return out
 
@@ -70,6 +76,7 @@ class ParameterMask:
             elif b is None:
                 out._masks[name] = a
             else:
+                _check_same_shape(name, a, b)
                 out._masks[name] = a & b
         return out
 

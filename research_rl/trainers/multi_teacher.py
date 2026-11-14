@@ -2,8 +2,22 @@
 
 This is *distillation* (not reinforcement learning) and it is distinct from the P²-MOPD parameter
 prior (:mod:`research_rl.optim.parameter_prior`): here several teachers define the target
-next-token distribution; there, task vectors constrain the student's weights. The two compose:
-use :class:`TeacherEnsemble` / the KL helpers for the loss and ``P2PriorRule`` for the update.
+next-token distribution; there, task vectors constrain the student's weights. ``P2PriorRule``
+works with any loss, including the ones built from this module.
+
+What this module does **not** provide: the P²-MOPD distillation objective itself (paper Eq. 2-3,
+App. A: per-prompt *routed* teacher π_{θ_d(x)}, a support-restricted top-16 / nucleus-0.99
+reverse-KL reward used inside a policy-gradient surrogate). Concretely:
+
+* :class:`TeacherEnsemble` passed to TRL ``DistillationTrainer`` gives a teacher with **one
+  global, static weight vector** ``[K]`` (mixture or product). TRL 1.18 calls the teacher with
+  ``input_ids`` / ``attention_mask`` (+ multimodal keys) only, so no per-sample domain reaches it:
+  through TRL there is **no per-prompt routing**, and the loss is TRL's generalised JSD over the
+  **full vocabulary** (``beta`` interpolates forward/reverse KL), not the paper's restricted reward.
+* Per-prompt routing is available **offline** only: :class:`MultiTeacherBatch` /
+  :func:`aggregate_teacher_logprobs` accept ``[K, B]`` (e.g. one-hot per domain) weights, and
+  :func:`masked_reverse_kl` gives the routed reverse KL. No trainer in ResearchRL wires this up;
+  it needs a custom ``compute_loss`` that reads the domain from the batch (not implemented).
 
 Implemented and numerically tested:
 
@@ -245,13 +259,17 @@ class _EnsembleBackbone:
 
 
 class TeacherEnsemble(nn.Module):
-    """Several frozen HF causal LMs (shared vocabulary) acting as one teacher.
+    """Several frozen HF causal LMs (shared vocabulary) acting as one teacher with static weights.
 
     ``forward(...).logits`` are the aggregated log-probabilities (already normalised), so the
     module can be used anywhere a teacher's logits are consumed. For TRL ``DistillationTrainer``
     (``teacher_model=ensemble``) it also provides ``config``, ``base_model`` and
     ``get_output_embeddings()`` such that ``base_model(...).last_hidden_state @ head.weight.T +
     head.bias`` reproduces the aggregated distribution up to a per-position constant.
+
+    The weights are one global ``[K]`` vector fixed at construction: inside TRL this is a global
+    mixture / product teacher under TRL's full-vocabulary JSD, **not** the per-prompt routed
+    teacher of MOPD (see the module docstring for the offline routed path).
     """
 
     def __init__(

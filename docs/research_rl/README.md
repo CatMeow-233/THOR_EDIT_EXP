@@ -150,8 +150,10 @@ after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
   `project_onto_span`, `PriorSubspaceRule`, and `P2PriorRule` — the two-channel update of P²-MOPD
   (arXiv 2611.03953): `W = B + Σ α_k τ_k` per module, coefficient gradient `⟨G, τ⟩` from the unclipped
   gradient, separate clipping, Adam on α, AdamW (decay 0) on W, `W ← W_AdamW + Σ Δα·τ`. This is the
-  parameter-prior part only; the routed multi-teacher distillation loss is separate
-  (`trainers/multi_teacher.py`, TRL `DistillationTrainer`).
+  parameter-prior part only. The P²-MOPD distillation *loss* (per-prompt routed,
+  support-restricted reverse KL inside a policy-gradient surrogate) is **not** implemented in V1.0;
+  `trainers/multi_teacher.py` provides routed aggregation / masked-KL helpers (tested offline) and a
+  static-weight `TeacherEnsemble` for TRL's full-vocabulary JSD `DistillationTrainer`.
 
 ## Experiment records
 
@@ -170,7 +172,7 @@ evaluation outputs, environment (package versions, device). `hardware.gpu_metric
 | Recurrent state | `state/recurrent_interface.py` | `FastSlowMemory`, `StateStore` (no cross-sample sharing) |
 | Compute controller | `state/compute_controller.py` | `FixedDepth`, `ThresholdHalting`, `run_looped`, `ComputeLedger`, `best_of_depth` |
 | Agent environment | `rollout/agent_env.py` | TRL `environment_factory`-compatible `ResearchEnvironment`, `CalculatorEnv`, `EpisodeLog` credit math. OpenEnv (`trl.experimental.async_grpo.openenv_harness`) needs the separate `openenv` package — not installed, not tested |
-| Multi-teacher distillation | `trainers/multi_teacher.py` | teacher aggregation (mixture / product), masked KLs, `TeacherEnsemble` usable as TRL `teacher_model`. `AsyncDistillationTrainer` needs a vLLM server — not tested |
+| Multi-teacher distillation | `trainers/multi_teacher.py` | teacher aggregation (mixture / product, per-sample weights for routing), masked KLs, `TeacherEnsemble` usable as TRL `teacher_model` (global static weights only: TRL does not pass a per-prompt domain to the teacher). `AsyncDistillationTrainer` needs a vLLM server — not tested |
 | Code-execution reward | `rewards/code_sandbox.py` | disabled by default; refuses to run without an isolated backend that declares no-network + resource limits; no local executor ships |
 
 Plugins register themselves in `research_rl.core.registry` (`TRAINERS`, `UPDATE_RULES`, `VERIFIERS`,

@@ -35,22 +35,23 @@ class FakeClock:
 def test_step_timer_arithmetic_with_fake_clock():
     clock = FakeClock()
     timer = StepTimer(clock=clock)
-    for dt, tok in [(0.5, 100), (1.5, 300), (1.0, 200)]:
+    # asymmetric durations: total (4.0) != steps (3) and median (1.0) != mean (4/3)
+    for dt, tok in [(0.5, 100), (2.5, 300), (1.0, 200)]:
         with timer.step(tokens=tok):
             clock.advance(dt)
         clock.advance(10.0)  # time between steps is not counted
-    assert timer.durations == [0.5, 1.5, 1.0]
-    assert timer.count == 3 and timer.total == 3.0 and timer.last == 1.0
+    assert timer.durations == [0.5, 2.5, 1.0]
+    assert timer.count == 3 and timer.total == 4.0 and timer.last == 1.0
     s = timer.summary()
     assert s == {
         "steps": 3,
-        "total_seconds": 3.0,
-        "mean_seconds": 1.0,
+        "total_seconds": 4.0,
+        "mean_seconds": pytest.approx(4.0 / 3),
         "median_seconds": 1.0,
         "min_seconds": 0.5,
-        "max_seconds": 1.5,
+        "max_seconds": 2.5,
         "total_tokens": 600,
-        "tokens_per_second": 200.0,
+        "tokens_per_second": 150.0,
     }
 
 
@@ -100,12 +101,41 @@ def test_measure_throughput_excludes_warmup_with_fake_clock():
     assert out["steps_per_second"] == 4.0
     assert out["tokens_per_second"] == 64 * 8 / 2.0
     assert out["steps"] == 8 and out["warmup_steps"] == 2
-    assert out["device"] == ("cuda" if torch.cuda.is_available() else "cpu")
+    assert out["cuda_available"] is torch.cuda.is_available() and out["synchronized"] is True
+    assert "device" not in out  # fn's device is unknown here; not guessed
     assert "tokens_per_second" not in measure_throughput(fn, 1, warmup=0, clock=clock)
     with pytest.raises(ValueError):
         measure_throughput(fn, 0)
     with pytest.raises(ValueError):
         measure_throughput(fn, 1, warmup=-1)
+
+
+def test_auto_sync_plumbing_with_mocked_cuda(monkeypatch):
+    """Plumbing only (torch.cuda mocked; the real CUDA path is NOT_TESTED in CPU CI): StepTimer and
+    measure_throughput share the same default, which syncs whenever CUDA is available."""
+    calls: list[str] = []
+    monkeypatch.setattr(profiling.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(profiling.torch.cuda, "synchronize", lambda: calls.append("sync"))
+    clock = FakeClock()
+    timer = StepTimer(clock=clock)
+    with timer.step():
+        clock.advance(1.0)
+    assert calls == ["sync", "sync"]
+    calls.clear()
+    out = measure_throughput(lambda: clock.advance(0.5), n_steps=2, warmup=0, clock=clock)
+    assert calls == ["sync", "sync"] and out["synchronized"] is True and out["cuda_available"] is True
+    calls.clear()
+    with StepTimer(clock=clock, synchronize=None).step():
+        clock.advance(1.0)
+    out = measure_throughput(lambda: None, n_steps=1, warmup=0, clock=clock, synchronize=None)
+    assert calls == [] and out["synchronized"] is False
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="checks the CPU (no CUDA) path")
+def test_auto_sync_is_off_without_cuda():
+    clock = FakeClock()
+    out = measure_throughput(lambda: clock.advance(1.0), n_steps=1, warmup=0, clock=clock)
+    assert out["synchronized"] is False and out["cuda_available"] is False
 
 
 def test_measure_throughput_real_clock_runs_cpu_workload():

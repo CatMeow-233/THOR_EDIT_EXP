@@ -202,17 +202,20 @@ class StateStore:
         return keys
 
     def gather(self, ids: Sequence[Hashable]) -> State:
-        """Batch the states of ``ids`` (fresh state for unseen ids). Must be followed by ``scatter``."""
+        """Batch the states of ``ids`` (fresh state for unseen ids). Must be followed by ``scatter``.
+
+        Unseen ids are *not* inserted into the store here; they are stored by :meth:`scatter`, so an
+        aborted batch (:meth:`release`) leaves no trace in ``len()``, ``ids()`` or checkpoints.
+        """
         if self._checked_out is not None:
             raise RuntimeError("a batch is already gathered; scatter() or release() it first")
         keys = self._keys(ids)
         if not keys:
             raise ValueError("empty batch")
-        rows = []
-        for k in keys:
-            if k not in self._states:
-                self._states[k] = self.module.init(1, self.device, self.dtype)
-            rows.append(self._states[k])
+        rows = [
+            self._states[k] if k in self._states else self.module.init(1, self.device, self.dtype)
+            for k in keys
+        ]
         self._checked_out = keys
         return {name: torch.cat([r[name] for r in rows], dim=0) for name in rows[0]}
 
@@ -235,7 +238,7 @@ class StateStore:
         self._checked_out = None
 
     def release(self) -> None:
-        """Abandon the gathered batch without storing anything."""
+        """Abandon the gathered batch: nothing is stored, and ids first seen in that ``gather`` stay unknown."""
         self._checked_out = None
 
     def step(self, ids: Sequence[Hashable], inputs: torch.Tensor) -> torch.Tensor:
