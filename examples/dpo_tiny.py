@@ -3,9 +3,10 @@
 
 By default this writes a random tiny Llama + char tokenizer into the output dir and runs a few CPU
 steps on in-memory arithmetic preference pairs (chosen = correct sum, rejected = off by one); this
-is a smoke run and the numbers say nothing about real model quality. On a CUDA machine pass ``--model <hf id or path> --bf16`` (and optionally
-``--dataset``) to run real training with the same code path. The reference model is a frozen
-copy of the initial policy unless ``--ref-model`` is given. The experiment record is written to
+is a smoke run and the numbers say nothing about real model quality. On a CUDA machine pass
+``--model <hf id or path> --bf16`` (and optionally ``--dataset``) for real training through the same
+adapter (NOT_TESTED: only CPU runs are exercised in CI). The reference model is a frozen copy of
+the initial policy unless ``--ref-model`` is given. The experiment record is written to
 ``<output_dir>/<study_id>/<run_name>/record.json``.
 """
 

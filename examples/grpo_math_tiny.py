@@ -8,9 +8,10 @@ final answer). This is a smoke run: a random tiny model essentially never earns 
 The record states this honestly as ``applied_updates`` vs ``nominal_optimizer_steps``. CPU numbers
 say nothing about real model quality.
 
-On a CUDA machine run e.g. ``--model Qwen/Qwen2.5-0.5B-Instruct --bf16 --max-steps 200
---num-generations 8`` (and raise ``max_completion_length`` in a copy of the config) for real
-training with the same code path. The experiment record is written to
+NOT_TESTED (no GPU in the dev environment): on a CUDA machine run e.g. ``--model
+Qwen/Qwen2.5-0.5B-Instruct --bf16 --max-steps 200 --num-generations 8`` (and raise
+``max_completion_length`` in a copy of the config) for real training with the same code path. Only
+the CPU path above has been run. The experiment record is written to
 ``<output_dir>/<study_id>/<run_name>/record.json``.
 """
 

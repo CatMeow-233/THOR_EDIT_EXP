@@ -20,8 +20,9 @@ from datasets import Dataset
 from trl import GRPOConfig, RLOOConfig
 
 from research_rl.models.tiny import build_tiny_llama
+from research_rl.rollout import RolloutBatch, TrajectoryBuffer
 from research_rl.trainers.grpo_adapter import ResearchGRPOTrainer
-from research_rl.trainers.rl_common import eos_cut_length, eos_truncating_rollout
+from research_rl.trainers.rl_common import SIGNAL_KEY, eos_cut_length, eos_truncating_rollout
 from research_rl.trainers.rloo_adapter import ResearchRLOOTrainer
 
 EOS, PAD = 2, 0
@@ -95,7 +96,7 @@ def make_rollout(tokenizer, rows: list[list[int]]):
         return {
             "prompt_ids": prompt_ids,
             "completion_ids": [list(r) for r in rows],
-            "logprobs": [[-1.0] * len(r) for r in rows],
+            "logprobs": [[-(t + 1.0) for t in range(len(r))] for r in rows],  # position-dependent
         }
 
     return rollout
@@ -194,6 +195,13 @@ def test_grpo_rollout_func_mask_matches_reference(tokenizer, tmp_path, mask_trun
     out = trainer._generate_and_score_completions(inputs_for(len(ROLLOUT_ROWS)))
     check_against_reference(out, ROLLOUT_ROWS, mask_truncated)
     assert int(out["num_items_in_batch"]) == int(reference_mask(ROLLOUT_ROWS, WIDTH, mask_truncated).sum())
+    # learning-signal flags: a fully masked row (truncated, mask_truncated_completions) has none,
+    # even though its advantage is non-zero (row 5: length 3 vs. its sibling's 4)
+    adv = out["advantages"].cpu()
+    assert adv[5] != 0
+    expected = (adv != 0) & reference_mask(ROLLOUT_ROWS, WIDTH, mask_truncated).bool().any(dim=1)
+    assert torch.equal(out[SIGNAL_KEY].cpu(), expected)
+    assert bool(out[SIGNAL_KEY][5]) is (not mask_truncated)
 
 
 # Rows that *continue* after EOS or end in padding without EOS: TRL's rollout path differs from
@@ -240,8 +248,12 @@ def test_eos_truncating_rollout_restores_reference(tokenizer, tmp_path, mask_tru
     ref = reference_mask(stripped, WIDTH, mask_truncated)
     assert torch.equal(out["completion_mask"].cpu().long(), ref)
     assert torch.equal(out["completion_ids"].cpu().long(), reference_ids(stripped, WIDTH))
-    # logprobs were cut consistently with the ids
-    assert out["sampling_per_token_logps"].shape == out["completion_ids"].shape
+    # logprobs were cut consistently with the ids: -(t+1) on kept tokens, TRL's 0.0 padding after
+    expected = torch.zeros(len(stripped), WIDTH)
+    for i, row in enumerate(stripped):
+        n = row.index(EOS) + 1 if EOS in row else len(row)  # kept length
+        expected[i, :n] = -torch.arange(1.0, n + 1)
+    assert torch.equal(out["sampling_per_token_logps"].cpu(), expected)
 
 
 def test_eos_cut_length_and_empty_completion(tokenizer, tmp_path):
@@ -293,3 +305,58 @@ def test_trajectory_log_unbatches_rows(tokenizer, tmp_path):
     assert stats["num_samples"] == 6 and stats["num_loss_tokens"] == sum(len(r) for r in ROLLOUT_ROWS)
     assert stats["mean_reward"] == pytest.approx(sum(len(r) for r in ROLLOUT_ROWS) / 6)
     assert int(out["policy_version"]) == 0
+
+
+def test_eval_rollouts_do_not_touch_the_training_log_or_window(tokenizer, tmp_path):
+    trainer = grpo_trainer(tokenizer, tmp_path, rollout_func=make_rollout(tokenizer, ROLLOUT_ROWS))
+    trainer.model.eval()
+    out = trainer._prepare_inputs(inputs_for(len(ROLLOUT_ROWS)))
+    assert out["completion_ids"].shape[0] == len(ROLLOUT_ROWS)  # the eval rollout really ran
+    assert out[SIGNAL_KEY].any()
+    assert len(trainer.trajectory_buffer) == 0 and trainer.trajectory_buffer.counters()["total_batches"] == 0
+    assert trainer._rr_window_microbatches == 0 and not trainer._rr_window_signal
+    assert trainer.trajectory_buffer.counters()["windows"] == 0
+
+
+def _batch(advantages: torch.Tensor, signal: torch.Tensor | None = None) -> RolloutBatch:
+    n = advantages.shape[0]
+    return RolloutBatch.from_tensors(
+        prompt_ids=torch.ones(n, 2, dtype=torch.long),
+        prompt_mask=torch.ones(n, 2, dtype=torch.long),
+        completion_ids=torch.ones(n, 3, dtype=torch.long),
+        completion_mask=torch.ones(n, 3, dtype=torch.long),
+        rewards=torch.tensor([1.0, float("nan"), 3.0])[:n],
+        advantages=advantages,
+        policy_version=4,
+        signal=signal,
+    )
+
+
+def test_rollout_batch_token_level_advantages_and_signal():
+    # token-level (B, C) advantages: a sample is zero only if every token is zero
+    adv = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]])
+    batch = _batch(adv)
+    assert batch.frac_zero_advantage == pytest.approx(2 / 3) and batch.has_nonzero_advantage
+    assert batch.mean_reward == pytest.approx(2.0)  # NaN (unscorable) excluded
+    assert not _batch(torch.zeros(3, 3)).has_nonzero_advantage
+    # an explicit signal flag overrides the exact test (round-off advantages, no signal)
+    flagged = _batch(torch.tensor([1e-7, -1e-7, 0.0]), signal=torch.tensor([False, False, False]))
+    assert not flagged.has_nonzero_advantage and flagged.frac_zero_advantage == 1.0
+    flagged = _batch(torch.tensor([1e-7, 0.5, 0.0]), signal=torch.tensor([False, True, False]))
+    assert flagged.has_nonzero_advantage and flagged.frac_zero_advantage == pytest.approx(2 / 3)
+    with pytest.raises(ValueError, match="signal"):
+        _batch(torch.zeros(3), signal=torch.tensor([True]))
+
+
+def test_trajectory_buffer_counters_round_trip():
+    buf = TrajectoryBuffer(capacity=2)
+    buf.append(_batch(torch.zeros(3)))
+    buf.append(_batch(torch.tensor([0.0, 1.0, 0.0])))
+    buf.record_window(has_signal=False, skipped=True)
+    buf.record_window(has_signal=True, skipped=False)
+    state = buf.state_dict()
+    assert state["zero_signal_batches"] == 1 and state["last_policy_version"] == 4
+    restored = TrajectoryBuffer(capacity=2)
+    restored.load_state_dict(state)
+    assert restored.counters() == buf.counters()
+    assert restored.last_policy_version == 4 and len(restored) == 0  # tensors are not checkpointed

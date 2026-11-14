@@ -2,8 +2,10 @@
 
 * :class:`Trajectory` – one prompt/completion sample (unbatched, Python lists).
 * :class:`RolloutBatch` – one generation batch as the trainer saw it (padded tensors on CPU),
-  with per-batch statistics (mean reward, fraction of zero-advantage samples, whether *any*
-  non-zero advantage exists).
+  with per-batch statistics (mean reward, fraction of samples without learning signal, whether
+  *any* sample carries one). A sample's signal is the trainer-supplied ``signal`` flag when given
+  (the RL trainers derive it from the rewards, robust to float32 round-off in the advantages,
+  see :mod:`research_rl.trainers.rl_common`), otherwise "advantage exactly non-zero".
 * :class:`TrajectoryBuffer` – a bounded FIFO of recent :class:`RolloutBatch` objects plus running
   counters. Only the counters are checkpointed (``state_dict`` holds plain ints so it survives
   ``torch.load(weights_only=True)``); the stored tensors are a diagnostic window and are *not*
@@ -58,6 +60,7 @@ class RolloutBatch:
     global_step: int = 0  # HF global_step when the batch was generated
     mode: str = "train"
     extras: dict[str, Any] = field(default_factory=dict)
+    signal: torch.Tensor | None = None  # (B,) bool: sample carries a learning signal (None = derive)
 
     def __post_init__(self) -> None:
         n = self.prompt_ids.shape[0]
@@ -67,6 +70,8 @@ class RolloutBatch:
                 raise ValueError(f"RolloutBatch.{name} has {value.shape[0]} rows, expected {n}")
         if self.completion_ids.shape != self.completion_mask.shape:
             raise ValueError("completion_ids and completion_mask must have the same shape")
+        if self.signal is not None and tuple(self.signal.shape) != (n,):
+            raise ValueError(f"RolloutBatch.signal must have shape ({n},), got {tuple(self.signal.shape)}")
 
     @classmethod
     def from_tensors(
@@ -81,6 +86,7 @@ class RolloutBatch:
         policy_version: int,
         global_step: int = 0,
         mode: str = "train",
+        signal: torch.Tensor | None = None,
     ) -> RolloutBatch:
         """Build a batch from (possibly GPU, possibly grad-carrying) tensors; stores detached CPU copies."""
         return cls(
@@ -93,6 +99,7 @@ class RolloutBatch:
             policy_version=int(policy_version),
             global_step=int(global_step),
             mode=mode,
+            signal=None if signal is None else _to_cpu(signal).bool(),
         )
 
     # ------------------------------------------------------------------ statistics
@@ -100,6 +107,9 @@ class RolloutBatch:
         return int(self.prompt_ids.shape[0])
 
     def _per_sample_zero_adv(self) -> torch.Tensor:
+        """Per sample: no learning signal (``~signal`` if given, else every advantage exactly 0)."""
+        if self.signal is not None:
+            return ~self.signal
         adv = self.advantages
         if adv.dim() > 1:  # token-level advantages: a sample is "zero" only if every token is
             return (adv == 0).flatten(1).all(dim=1)
@@ -113,11 +123,13 @@ class RolloutBatch:
 
     @property
     def frac_zero_advantage(self) -> float:
+        """Fraction of samples without learning signal (see :meth:`_per_sample_zero_adv`)."""
         return float(self._per_sample_zero_adv().float().mean()) if len(self) else 0.0
 
     @property
     def has_nonzero_advantage(self) -> bool:
-        return bool((self.advantages != 0).any())
+        """Does any sample carry a learning signal?"""
+        return bool((~self._per_sample_zero_adv()).any())
 
     @property
     def num_loss_tokens(self) -> int:

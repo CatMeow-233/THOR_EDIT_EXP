@@ -28,7 +28,12 @@ from research_rl.models.tiny import build_tiny_llama
 from research_rl.rollout import POLICY_VERSION_KEY
 from research_rl.trainers import build_run, get_adapter
 from research_rl.trainers.grpo_adapter import GRPOAdapter, ResearchGRPOTrainer
-from research_rl.trainers.rl_common import ROLLOUT_COMPONENT
+from research_rl.trainers.rl_common import (
+    ROLLOUT_COMPONENT,
+    SIGNAL_KEY,
+    _WindowCallback,
+    resume_is_generation_aligned,
+)
 from research_rl.trainers.rloo_adapter import ResearchRLOOTrainer, RLOOAdapter
 
 EOS = 2
@@ -493,6 +498,9 @@ def test_constant_reward_skip_keeps_parameters_bit_identical(tokenizer, tmp_path
     assert all(torch.equal(before[n], after[n]) for n in before)
     assert run.trainer.trajectory_buffer.policy_versions() == [0, 0, 0]
     assert all(not b.has_nonzero_advantage for b in run.trainer.trajectory_buffer)
+    counters = run.trainer.trajectory_buffer.counters()
+    assert counters["zero_signal_batches"] == 3 and counters["total_batches"] == 3
+    assert counters["zero_signal_windows"] == 3 and counters["skipped_windows"] == 3
     # sensitivity: without the flag the zero-gradient steps still move weights (AdamW decay)
     before, after, record, _ = results[False]
     assert record["steps"]["applied_updates"] == 3
@@ -503,6 +511,56 @@ def test_constant_reward_skip_keeps_parameters_bit_identical(tokenizer, tmp_path
         expected = expected * (1 - 1e-2 * lr_factor * 0.1)
     assert not torch.equal(before[name], after[name])
     torch.testing.assert_close(after[name], expected, rtol=1e-6, atol=1e-8)
+
+
+def const_reward_of(value: float):
+    def reward(completions, **kwargs):
+        return [value] * len(completions)
+
+    return reward
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("algorithm", "value", "num_generations", "beta"),
+    [("grpo", 0.1, 8, 0.0), ("grpo", 0.9, 3, 0.0), ("rloo", 0.9, 4, 0.0), ("rloo", 0.9, 4, 0.05)],
+)
+def test_constant_non_dyadic_reward_is_skipped_despite_round_off(
+    tokenizer, tiny_model_dir, tmp_path, algorithm, value, num_generations, beta
+):
+    """TRL's float32 advantages of these constant groups are round-off (~1e-8..1e-3), not zero.
+
+    Adam would turn them into full lr-sized updates; the reward-based signal flags must skip.
+    ``beta=0.05`` (RLOO default) loads the policy from disk so a reference model exists.
+    """
+    args = rl_args(
+        algorithm,
+        per_device_train_batch_size=2 * num_generations,
+        num_generations=num_generations,
+        learning_rate=1e-2,
+        weight_decay=0.1,
+    )
+    if algorithm == "rloo":
+        args["beta"] = beta
+    exp = make_config(tmp_path, algorithm, args, skip=True, run_name=f"{algorithm}-{value}-{beta}")
+    model = build_tiny_llama(len(tokenizer), seed=0) if beta == 0.0 else tiny_model_dir
+    run = build_run(
+        exp,
+        train_dataset=arithmetic_dataset(),
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=const_reward_of(value),
+    )
+    before = snapshot(run.trainer.model)
+    record = run.train()
+    buf = run.trainer.trajectory_buffer
+    # not vacuous: TRL really handed round-off advantages to the loss
+    assert max(float(b.advantages.abs().max()) for b in buf) > 0
+    assert record["steps"]["applied_updates"] == 0 and record["steps"]["skipped_steps"] == 3
+    after = snapshot(run.trainer.model)
+    assert all(torch.equal(before[n], after[n]) for n in before)
+    assert buf.counters()["zero_signal_batches"] == 3 and buf.counters()["skipped_windows"] == 3
+    assert all(b.frac_zero_advantage == 1.0 for b in buf)
 
 
 @pytest.mark.integration
@@ -536,7 +594,9 @@ def test_dense_reward_increases(tokenizer, tmp_path, algorithm):
 
 
 @pytest.mark.integration
-def test_grpo_resume_restores_policy_version_counters_and_optimizer(tokenizer, tmp_path, monkeypatch):
+def test_grpo_resume_restores_policy_version_counters_and_optimizer(
+    tokenizer, tmp_path, monkeypatch, recwarn
+):
     prompts = ["v0", "c1", "c2"]
     full, _ = window_run(tokenizer, tmp_path, monkeypatch, prompts, ga=1, spg=3, max_steps=6, run_name="full")
     full.train()
@@ -577,6 +637,7 @@ def test_grpo_resume_restores_policy_version_counters_and_optimizer(tokenizer, t
         for p in resumed.trainer.model.parameters():
             p.add_(1.0)
     resumed.train(resume_from_checkpoint=str(ckpt))
+    assert not [w for w in recwarn if "generation boundary" in str(w.message)]  # step 3 is aligned
     opt = resumed.hooked_optimizer
     assert (opt.nominal_steps, opt.applied_updates, opt.skipped_steps) == (6, 2, 4)
     buf = resumed.trainer.trajectory_buffer
@@ -597,8 +658,50 @@ def test_policy_version_key_is_scalar_and_survives_trl_split(tokenizer, tmp_path
     from research_rl.rollout import read_policy_version, stamp_policy_version
 
     batch = {"advantages": torch.arange(6.0), "completion_ids": torch.zeros(6, 3)}
+    batch[SIGNAL_KEY] = batch["advantages"] > 2  # per-sample flags travel with their samples
     stamp_policy_version(batch, 7)
     assert batch[POLICY_VERSION_KEY].ndim == 0
     parts = split_tensor_dict(shuffle_sequence_dict(batch), 3)
     assert [read_policy_version(p) for p in parts] == [7, 7, 7]
     assert all(p["advantages"].shape == (2,) for p in parts)
+    for p in parts:
+        assert p[SIGNAL_KEY].dtype == torch.bool and torch.equal(p[SIGNAL_KEY], p["advantages"] > 2)
+
+
+@pytest.mark.parametrize(
+    ("step", "ga", "spg", "num_iterations", "aligned"),
+    [
+        (3, 1, 3, 1, True),
+        (2, 1, 3, 1, False),
+        (1, 2, 4, 1, False),
+        (2, 2, 4, 1, True),
+        (2, 1, 2, 2, False),
+        (4, 1, 2, 2, True),
+        (3, 4, 2, 1, True),  # ga > spg: every step ends on a boundary
+    ],
+)
+def test_resume_alignment_rule(step, ga, spg, num_iterations, aligned):
+    # ``aligned`` is hand-derived: TRL generates before micro-batch k iff k % (spg * num_iterations) == 0,
+    # and step s starts at micro-batch s * ga.
+    assert resume_is_generation_aligned(step, ga, spg, num_iterations) is aligned
+
+
+def test_unaligned_resume_warns(recwarn):
+    class Fake:
+        num_iterations = 1
+
+    class Args:
+        gradient_accumulation_steps = 1
+        steps_per_generation = 3
+
+    class State:
+        global_step = 2
+
+    callback = _WindowCallback(Fake())  # type: ignore[arg-type]
+    with pytest.warns(UserWarning, match="not a generation boundary"):
+        callback.on_train_begin(Args(), State(), None)
+    State.global_step = 3
+    callback.on_train_begin(Args(), State(), None)
+    State.global_step = 0
+    callback.on_train_begin(Args(), State(), None)
+    assert not [w for w in recwarn if "generation boundary" in str(w.message)]

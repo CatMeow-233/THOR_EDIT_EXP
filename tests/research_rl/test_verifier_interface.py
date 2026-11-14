@@ -164,13 +164,15 @@ def test_reward_func_conversational_completions_and_custom_key():
 
 def test_reward_func_truncation_from_completion_ids():
     fn = as_trl_reward_func(MathVerifier(rewards=SCHEME), eos_token_ids=[2, 7])
-    comps = ["\\boxed{4}", "\\boxed{4}", "\\boxed{4}", "", "\\boxed{4}</s>"]
-    ids = [[5, 6, 2], [5, 6, 7], [5, 6, 9], [], [5, 6, 9]]
-    kw, _ = _trl_kwargs(answer=["4"] * 5)
+    comps = ["\\boxed{4}", "\\boxed{4}", "\\boxed{4}", "", "\\boxed{4}</s>", "\\boxed{4}</s>"]
+    ids = [[5, 6, 2], [5, 6, 7], [5, 6, 9], [], [5, 6, 9], [5, 6, 2]]
+    kw, _ = _trl_kwargs(answer=["4"] * 6)
     out = fn(prompts=None, completions=comps, completion_ids=ids, **kw)
-    # ends in eos -> graded; ends in other id -> truncated; empty ids -> truncated; textual </s> overrides
-    assert [r.status for r in fn.last_results] == ["correct", "correct", "truncated", "truncated", "correct"]
-    assert out == [1.0, 1.0, -1.0, -1.0, 1.0]
+    # ends in eos -> graded; ends in other id -> truncated; empty ids -> truncated; a textual </s> does
+    # NOT clear the token-level truncation flag (with skip_special_tokens it came from ordinary tokens)
+    statuses = ["correct", "correct", "truncated", "truncated", "truncated", "correct"]
+    assert [r.status for r in fn.last_results] == statuses
+    assert out == [1.0, 1.0, -1.0, -1.0, -1.0, 1.0]
     # without eos ids nothing is flagged
     plain = as_trl_reward_func(MathVerifier(rewards=SCHEME))
     assert plain(completions=comps[:3], completion_ids=ids[:3], answer=["4"] * 3) == [1.0, 1.0, 1.0]
@@ -202,6 +204,23 @@ def test_reward_func_none_on_error():
     assert fn(completions=["\\boxed{1}", "\\boxed{1}"], answer=[None, "1"]) == [None, 1.0]
     strict = as_trl_reward_func(MathVerifier(rewards=SCHEME))
     assert strict(completions=["\\boxed{1}"], answer=[None]) == [-2.0]
+
+
+def test_reward_func_max_error_frac():
+    # default: per-row bad references are scored, not raised
+    assert as_trl_reward_func(MathVerifier())(completions=["\\boxed{1}"] * 2, answer=[None, None]) == [
+        0.0,
+        0.0,
+    ]
+    fn = as_trl_reward_func(MathVerifier(), max_error_frac=0.5)
+    assert fn(completions=["\\boxed{1}"] * 2, answer=[None, "1"]) == [0.0, 1.0]  # 1/2 is not > 0.5
+    with pytest.raises(ValueError, match="2/3 completions"):
+        fn(completions=["\\boxed{1}"] * 3, answer=[None, "", "1"])
+    assert [r.status for r in fn.last_results] == ["error", "error", "correct"]  # still inspectable
+    assert pickle.loads(pickle.dumps(fn)).max_error_frac == 0.5
+    for bad in (1.0, -0.1):
+        with pytest.raises(ValueError):
+            as_trl_reward_func(MathVerifier(), max_error_frac=bad)
 
 
 def test_reward_func_passes_through_meta_and_is_picklable():
@@ -283,6 +302,14 @@ def test_grpo_trainer_one_step_with_math_reward(tiny_model_dir, tmp_path):
         truncated = len(ids) == 0 or ids[-1] != 2
         expected.append(verifier.verify(comp[0]["content"], ref, truncated=truncated).reward)
     assert call["out"] == expected
+    # hand-written status rule, independent of MathVerifier: no final EOS id -> truncated; terminated and
+    # without any answer marker -> no_answer
+    for comp, ids, result in zip(call["completions"], call["ids"], reward.fn.last_results, strict=True):
+        text = comp[0]["content"]
+        if len(ids) == 0 or ids[-1] != 2:
+            assert result.status == "truncated", (text, result)
+        elif not any(m in text.lower() for m in ("\\boxed", "\\fbox", "####", "answer")):
+            assert result.status == "no_answer", (text, result)
     assert len(set(expected)) > 1, "rewards constant -> zero advantages; pick another seed"
     logs = trainer.state.log_history[0]
     assert logs["rewards/math_reward/mean"] == pytest.approx(sum(expected) / 4, abs=1e-6)
@@ -377,6 +404,23 @@ def test_code_verifier_with_fake_backend():
     assert tiny.verify(CODE, "1").details["reason"] == "code_too_long" and len(backend.requests) == n_requests
 
 
+def test_code_verifier_output_longer_than_cap_fails():
+    policy = SandboxPolicy(enabled=True, max_output_chars=5)
+    # overlong output whose prefix equals the expected output must not pass
+    backend = FakeBackend(outputs={"": ExecutionResult("ok", "12345WRONGEXTRA", return_code=0)})
+    r = CodeExecutionVerifier(policy, backend).verify("```python\nprint(1)\n```", "12345")
+    assert (r.status, r.details["outcomes"]) == ("incorrect", ["output_too_long"])
+    # output of exactly the cap still passes, also with a trailing newline (compared after normalisation)
+    backend = FakeBackend(outputs={"": ExecutionResult("ok", "12345\n", return_code=0)})
+    assert (
+        CodeExecutionVerifier(policy, backend).verify("```python\nprint(1)\n```", "12345").status == "correct"
+    )
+    # an expected output longer than the cap cannot be checked: bad reference, nothing is executed
+    backend = FakeBackend(outputs={})
+    r = CodeExecutionVerifier(policy, backend).verify("```python\nprint(1)\n```", "123456")
+    assert (r.status, r.details["reason"], backend.requests) == ("error", "bad_reference", [])
+
+
 def test_sandbox_recheck_propagates_through_trl_adapter():
     backend = FakeBackend(outputs={"": ExecutionResult("ok", "7", return_code=0)})
     v = CodeExecutionVerifier(ENABLED, backend)
@@ -394,6 +438,11 @@ def test_sandbox_recheck_propagates_through_trl_adapter():
         ("```py\nx\n```\n```python\ny\n```", "y\n"),
         ("```python\nx\n```\n```bash\nrm -rf /\n```", "x\n"),
         ("```\nbare\n```", "bare\n"),
+        # a tagged block wins over a later untagged example-output block, and vice versa
+        ("```python\nprint(41+1)\n```\nOutput:\n```\n42\n```", "print(41+1)\n"),
+        ("```\n42\n```\n```python\nprint(42)\n```", "print(42)\n"),
+        ("```\na\n```\n```\nb\n```", "b\n"),
+        ("```\nbare\n```\n```bash\nrm -rf /\n```", "bare\n"),
         ("```python\nunclosed", None),
         ("no fences", None),
         ("```python", None),

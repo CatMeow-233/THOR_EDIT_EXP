@@ -118,7 +118,17 @@ CASES: list[tuple[str, str | None, object, dict, dict, str, str | None]] = [
     ("default_terms_off", "\\boxed{5}</s>\\boxed{6}", "6", {"terminators": ()}, {}, "correct", "6"),
     ("truncated_flag", "\\boxed{5}", "5", {}, {"truncated": True}, "truncated", None),
     ("truncated_no_answer", "abc", "5", {}, {"truncated": True}, "truncated", None),
-    ("truncated_but_terminated", "\\boxed{5}</s>", "5", {}, {"truncated": True}, "correct", "5"),
+    # a textual terminator does not clear an explicit truncated=True (TRL decodes with skip_special_tokens)
+    ("truncated_textual_eos", "\\boxed{5}</s> more", "5", {}, {"truncated": True}, "truncated", None),
+    (
+        "truncated_eos_override_opt_in",
+        "\\boxed{5}</s> more",
+        "5",
+        {"terminator_overrides_truncated": True},
+        {"truncated": True},
+        "correct",
+        "5",
+    ),
     ("not_truncated_flag", "\\boxed{5}", "5", {}, {"truncated": False}, "correct", "5"),
     ("grade_truncated", "\\boxed{5}", "5", {"grade_truncated": True}, {"truncated": True}, "correct", "5"),
     # ---- numeric / normalisation edge cases (boxed answer vs reference)
@@ -177,6 +187,70 @@ CASES: list[tuple[str, str | None, object, dict, dict, str, str | None]] = [
     ("rightarrow_kept", "\\boxed{a\\rightarrow b}", "a\\rightarrowb", {}, {}, "correct", "a\\rightarrowb"),
     ("expression_spacing", "\\boxed{x^2 + 1}", "x^2+1", {}, {}, "correct", "x^2+1"),
     ("unicode_superscript_not_digit", "\\boxed{2²}", "4", {}, {}, "incorrect", "2²"),
+    ("boxed_space_before_brace", "\\boxed {5}", "5", {}, {}, "correct", "5"),
+    ("displaystyle_short_frac", "\\boxed{\\displaystyle\\frac12}", "0.5", {}, {}, "correct", "\\frac{1}{2}"),
+    ("tilde_spacing", "\\boxed{1~000}", "1000", {}, {}, "correct", "1000"),
+    ("exp_at_bound", "\\boxed{1e400}", "1" + "0" * 400, {}, {}, "correct", "1e400"),
+    ("exp_at_bound_wrong", "\\boxed{1e400}", "1" + "0" * 399, {}, {}, "incorrect", "1e400"),
+    # ---- null delimiters \left. / \right. leave nothing behind (no "5" -> ".5" false positive)
+    ("null_delims_not_half", "\\boxed{\\left. 5 \\right.}", "0.5", {}, {}, "incorrect", "5"),
+    ("null_delims_value", "\\boxed{\\left. 5 \\right.}", "5", {}, {}, "correct", "5"),
+    ("null_delim_with_bar", "\\boxed{\\left.x\\right|_0}", "x|_0", {}, {}, "correct", "x|_0"),
+    # ---- escaped dollar (currency) on the answer and reference side
+    ("escaped_dollar_boxed", "\\boxed{\\$18}", "18", {}, {}, "correct", "18"),
+    ("escaped_dollar_gsm8k", "#### \\$18", "18", {}, {}, "correct", "18"),
+    ("escaped_dollar_reference", "\\boxed{5}", "\\$5", {}, {}, "correct", "5"),
+    ("escaped_dollar_thousands", "\\boxed{\\$1,234}", "1234", {}, {}, "correct", "1234"),
+    ("escaped_dollar_space_in_math", "The answer is $\\$ 18$ total", "18", {}, {}, "correct", "18"),
+    ("escaped_dollar_in_math", "The answer is $\\$18$ total", "18", {}, {}, "correct", "18"),
+    # ---- line-based extractors: bounded answer span, same-line reasoning text is trailing text
+    ("phrase_then_sentence", "The answer is 42. Let me double check.", "42", {}, {}, "correct", "42"),
+    ("phrase_math_then_unit", "The answer is $7$ dollars.", "7", {}, {}, "correct", "7"),
+    ("gsm8k_then_unit", "#### 5 apples", "5", {}, {}, "correct", "5"),
+    ("phrase_comma_reasoning", "The answer is 5, as shown above", "5", {}, {}, "correct", "5"),
+    ("markdown_answer_colon", "**Answer:** 5", "5", {}, {}, "correct", "5"),
+    ("markdown_final_answer", "**Final Answer**: 5", "5", {}, {}, "correct", "5"),
+    ("markdown_bold_value", "The answer is **5**", "5", {}, {}, "correct", "5"),
+    ("markdown_bold_value_period", "The answer is **5**.", "5", {}, {}, "correct", "5"),
+    ("phrase_period_then_math", "The answer is 5. 2+3=5", "5", {}, {}, "correct", "5"),
+    ("phrase_comma_then_number", "The answer is 5, 6 is wrong", "5", {}, {}, "correct", "5"),
+    ("phrase_two_currency_signs", "The answer is $18, since $20 - $2 = $18.", "18", {}, {}, "correct", "18"),
+    ("gsm8k_two_currency_signs", "#### $18 (from $20)", "18", {}, {}, "correct", "18"),
+    ("phrase_unit_dropped_limitation", "The answer is 5 cm", "5 cm", {}, {}, "incorrect", "5"),
+    ("phrase_paren_reasoning", "The answer is 5 (since 2+3=5)", "5", {}, {}, "correct", "5"),
+    ("phrase_currency_unclosed", "The answer is $18. Done", "18", {}, {}, "correct", "18"),
+    ("phrase_decimal_period", "The answer is 3.14.", "3.14", {}, {}, "correct", "3.14"),
+    ("phrase_expression", "Answer: x^2 + 1", "x^2+1", {}, {}, "correct", "x^2+1"),
+    ("phrase_choice", "The answer is (B)", "(B)", {}, {}, "correct", "(B)"),
+    ("phrase_interval", "The answer is (1, 2] here", "(1,2]", {}, {}, "correct", "(1,2]"),
+    ("phrase_frac", "Answer: \\frac{1}{2}", "0.5", {}, {}, "correct", "\\frac{1}{2}"),
+    ("phrase_paren_math", "Answer: \\(\\frac{1}{2}\\) cups", "0.5", {}, {}, "correct", "\\frac{1}{2}"),
+    ("phrase_word_answer", "The answer is yes because 2>1", "yes", {}, {}, "correct", "yes"),
+    ("phrase_wrong_then_text", "The answer is 41. Close to 42", "42", {}, {}, "incorrect", "41"),
+    ("gsm8k_last_marker_wins", "#### 5\n#### 6", "6", {}, {}, "correct", "6"),
+    ("gsm8k_last_marker_wrong", "#### 6\n#### 5", "6", {}, {}, "incorrect", "5"),
+    ("phrase_last_match_wins", "Answer: 5 ... The answer is 6", "6", {}, {}, "correct", "6"),
+    ("phrase_last_match_wrong", "Answer: 6 ... The answer is 5", "6", {}, {}, "incorrect", "5"),
+    # ---- strict_trailing applies to line-based extractors too
+    ("gsm8k_unit_strict", "#### 5 apples", "5", {"strict_trailing": True}, {}, "format_error", None),
+    (
+        "phrase_because_strict",
+        "The answer is 5 because x",
+        "5",
+        {"strict_trailing": True},
+        {},
+        "format_error",
+        None,
+    ),
+    ("phrase_period_strict", "The answer is **5**.", "5", {"strict_trailing": True}, {}, "correct", "5"),
+    ("phrase_math_strict", "The answer is $$7$$.\n", "7", {"strict_trailing": True}, {}, "correct", "7"),
+    # ---- reference extraction: last box / last #### / bounded #### span
+    ("ref_last_box", "\\boxed{6}", "\\boxed{5} or \\boxed{6}", {}, {}, "correct", "6"),
+    ("ref_last_box_wrong", "\\boxed{5}", "\\boxed{5} or \\boxed{6}", {}, {}, "incorrect", "5"),
+    ("ref_last_hashes", "\\boxed{6}", "#### 5\n#### 6", {}, {}, "correct", "6"),
+    ("ref_last_hashes_wrong", "\\boxed{5}", "#### 5\n#### 6", {}, {}, "incorrect", "5"),
+    ("ref_hashes_with_unit", "\\boxed{5}", "so 5 apples\n#### 5 apples", {}, {}, "correct", "5"),
+    ("ref_hashes_expression", "\\boxed{x^2+1}", "#### x^2 + 1", {}, {}, "correct", "x^2+1"),
 ]
 
 
@@ -212,6 +286,8 @@ def test_case_ids_unique():
         ("\\boxed{" + "1" * 600 + "}", {}, "answer_too_long"),
         ("a" * 40000 + "\\boxed{5}", {}, "completion_too_long"),
         ("\\boxed{" * 20 + "5" + "}" * 20, {}, "nested_boxes_too_deep"),
+        ("#### 5 apples", {"strict_trailing": True}, "trailing_text"),
+        ("Answer: " + "1 " * 400, {}, "answer_too_long"),
     ],
     ids=lambda v: v if isinstance(v, str) and len(v) < 40 else "",
 )
@@ -274,6 +350,13 @@ def test_reward_scheme_is_applied():
         ("45^\\circ", "45"),
         ("10\\%", "10"),
         ("\\frac34", "\\frac{3}{4}"),
+        ("\\displaystyle\\frac12", "\\frac{1}{2}"),
+        ("1~000", "1000"),
+        ("\\$1,234", "1234"),
+        ("$\\$5$", "5"),
+        ("\\left. 5 \\right.", "5"),
+        ("\\left.\\frac{1}{2}\\right|", "\\frac{1}{2}|"),
+        ("\\left\\{1\\right\\}", "\\{1\\}"),
         ("1,23", "1,23"),
     ],
 )
@@ -299,6 +382,11 @@ def test_normalize_answer_table(raw, expected):
         ("-\\frac{0.5}{2}", Fraction(-1, 4)),
         ("1.2\\times10^{-1}", Fraction(3, 25)),
         ("4\\cdot10^3", Fraction(4000)),
+        ("1e400", Fraction(10**400)),
+        ("1e-400", Fraction(1, 10**400)),
+        ("1\\times10^{400}", Fraction(10**400)),
+        ("1\\times10^{401}", None),
+        ("1\\times10^{999999999}", None),
         ("1/0", None),
         ("\\frac{1}{0}", None),
         (".", None),
@@ -382,6 +470,12 @@ def test_seeded_equivalence_against_fraction_reference():
         ("\\boxed{5}</s>" + "a" * 2_000_000, {}),
         ("a" * 2_000_000, {}),
         ("1" * 30000 + "e" + "9" * 20, {"extractors": ("answer_phrase",)}),
+        ("\\boxed{1\\times10^{999999999}}", {}),
+        ("The answer is " + "(" * 30000, {}),
+        ("#### " + "1 " * 15000, {"strict_trailing": True}),
+        ("Answer: $" + "\\$" * 15000, {}),
+        ("answer" + " " * 32000 + "x", {}),
+        ("final answer" + " " * 32000 + "**" + " " * 100, {}),
     ],
     ids=[
         "open_boxes",
@@ -396,6 +490,12 @@ def test_seeded_equivalence_against_fraction_reference():
         "tail_after_eos",
         "long_no_eos",
         "long_number",
+        "times_ten_huge_exponent",
+        "phrase_open_parens",
+        "hash_many_tokens",
+        "phrase_unclosed_dollar_escapes",
+        "answer_long_space_run",
+        "answer_spaces_then_bold",
     ],
 )
 def test_pathological_inputs_are_fast(completion, cfg):
@@ -420,3 +520,11 @@ def test_invalid_configuration_rejected():
         MathVerifier(max_number_digits=5000)
     with pytest.raises(ValueError):
         MathVerifier(terminators=("",))
+
+
+def test_answer_phrase_regex_is_linear_on_long_space_runs():
+    # an ambiguous "[ \t]*(**)?[ \t]*:" regex was quadratic here (~1.4 s for 32k spaces); now ~2 ms
+    v = MathVerifier()
+    start = time.perf_counter()
+    result = v.verify("answer" + " " * 32000 + "x", "5")
+    assert time.perf_counter() - start < 0.3 and result.status == "no_answer"

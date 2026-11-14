@@ -6,10 +6,13 @@ length-bounded string; nothing is ``eval``-ed, no sympy, no signal-based timeout
 1. **Size guard** - only the first ``max_completion_chars`` characters (plus terminator slack) are ever
    scanned; a longer completion without an earlier terminator is a ``format_error``.
 2. **Termination** - the text is cut at the *first* terminator string (``</s>``, ``<|im_end|>``, ...).
-   ``verify(..., truncated=True)`` tells the verifier the generation was cut by the length limit. A
-   terminator present in the text overrides that flag (the model did finish). By default a truncated
-   completion gets ``status="truncated"`` even if it contains an answer (the answer may be cut off,
-   e.g. ``\\boxed{12`` of ``\\boxed{123}``); ``grade_truncated=True`` grades it normally instead.
+   ``verify(..., truncated=True)`` tells the verifier the generation was cut by the length limit; the
+   flag is trusted even when a terminator string appears in the text (with TRL's
+   ``skip_special_tokens=True`` decoding such a string came from ordinary tokens, so the generation did
+   *not* stop there). ``terminator_overrides_truncated=True`` lets a textual terminator clear the flag -
+   only meaningful for raw decoding that keeps special tokens. By default a truncated completion gets
+   ``status="truncated"`` even if it contains an answer (the answer may be cut off, e.g. ``\\boxed{12``
+   of ``\\boxed{123}``); ``grade_truncated=True`` grades it normally instead.
 3. **Extraction** - extractors are tried in the configured order, the first one that finds something wins:
 
    * ``"boxed"``: ``\\boxed{...}`` / ``\\fbox{...}`` with nested braces (``\\{`` / ``\\}`` are escapes);
@@ -17,14 +20,25 @@ length-bounded string; nothing is ``eval``-ed, no sympy, no signal-based timeout
      ``strict_boxed=True`` exactly one *distinct* boxed answer must exist (distinct = different after
      normalisation and numeric canonicalisation, so ``\\boxed{1}`` and ``\\boxed{1.0}`` agree), and a
      completion without any box is a ``format_error``. ``\\boxed`` not followed by ``{`` is ignored.
-   * ``"gsm8k"``: the rest of the line after the last ``####``.
-   * ``"answer_phrase"``: the rest of the line after the last ``Answer:`` / ``answer is`` /
-     ``final answer is`` (case-insensitive).
+   * ``"gsm8k"``: the answer span after the last ``####``.
+   * ``"answer_phrase"``: the answer span after the last ``Answer:`` / ``answer is`` /
+     ``final answer is`` (case-insensitive; markdown ``**Answer:**`` / ``**Final Answer**:`` included).
+
+   For these two line-based extractors the answer span (:func:`_line_answer`) is bounded, not the whole
+   rest of the line: after skipping whitespace and markdown ``*``, it is either a ``$...$`` / ``$$...$$``
+   / ``\\(...\\)`` / ``\\[...\\]`` span closed on the same line, or a run of whitespace-separated
+   tokens that stops *before* the first plain English word (2+ letters only, e.g. ``apples``,
+   ``because``, ``(since``) and *after* a token ending in ``. , ; : ?`` - both only outside brackets, and
+   the first token is always taken. So ``The answer is 42. Let me check`` -> ``42``, ``#### 5 apples``
+   -> ``5``, ``Answer: (1, 2]`` -> ``(1,2]``, ``Answer: x^2 + 1`` -> ``x^2+1``, ``The answer is $18.``
+   -> ``18`` (an unclosed ``$``, or one whose closing ``$`` is followed by a digit, is a currency sign). This is a heuristic: a multi-word textual answer
+   keeps only its first word, and units written as words are dropped. The rest of the line is trailing
+   text. A ``####`` reference is reduced with the same rule.
 
    Nothing found -> ``no_answer``.
-4. **Trailing text** - default: reasoning text before/after the answer is allowed. ``strict_trailing=True``
-   rejects any non-whitespace after the answer span except closing math delimiters ``$``, ``\\]``,
-   ``\\)`` and a period.
+4. **Trailing text** - default: reasoning text before/after the answer is allowed (for every extractor).
+   ``strict_trailing=True`` rejects any non-whitespace after the answer span except closing math
+   delimiters ``$``, ``\\]``, ``\\)``, markdown ``*`` and a period.
 5. **Normalisation** (:func:`normalize_answer`) - see its docstring.
 6. **Equivalence** - if both sides parse as exact rationals (:func:`parse_number`: integers, decimals,
    scientific notation with bounded exponent, ``a/b``, ``\\frac{a}{b}``, ``a\\times10^{k}``) they are
@@ -54,9 +68,18 @@ DEFAULT_TERMINATORS: tuple[str, ...] = (
 EXTRACTORS: tuple[str, ...] = ("boxed", "gsm8k", "answer_phrase")
 
 _BOX_RE = re.compile(r"\\(?:boxed|fbox)")
-_ANSWER_PHRASE_RE = re.compile(r"\b(?:final\s+)?answer(?:\s+is\b[ \t]*:?|[ \t]*:)", re.IGNORECASE)
-_ALLOWED_TRAILING_RE = re.compile(r"(?:\s|\$|\\\]|\\\)|\.)*")
-_LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)(?![A-Za-z])")
+_ANSWER_PHRASE_RE = re.compile(
+    r"\b(?:final\s+)?answer(?:\s+is\b[ \t]*:?|[ \t]*(?:\*\*[ \t]*)?:)",
+    re.IGNORECASE,  # no ambiguous runs
+)
+_ALLOWED_TRAILING_RE = re.compile(r"(?:\s|\$|\\\]|\\\)|\.|\*)*")
+_LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)(?:\.|(?![A-Za-z]))")  # "\left." / "\right." = null delimiter
+_LEAD_RE = re.compile(r"[ \t*]*")
+_TOKEN_RE = re.compile(r"[^ \t]+")
+_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+_WORD_STRIP = "*()[]{}\"'.,;:!?"
+_STOP_PUNCT = ".,;:?"
+_DELIMS = (("$$", "$$"), ("$", "$"), ("\\(", "\\)"), ("\\[", "\\]"))
 _TEXT_CMD_RE = re.compile(r"\\(?:text|textbf|textrm|textit|mathrm|mathbf|mbox|operatorname)\s*\{([^{}]*)\}")
 _FRAC_SHORT_RE = re.compile(r"\\frac([0-9])([0-9])")
 _FRAC_RE = re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}")
@@ -65,7 +88,7 @@ _THOUSANDS_RE = re.compile(r"-?[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?")
 _WS_RE = re.compile(r"\s+")
 _UNICODE_MINUS = ("\u2212", "\ufe63", "\uff0d")
 _TIMES_TEN = ("\\times10^", "\\cdot10^", "×10^", "*10^")
-_DEGREE_MARKERS = ("^\\circ", "^{\\circ}", "\\degree", "°")
+_DEGREE_MARKERS = ("^{\\circ}", "^\\circ", "\\degree", "°")
 
 
 class _FormatError(Exception):
@@ -77,14 +100,15 @@ class _FormatError(Exception):
 def normalize_answer(answer: str, *, strip_percent: bool = True, strip_degrees: bool = True) -> str:
     """Canonical string form of a final answer.
 
-    Removes surrounding ``$...$`` / ``\\(...\\)`` / ``\\[...\\]``, ``\\left`` / ``\\right``, ``\\displaystyle``,
+    Removes escaped dollars ``\\$`` (currency), surrounding ``$...$`` / ``\\(...\\)`` / ``\\[...\\]``,
+    ``\\left`` / ``\\right`` (with the null delimiters ``\\left.`` / ``\\right.``), ``\\displaystyle``,
     LaTeX spacing (``\\!``, ``\\,``, ``\\;``, ``\\:``, ``\\ ``, ``~``), all whitespace, a leading ``+`` and
     trailing periods; maps ``\\dfrac`` / ``\\tfrac`` -> ``\\frac``, ``\\frac12`` -> ``\\frac{1}{2}``, unicode
     minus signs -> ``-``, ``\\text{x}`` (and ``\\mathrm``, ``\\textbf``, ...) -> ``x``, ``{,}`` -> ``,`` and
     ``1,234,567`` -> ``1234567`` (only when the whole answer is such a number); optionally drops degree
     (``^\\circ``, ``°``) and percent (``\\%``, ``%``) markers.
     """
-    s = answer.strip()
+    s = answer.strip().replace("\\$", "")  # escaped dollar = currency sign, not a math delimiter
     for _ in range(4):  # nested delimiters such as "$\(5\)$"; bounded, each pass shrinks or stops
         before = s
         if len(s) >= 2 and s[0] == "$" and s[-1] == "$":
@@ -238,10 +262,62 @@ def _unwrap_box(content: str, max_depth: int = 16) -> str:
     raise _FormatError("nested_boxes_too_deep")
 
 
-def _rest_of_line(text: str, start: int) -> tuple[str, int]:
-    end = text.find("\n", start)
-    end = len(text) if end < 0 else end
-    return text[start:end], end
+def _find_closing(text: str, start: int, close: str, stop: int) -> int:
+    """Index of ``close`` in ``text[start:stop]`` that is not preceded by a backslash escape, or -1."""
+    k = start
+    while k < stop:
+        if text.startswith(close, k, stop):
+            return k
+        k += 2 if text[k] == "\\" else 1  # skip escapes such as "\\$"
+    return -1
+
+
+def _is_word(token: str) -> bool:
+    return _WORD_RE.fullmatch(token.strip(_WORD_STRIP)) is not None
+
+
+def _line_answer(text: str, start: int, max_chars: int) -> tuple[str, int]:
+    """Bounded answer span on the line starting at ``start``: ``(raw_answer, end_index_in_text)``.
+
+    See the module docstring (step 3) for the rule. Linear in the line length; stops once the span
+    exceeds ``max_chars`` (the caller then reports ``answer_too_long``).
+    """
+    line_end = text.find("\n", start)
+    line_end = len(text) if line_end < 0 else line_end
+    pos = _LEAD_RE.match(text, start, line_end).end()  # type: ignore[union-attr]  # always matches
+    for open_, close in _DELIMS:
+        if text.startswith(open_, pos, line_end):
+            k = _find_closing(text, pos + len(open_), close, line_end)
+            # "$18, since $20": a "$" followed by a digit opens an amount, it does not close math
+            currency = close == "$" and k >= 0 and text[k + 1 : k + 2].isdigit()
+            if k >= 0 and not currency:
+                end = k + len(close)
+                return text[pos:end], end
+            break  # unclosed "$18" or "$18 ... $20": currency signs, scan tokens instead
+    end = pos
+    depth = 0
+    taken = 0
+    for m in _TOKEN_RE.finditer(text, pos, line_end):
+        token = m.group()
+        core = token.strip("*")
+        if not core:  # stray markdown emphasis
+            if taken:
+                end = m.end()
+            continue
+        if taken and depth == 0 and _is_word(core):
+            break
+        taken += 1
+        depth = max(0, depth + sum(core.count(c) for c in "([{") - sum(core.count(c) for c in ")]}"))
+        end = m.end()
+        if end - pos > max_chars or (depth == 0 and core[-1] in _STOP_PUNCT):
+            break
+    return _clean_line_answer(text[pos:end]), end
+
+
+def _clean_line_answer(raw: str) -> str:
+    """Drop markdown bold markers and sentence punctuation around a line answer."""
+    raw = raw.replace("**", "").strip().strip("*").strip()
+    return raw.rstrip(_STOP_PUNCT).rstrip()
 
 
 class MathVerifier(BaseVerifier):
@@ -261,6 +337,7 @@ class MathVerifier(BaseVerifier):
         strict_trailing: bool = False,
         terminators: Sequence[str] = DEFAULT_TERMINATORS,
         grade_truncated: bool = False,
+        terminator_overrides_truncated: bool = False,
         strip_percent: bool = True,
         strip_degrees: bool = True,
         max_completion_chars: int = 32768,
@@ -286,6 +363,7 @@ class MathVerifier(BaseVerifier):
         self.strict_trailing = strict_trailing
         self.terminators = tuple(terminators)
         self.grade_truncated = grade_truncated
+        self.terminator_overrides_truncated = terminator_overrides_truncated
         self.strip_percent = strip_percent
         self.strip_degrees = strip_degrees
         self.max_completion_chars = max_completion_chars
@@ -337,7 +415,7 @@ class MathVerifier(BaseVerifier):
         if boxes:
             ref = _unwrap_box(boxes[-1][0])
         elif "####" in ref:
-            ref = _rest_of_line(ref, ref.rfind("####") + 4)[0]
+            ref = _line_answer(ref, ref.rfind("####") + 4, self.max_answer_chars)[0]
         if len(ref) > self.max_answer_chars:
             raise ValueError("reference answer longer than max_answer_chars")
         normalized = self.normalize(ref)
@@ -366,14 +444,14 @@ class MathVerifier(BaseVerifier):
             if extractor == "gsm8k":
                 idx = text.rfind("####")
                 if idx >= 0:
-                    answer, end = _rest_of_line(text, idx + 4)
+                    answer, end = _line_answer(text, idx + 4, self.max_answer_chars)
                     return answer, end, "gsm8k"
             if extractor == "answer_phrase":
                 last = None
                 for last in _ANSWER_PHRASE_RE.finditer(text):  # noqa: B007 - we want the last match
                     pass
                 if last is not None:
-                    answer, end = _rest_of_line(text, last.end())
+                    answer, end = _line_answer(text, last.end(), self.max_answer_chars)
                     return answer, end, "answer_phrase"
         return None
 
@@ -397,7 +475,7 @@ class MathVerifier(BaseVerifier):
         except (ValueError, _FormatError) as exc:
             return "error", None, None, {"reason": "bad_reference", "message": str(exc)}
         text, terminated = self.strip_terminators(completion or "")
-        cut = bool(truncated) and not terminated
+        cut = bool(truncated) and not (terminated and self.terminator_overrides_truncated)
         details: dict[str, Any] = {"terminated": terminated, "truncated": cut}
         if cut and not self.grade_truncated:
             return "truncated", None, ref, {**details, "reason": "cut_by_length"}

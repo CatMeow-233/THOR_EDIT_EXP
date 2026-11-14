@@ -6,7 +6,12 @@ distribution on them (generalized JSD; ``beta``/``temperature`` in the config). 
 writes two random tiny Llamas (student seed = config seed, teacher seed = config seed + 1) into the
 output dir and runs a few CPU steps on in-memory arithmetic prompts (a smoke run: the numbers say
 nothing about real model quality). On a CUDA machine pass ``--model <student> --teacher <teacher>
---bf16`` (same vocabulary) and optionally ``--dataset`` to run real training with the same code path.
+--bf16`` (same vocabulary) and optionally ``--dataset`` for real training (NOT_TESTED). It is *not*
+the CPU-tested code path: on CUDA/XPU with Triton installed, TRL computes the divergence with its
+Triton kernels (``trl/kernels/chunked_divergence.py``), while CI only exercises the plain-torch tile
+path. ``--bf16`` only turns on autocast; a teacher given as a path is loaded by TRL with
+``trainer.args.teacher_model_init_kwargs`` (dtype float32 unless set there, e.g. ``{"dtype":
+"bfloat16"}``), not with the student's ``model.dtype``.
 The experiment record is written to ``<output_dir>/<study_id>/<run_name>/record.json``.
 """
 

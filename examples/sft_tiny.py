@@ -4,7 +4,8 @@
 By default this writes a random tiny Llama + char tokenizer into the output dir and runs a few CPU
 steps on an in-memory arithmetic prompt/completion set (a smoke run: the numbers say nothing about
 real model quality). On a CUDA machine pass ``--model <hf id or path> --bf16`` (and optionally
-``--dataset``) to run real training with the same code path. The experiment record is written to
+``--dataset``) for real training through the same adapter (NOT_TESTED: only CPU runs, including
+bf16 autocast on CPU, are exercised in CI). The experiment record is written to
 ``<output_dir>/<study_id>/<run_name>/record.json``.
 """
 

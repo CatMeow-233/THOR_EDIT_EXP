@@ -172,7 +172,10 @@ class TRLRewardFunction:
         truncated_key: str | None = None,
         none_on_error: bool = False,
         log_status_metrics: bool = True,
+        max_error_frac: float | None = None,
     ) -> None:
+        if max_error_frac is not None and not 0.0 <= max_error_frac < 1.0:
+            raise ValueError(f"max_error_frac must be in [0, 1) or None, got {max_error_frac!r}")
         if not isinstance(verifier, Verifier):
             raise TypeError(f"{verifier!r} does not implement Verifier.verify")
         self.verifier = verifier
@@ -182,6 +185,7 @@ class TRLRewardFunction:
         self.truncated_key = truncated_key
         self.none_on_error = none_on_error
         self.log_status_metrics = log_status_metrics
+        self.max_error_frac = max_error_frac
         self.last_results: list[VerificationResult] = []
 
     def _truncation_flags(self, n: int, completion_ids: Any, kwargs: Mapping[str, Any]) -> list[bool | None]:
@@ -225,6 +229,12 @@ class TRLRewardFunction:
             counts: Counter[str] = Counter(r.status for r in results)
             for status in STATUSES:
                 log_metric(f"verifier/{self.__name__}/{status}_frac", counts.get(status, 0) / n)
+        errors = [r for r in results if r.status == "error"]
+        if self.max_error_frac is not None and n and len(errors) / n > self.max_error_frac:
+            raise ValueError(
+                f"{self.__name__}: {len(errors)}/{n} completions scored status='error' "
+                f"(> max_error_frac={self.max_error_frac}); first error details: {errors[0].details}"
+            )
         return [None if (self.none_on_error and r.status == "error") else r.reward for r in results]
 
     def __repr__(self) -> str:
@@ -248,6 +258,7 @@ def as_trl_reward_func(
     truncated_key: str | None = None,
     none_on_error: bool = False,
     log_status_metrics: bool = True,
+    max_error_frac: float | None = None,
 ) -> TRLRewardFunction:
     """Wrap ``verifier`` as a TRL ``reward_funcs`` entry.
 
@@ -262,9 +273,15 @@ def as_trl_reward_func(
         none_on_error: return ``None`` (TRL: "reward not applicable", excluded from the sum) for
             ``status="error"`` instead of the scheme's error reward.
         log_status_metrics: log the fraction of each status via TRL's ``log_metric`` kwarg when available.
+        max_error_frac: if set, raise ``ValueError`` when more than this fraction of a batch scores
+            ``status="error"`` (e.g. a column of ``None`` / unparsable references). Default ``None``: off.
 
     Raises (at call time) ``KeyError`` if the reference column is missing and ``ValueError`` on length
-    mismatches - a misconfigured dataset must fail loudly instead of training on zero rewards.
+    mismatches. Per-row problems are **not** raised by default: an invalid reference (``None``, empty, too
+    long) scores ``status="error"`` (the scheme's error reward, or ``None`` with ``none_on_error``) and
+    shows up in the ``verifier/<name>/error_frac`` metric; use ``max_error_frac`` to make it fatal. A
+    reference that is valid but semantically wrong (e.g. a free-text solution without ``####`` or a box)
+    cannot be detected and is simply graded.
     """
     return TRLRewardFunction(
         verifier,
@@ -274,4 +291,5 @@ def as_trl_reward_func(
         truncated_key=truncated_key,
         none_on_error=none_on_error,
         log_status_metrics=log_status_metrics,
+        max_error_frac=max_error_frac,
     )

@@ -2,9 +2,9 @@
 """Math RLVR with RLOO (REINFORCE + leave-one-out baseline) through ResearchRL.
 
 Same flags, data and verifier as ``grpo_math_tiny.py`` (see its docstring for the CPU-smoke vs CUDA
-usage); only the algorithm and config (``configs/rloo_math_tiny.yaml``) differ. RLOO's default
-``beta=0.05`` KL penalty re-loads the reference model from the model path, which works here because
-the tiny model is written to disk first. CPU numbers say nothing about real model quality.
+usage; the CUDA usage is NOT_TESTED, no GPU in the dev environment); only the algorithm and config
+(``configs/rloo_math_tiny.yaml``) differ. RLOO's default ``beta=0.05`` KL penalty re-loads the
+reference model from the model path, which works here because the tiny model is written to disk first. CPU numbers say nothing about real model quality.
 """
 
 from __future__ import annotations

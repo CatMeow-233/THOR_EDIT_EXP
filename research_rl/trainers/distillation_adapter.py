@@ -18,6 +18,9 @@ and divided by the number of completion tokens in the whole generation batch (so
 accumulation is token-weighted); there is no ``T**2`` rescaling. The teacher gets no gradient.
 ``temperature`` also sets the student's sampling temperature.
 
+Tested on CPU only. On CUDA/XPU with Triton available, TRL evaluates the same divergence with Triton
+kernels instead of the plain-torch tile code the CPU tests exercise (NOT_TESTED here).
+
 Note on TRL versions: TRL 1.18's ``DistillationTrainer`` is purely on-policy — its config has no
 ``lmbda`` (mixing of dataset completions and student samples) and no ``seq_kd``. In TRL 1.18
 ``lmbda`` exists only in experimental trainers (``trl.experimental.gkd``, ``.gold``, ``.iw_opd``;
@@ -42,7 +45,8 @@ class DistillationAdapter(TrainerAdapter):
     """``TRAINERS.build("distillation")`` -> adapter for on-policy distillation.
 
     The teacher is given as ``teacher_model=`` (a ``PreTrainedModel`` or an HF id / local path,
-    which TRL loads with ``trainer.args.teacher_model_init_kwargs``). If it is omitted, the
+    which TRL loads with ``trainer.args.teacher_model_init_kwargs``; their ``dtype`` defaults to
+    float32 in TRL 1.18, independent of ``exp.model.dtype`` and of ``bf16``). If it is omitted, the
     config's ``trainer.args.teacher_model_name_or_path`` is used. Teacher and student must share
     the vocabulary. The teacher's identity is written to the experiment record as ``teacher_model``.
 

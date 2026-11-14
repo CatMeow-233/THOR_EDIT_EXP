@@ -16,6 +16,7 @@ from trl import GRPOConfig, RLOOConfig
 
 from research_rl.models.tiny import build_tiny_llama
 from research_rl.trainers.grpo_adapter import ResearchGRPOTrainer
+from research_rl.trainers.rl_common import SIGNAL_KEY
 from research_rl.trainers.rloo_adapter import ResearchRLOOTrainer
 
 EOS = 2
@@ -254,3 +255,153 @@ def test_rloo_default_beta_kl_penalty_matches_reference(tokenizer, tiny_model_di
     torch.testing.assert_close(out["advantages"].cpu(), ref, rtol=1e-4, atol=1e-5)
     # the KL term is not negligible in this test, so dropping it would be caught
     assert not torch.allclose(out["advantages"].cpu(), as_tensor(rloo_reference(REWARDS, False)), atol=1e-3)
+
+
+# ---------------------------------------------------------------------------------- learning signal
+# TRL computes advantages in float32. A constant group whose value is not exactly representable
+# (0.1, 0.9) leaves round-off advantages; the learning-signal flags must still say "no signal".
+def const_table_reward(values: list[float | None]):
+    table = {tuple(c): v for c, v in zip(COMPLETIONS, values)}
+
+    def reward(completion_ids, **kwargs):
+        return [table[tuple(c)] for c in completion_ids]
+
+    return reward
+
+
+def grpo_with(tokenizer, tmp_path, values, num_generations=G, reward_funcs=None, **cfg):
+    args = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=len(REWARDS),
+        num_generations=num_generations,
+        max_completion_length=8,
+        report_to=[],
+        use_cpu=True,
+        bf16=False,
+        **cfg,
+    )
+    trainer = ResearchGRPOTrainer(
+        model=build_tiny_llama(len(tokenizer), seed=0),
+        reward_funcs=reward_funcs if reward_funcs is not None else const_table_reward(values),
+        args=args,
+        train_dataset=dataset(),
+        processing_class=tokenizer,
+        rollout_func=make_rollout(tokenizer),
+    )
+    trainer.model.train()
+    return trainer
+
+
+def group_inputs(num_generations: int) -> list[dict[str, str]]:
+    return [{"prompt": PROMPTS[(i // num_generations) % len(PROMPTS)]} for i in range(len(REWARDS))]
+
+
+@pytest.mark.parametrize(("num_generations", "value"), [(12, 0.1), (3, 0.9), (4, 0.1)])
+def test_grpo_round_off_constant_groups_have_no_signal(tokenizer, tmp_path, num_generations, value):
+    trainer = grpo_with(tokenizer, tmp_path, [value] * len(REWARDS), num_generations=num_generations)
+    out = trainer._generate_and_score_completions(group_inputs(num_generations))
+    adv = out["advantages"].cpu()
+    if num_generations != 4:  # TRL really produces round-off here (so the test is not vacuous)
+        assert adv.abs().max() > 1e-6
+    assert adv.abs().max() < 1e-2  # ... but only round-off
+    assert not out[SIGNAL_KEY].any()
+    logged = trainer.trajectory_buffer.latest()
+    assert logged is not None and not logged.has_nonzero_advantage and logged.frac_zero_advantage == 1.0
+    assert trainer.trajectory_buffer.counters()["zero_signal_batches"] == 1
+
+
+def test_grpo_signal_flags_one_ulp_apart_rewards(tokenizer, tmp_path):
+    """Over-skip guard: rewards one float32 ulp apart are a (tiny) real signal, not round-off."""
+    v = 0.9
+    w = float(torch.nextafter(torch.tensor(v), torch.tensor(2.0)))
+    values = [v] * 4 + [v, w, v, v] + [0.1] * 4
+    trainer = grpo_with(tokenizer, tmp_path, values)
+    out = trainer._generate_and_score_completions(inputs())
+    signal, adv = out[SIGNAL_KEY].cpu(), out["advantages"].cpu()
+    # float32 r - mean rounds to exactly 0 for the three v's here (TRL trains on w only); the flag
+    # follows TRL wherever the group really varies, and is off for the constant groups.
+    assert adv[5] != 0 and signal[5]
+    assert torch.equal(signal[4:8], adv[4:8] != 0)
+    assert not signal[:4].any() and not signal[8:].any()
+    assert trainer.trajectory_buffer.latest().has_nonzero_advantage
+
+
+def test_grpo_normalize_then_sum_signal(tokenizer, tmp_path):
+    """normalize_then_sum: an all-constant batch gives O(round-off / 1e-4) advantages in TRL; no signal."""
+    trainer = grpo_with(
+        tokenizer, tmp_path, [0.7] * 12, num_generations=12, multi_objective_aggregation="normalize_then_sum"
+    )
+    out = trainer._generate_and_score_completions(group_inputs(12))
+    assert out["advantages"].abs().max() > 1e-7  # TRL's round-off is real here
+    assert not out[SIGNAL_KEY].any()
+    # mixed: a varied group carries signal, the constant non-dyadic groups do not
+    values = [0.1] * 4 + [1.0, 0.0, 0.5, 0.25] + [0.9] * 4
+    trainer = grpo_with(tokenizer, tmp_path, values, multi_objective_aggregation="normalize_then_sum")
+    out = trainer._generate_and_score_completions(inputs())
+    assert out[SIGNAL_KEY].cpu().tolist() == [False] * 4 + [True] * 4 + [False] * 4
+
+
+def test_grpo_unscorable_rows_are_nan_excluded_and_without_signal(tokenizer, tmp_path):
+    values: list[float | None] = [1.0, None, 0.5, 0.25, None, None, None, None, 2.0, 2.0, None, 0.0]
+    trainer = grpo_with(tokenizer, tmp_path, values)
+    out = trainer._generate_and_score_completions(inputs())
+    logged = trainer.trajectory_buffer.latest()
+    assert logged is not None
+    nan = torch.isnan(logged.rewards)
+    assert nan.tolist() == [v is None for v in values]
+    scorable = [v for v in values if v is not None]
+    assert logged.mean_reward == pytest.approx(sum(scorable) / len(scorable))
+    adv = out["advantages"].cpu()
+    assert torch.equal(adv[nan], torch.zeros(int(nan.sum())))
+    # reference: group mean / unbiased std over scorable members only
+    for g in range(3):
+        group = [(i, v) for i, v in enumerate(values[g * G : (g + 1) * G], start=g * G) if v is not None]
+        rs = [v for _, v in group]
+        for i, r in group:
+            expected = (r - statistics.fmean(rs)) / (statistics.stdev(rs) + 1e-4) if len(rs) > 1 else 0.0
+            assert float(adv[i]) == pytest.approx(expected, rel=1e-5, abs=1e-6)
+    expected_signal = [False] * 12
+    for i in (0, 2, 3, 8, 9, 11):
+        expected_signal[i] = True
+    assert out[SIGNAL_KEY].cpu().tolist() == expected_signal
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_rloo_round_off_constant_groups_have_no_signal(tokenizer, tmp_path, normalize):
+    trainer = rloo(tokenizer, tmp_path, beta=0.0, normalize_advantages=normalize)
+    trainer.reward_funcs = [const_table_reward([0.9] * len(REWARDS))]
+    out = trainer._generate_and_score_completions(inputs())
+    if not normalize:  # (normalising identical round-off values gives exact zeros)
+        assert out["advantages"].abs().max() > 0  # TRL leaves round-off (not vacuous)
+    assert not out[SIGNAL_KEY].any()
+    # mixed batch: the varied group has signal, the constant 0.9 groups do not
+    trainer.reward_funcs = [const_table_reward([0.9] * 4 + [3.0, -1.0, 2.0, 7.0] + [0.9] * 4)]
+    out = trainer._generate_and_score_completions(inputs())
+    assert out[SIGNAL_KEY].cpu().tolist() == [False] * 4 + [True] * 4 + [False] * 4
+    assert (out["advantages"][:4] != 0).all()  # round-off (amplified when normalised), not signal
+
+
+def test_rloo_signal_uses_clipped_rewards(tokenizer, tmp_path):
+    """reward_clip_range can make a varied group constant (here: all clipped to 0.9)."""
+    trainer = rloo(tokenizer, tmp_path, beta=0.0, reward_clip_range=(-10.0, 0.9))
+    trainer.reward_funcs = [const_table_reward([1.0, 3.0, 2.0, 7.0] * 3)]
+    out = trainer._generate_and_score_completions(inputs())
+    assert out["advantages"].abs().max() > 0
+    assert not out[SIGNAL_KEY].any()
+
+
+def test_rloo_kl_shaped_signal_when_policy_equals_reference(tokenizer, tiny_model_dir, tmp_path):
+    """Default beta: policy == reference -> KL is exactly 0, constant 0.9 rewards -> no signal;
+    once the policy moves, the KL differs per completion -> signal everywhere."""
+    trainer = rloo(tokenizer, tmp_path, model=tiny_model_dir)
+    trainer.reward_funcs = [const_table_reward([0.9] * len(REWARDS))]
+    patch_generate(trainer.model)
+    out = trainer._generate_and_score_completions(inputs())
+    assert out["advantages"].abs().max() > 0  # TRL's round-off
+    assert not out[SIGNAL_KEY].any()
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for p in trainer.model.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    out = trainer._generate_and_score_completions(inputs())
+    assert out[SIGNAL_KEY].all() and (out["advantages"].abs() > 1e-5).all()

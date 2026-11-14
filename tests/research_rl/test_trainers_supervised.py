@@ -243,7 +243,7 @@ def test_sft_checkpoint_resume_restores_step_and_optimizer_counters(tokenizer, t
         return build_run(exp, train_dataset=data, model=model, processing_class=tokenizer)
 
     full = run_for("full", 0)
-    full.train()
+    full_record = full.train()
     part = run_for("part", 0, save_strategy="steps", save_steps=2)
     part.train()
     ckpt = Path(part.trainer.args.output_dir) / "checkpoint-2"
@@ -257,6 +257,9 @@ def test_sft_checkpoint_resume_restores_step_and_optimizer_counters(tokenizer, t
     assert resumed.trainer.state.global_step == 4
     assert opt is not None and (opt.nominal_steps, opt.applied_updates, opt.skipped_steps) == (4, 4, 0)
     assert record["steps"]["applied_updates"] == 4 and record["steps"]["global_step"] == 4
+    # TRL's num_tokens counter is not in HF checkpoints; the adapter restores it (else: post-resume only).
+    assert load_research_state(ckpt)["algorithm_state"]["trl_total_train_tokens"] > 0
+    assert record["training_tokens"] == full_record["training_tokens"] > 0
     # Adam's step counter came back from optimizer.pt (it would be 2 after a cold start).
     adam_steps = {int(s["step"]) for s in opt.inner.state.values()}
     assert adam_steps == {4}
@@ -386,6 +389,111 @@ def test_dpo_with_lora_uses_adapter_free_base_as_reference(tokenizer, tmp_path):
         expected = _dpo_reference(lambda x: peft_model(input_ids=x), AdapterFree(), tokenizer, DPO_ROWS, 0.5)
     assert abs(expected.item() - math.log(2)) > 1e-2
     assert trl_loss == pytest.approx(expected.item(), abs=1e-5)
+
+
+def test_dpo_with_prewrapped_peft_model_uses_frozen_initial_adapter(tokenizer, tmp_path):
+    """A ready-made ``PeftModel`` (non-zero adapter): no frozen policy copy; TRL's "ref" adapter copy is used."""
+    import copy
+
+    from peft import LoraConfig, PeftModel, get_peft_model
+
+    beta = 0.5
+    exp = make_exp(tmp_path, "dpo", max_steps=1, per_device_train_batch_size=3, beta=beta)
+    lora = LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+    policy = get_peft_model(build_tiny_llama(len(tokenizer), seed=0), lora)
+    gen = torch.Generator().manual_seed(1)
+    with torch.no_grad():  # a "pretrained" adapter: base model != base + adapter
+        for name, p in policy.named_parameters():
+            if "lora_B" in name:
+                p.add_(0.5 * torch.randn(p.shape, generator=gen))
+    initial = copy.deepcopy(policy).eval()  # independent reference: the policy before training
+    run = build_run(exp, train_dataset=Dataset.from_list(DPO_ROWS), model=policy, processing_class=tokenizer)
+    trainer = run.trainer
+    assert isinstance(trainer.model, PeftModel) and trainer.ref_model is None
+    assert "ref" in trainer.model.peft_config
+    assert run.recorder.record["reference_model"] == "policy with frozen copy of its initial PEFT adapter ('ref')"
+    batch = trainer.data_collator([trainer.train_dataset[i] for i in range(len(DPO_ROWS))])
+    peft_model = trainer.model
+    with torch.no_grad():
+        assert trainer.compute_loss(peft_model, dict(batch)).item() == pytest.approx(math.log(2), abs=1e-6)
+        for name, p in peft_model.named_parameters():
+            if "lora_B.default" in name:
+                p.add_(0.5 * torch.randn(p.shape, generator=gen))
+        trl_loss = trainer.compute_loss(peft_model, dict(batch)).item()
+
+        def policy_fn(x):
+            return peft_model(input_ids=x)
+
+        def initial_fn(x):
+            return initial(input_ids=x)
+
+        def base_fn(x):
+            with initial.disable_adapter():
+                return initial(input_ids=x)
+
+        expected = _dpo_reference(policy_fn, initial_fn, tokenizer, DPO_ROWS, beta).item()
+        adapter_free = _dpo_reference(policy_fn, base_fn, tokenizer, DPO_ROWS, beta).item()
+    assert abs(expected - math.log(2)) > 1e-2
+    assert abs(expected - adapter_free) > 1e-3  # the reference choice matters
+    assert trl_loss == pytest.approx(expected, abs=1e-5)
+
+
+def test_dpo_precompute_ref_log_probs_keeps_no_reference_copy(tokenizer, tmp_path):
+    """With ``precompute_ref_log_probs`` TRL uses the untrained policy once in ``__init__``; no copy is kept."""
+    beta = 0.5
+    exp = make_exp(
+        tmp_path, "dpo", max_steps=1, per_device_train_batch_size=3, beta=beta, precompute_ref_log_probs=True
+    )
+    model = build_tiny_llama(len(tokenizer), seed=0)
+    init_fp = fingerprint(model)
+    run = build_run(exp, train_dataset=Dataset.from_list(DPO_ROWS), model=model, processing_class=tokenizer)
+    trainer = run.trainer
+    assert trainer.ref_model is None
+    recorded = run.recorder.record["reference_model"]
+    assert recorded["weights_sha256"] == init_fp and "precomputed" in recorded["reference"]
+    batch = trainer.data_collator([trainer.train_dataset[i] for i in range(len(DPO_ROWS))])
+    assert "ref_chosen_logps" in batch and "ref_rejected_logps" in batch
+    reference = build_tiny_llama(len(tokenizer), seed=0)  # independent copy of the initial policy
+    with torch.no_grad():
+        assert trainer.compute_loss(trainer.model, dict(batch)).item() == pytest.approx(math.log(2), abs=1e-6)
+        gen = torch.Generator().manual_seed(0)
+        for p in model.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=gen))
+        trl_loss = trainer.compute_loss(trainer.model, dict(batch)).item()
+        expected = _dpo_reference(model, reference, tokenizer, DPO_ROWS, beta).item()
+    assert abs(expected - math.log(2)) > 1e-2
+    assert trl_loss == pytest.approx(expected, abs=1e-5)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("logging_steps", [1, 3])
+def test_dpo_checkpoint_resume_restores_training_tokens(tokenizer, tmp_path, logging_steps):
+    """``logging_steps=3`` with ``save_steps=2``: the checkpoint's log history has no ``num_tokens`` yet."""
+    common = {
+        "max_steps": 4,
+        "per_device_train_batch_size": 2,
+        "learning_rate": 5e-3,
+        "logging_steps": logging_steps,
+        "save_only_model": False,
+    }
+    data = Dataset.from_list(DPO_ROWS)
+
+    def run_for(run_name: str, **extra):
+        exp = make_exp(tmp_path, "dpo", run_name=run_name, **common, **extra)
+        # Same seed everywhere: the frozen reference is copied from the model given at build time.
+        model = build_tiny_llama(len(tokenizer), seed=0)
+        return build_run(exp, train_dataset=data, model=model, processing_class=tokenizer)
+
+    full_record = run_for("full").train()
+    part = run_for("part", save_strategy="steps", save_steps=2)
+    part.train()
+    ckpt = Path(part.trainer.args.output_dir) / "checkpoint-2"
+    saved = load_research_state(ckpt)["algorithm_state"]["trl_total_train_tokens"]
+    resumed = run_for("part", save_strategy="steps", save_steps=2)
+    record = resumed.train(resume_from_checkpoint=str(ckpt))
+    assert resumed.trainer.state.global_step == 4
+    assert 0 < saved < full_record["training_tokens"]
+    assert record["training_tokens"] == full_record["training_tokens"]
 
 
 # ---------------------------------------------------------------------------------------------- distillation
@@ -540,6 +648,19 @@ def test_distillation_requires_teacher(tokenizer, tmp_path):
             train_dataset=Dataset.from_list([{"prompt": "1+1="}]),
             model=build_tiny_llama(len(tokenizer), seed=0),
             processing_class=tokenizer,
+            record=False,
+        )
+
+
+def test_distillation_rejects_teacher_of_wrong_type(tokenizer, tmp_path):
+    exp = make_exp(tmp_path, "distillation", max_steps=1)
+    with pytest.raises(TypeError, match="teacher_model must be"):
+        build_run(
+            exp,
+            train_dataset=Dataset.from_list([{"prompt": "1+1="}]),
+            model=build_tiny_llama(len(tokenizer), seed=0),
+            processing_class=tokenizer,
+            teacher_model=123,
             record=False,
         )
 

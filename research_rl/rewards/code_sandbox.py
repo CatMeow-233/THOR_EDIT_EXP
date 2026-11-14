@@ -7,7 +7,8 @@ local process or in a local subprocess. What exists:
   default, time / memory / size limits).
 * :class:`SandboxBackend` - the protocol for an *isolated* executor; it must declare
   :class:`IsolationGuarantees`.
-* :class:`CodeExecutionVerifier` - extracts the last fenced code block from a completion, runs it on the
+* :class:`CodeExecutionVerifier` - extracts the last fenced code block (language-tagged blocks preferred
+  over bare ones, see :func:`extract_code`) from a completion, runs it on the
   reference test cases through the backend and compares stdout. It raises :class:`SandboxDisabledError`
   (at construction and again before every verification) unless ``policy.enabled`` is true, a backend is
   supplied, and the backend declares guarantees covering the policy: isolated from the trainer host, no
@@ -139,27 +140,33 @@ def check_sandbox(policy: SandboxPolicy, backend: SandboxBackend | None) -> None
 
 
 def extract_code(text: str, language: str = "python") -> str | None:
-    """Body of the last fenced code block (```` ```python ```` / ```` ```py ```` / bare ```` ``` ````).
+    """Body of the code block to run: the last block tagged with ``language`` (```` ```python ```` /
+    ```` ```py ````), else the last bare ```` ``` ```` block, else ``None``.
 
-    Blocks tagged with another language are skipped. Linear scan, no regex.
+    Tagged blocks win so that an untagged example-output block after the program (very common in LLM
+    answers) is not run as code. Blocks tagged with another language are skipped. Linear scan, no regex.
     """
     aliases = {language.lower(), *(("py", "python3") if language.lower() == "python" else ())}
-    found: str | None = None
+    tagged: str | None = None
+    bare: str | None = None
     pos = 0
     while True:
         start = text.find("```", pos)
         if start < 0:
-            return found
+            break
         header_end = text.find("\n", start + 3)
         if header_end < 0:
-            return found
+            break
         close = text.find("```", header_end + 1)
         if close < 0:
-            return found
+            break
         tag = text[start + 3 : header_end].strip().lower()
-        if tag == "" or tag in aliases:
-            found = text[header_end + 1 : close]
+        if tag in aliases:
+            tagged = text[header_end + 1 : close]
+        elif tag == "":
+            bare = text[header_end + 1 : close]
         pos = close + 3
+    return tagged if tagged is not None else bare
 
 
 def _normalize_output(text: str) -> str:
@@ -188,7 +195,9 @@ class CodeExecutionVerifier(BaseVerifier):
     """stdout-matching code verifier on top of an isolated :class:`SandboxBackend` (disabled by default).
 
     All test cases must pass for ``status="correct"``; a backend failure gives ``status="error"`` and a
-    compile / runtime error, timeout or wrong output ``status="incorrect"``.
+    compile / runtime error, timeout, wrong output or (normalised) stdout longer than ``policy.max_output_chars``
+    (outcome ``"output_too_long"``; never compared as a truncated prefix) ``status="incorrect"``. An
+    expected output longer than ``max_output_chars`` cannot be checked and is a ``bad_reference`` error.
     """
 
     name = "code_execution"
@@ -222,6 +231,9 @@ class CodeExecutionVerifier(BaseVerifier):
             cases = _test_cases(reference)
         except (KeyError, ValueError) as exc:
             return "error", None, None, {"reason": "bad_reference", "message": str(exc)}
+        cap = self.policy.max_output_chars  # applied to normalised text (trailing whitespace ignored)
+        if any(len(_normalize_output(expected)) > cap for _, expected in cases):
+            return "error", None, None, {"reason": "bad_reference", "message": "expected output too long"}
         code = extract_code(completion or "", self.language)
         if code is None:
             return "no_answer", None, None, {"reason": "no_code_block"}
@@ -243,9 +255,14 @@ class CodeExecutionVerifier(BaseVerifier):
             )
             if result.status == "sandbox_error":
                 return "error", code, None, {"reason": "sandbox_error", "backend": result.details}
-            stdout = result.stdout[: self.policy.max_output_chars]
-            ok = result.status == "ok" and _normalize_output(stdout) == _normalize_output(expected)
-            outcomes.append("pass" if ok else result.status if result.status != "ok" else "wrong_output")
+            if result.status != "ok":
+                outcomes.append(result.status)
+            elif len(_normalize_output(result.stdout)) > cap:
+                outcomes.append("output_too_long")
+            elif _normalize_output(result.stdout) == _normalize_output(expected):
+                outcomes.append("pass")
+            else:
+                outcomes.append("wrong_output")
         passed = outcomes.count("pass")
         details = {"passed": passed, "total": len(cases), "outcomes": outcomes}
         return ("correct" if passed == len(cases) else "incorrect"), code, None, details
