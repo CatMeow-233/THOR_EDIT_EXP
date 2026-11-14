@@ -95,7 +95,7 @@ def find_swiglu_ffns(
         experts = getattr(mlp, "experts", None)
         if isinstance(experts, nn.ModuleDict):
             name = expert if expert is not None else getattr(mlp, "active", None)
-            if name not in experts:
+            if not isinstance(name, str) or name not in experts:
                 raise ModelInterfaceError(f"layer {i}: unknown expert {name!r}; have {list(experts)}")
             mlp = experts[name]
             module_path = f"{module_path}.experts.{name}"

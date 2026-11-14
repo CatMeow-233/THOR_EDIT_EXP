@@ -47,7 +47,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -215,7 +215,7 @@ class MultiTeacherBatch:
 
 
 # ===================================================================================== ensemble
-def _text_config(model: nn.Module) -> Any:
+def _text_config(model: Any) -> Any:
     cfg = model.config
     return cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
 
@@ -234,6 +234,8 @@ def _trl_logit_scale(cfg: Any) -> float:
 
 class _EnsembleHead(nn.Module):
     """Stand-in ``lm_head``: ``logits = hidden @ weight.T + bias`` (what TRL's chunked loss computes)."""
+
+    weight: torch.Tensor
 
     def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None) -> None:
         super().__init__()
@@ -272,6 +274,10 @@ class TeacherEnsemble(nn.Module):
     teacher of MOPD (see the module docstring for the offline routed path).
     """
 
+    # Declared for the type checker: buffers / module lists registered in __init__.
+    weights: torch.Tensor
+    teachers: Any
+
     def __init__(
         self,
         teachers: Sequence[nn.Module],
@@ -300,7 +306,7 @@ class TeacherEnsemble(nn.Module):
             raise ValueError("one weight per teacher")
         self.register_buffer("weights", w, persistent=False)
         self.names = list(names) if names is not None else [f"teacher{i}" for i in range(len(teachers))]
-        cfg = copy.deepcopy(teachers[0].config)
+        cfg: Any = copy.deepcopy(cast(Any, teachers[0]).config)
         text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
         for attr in (*_LOGIT_SCALE_ATTRS, _SOFTCAP_ATTR):  # scaling is folded into hidden/head below
             if getattr(text_cfg, attr, None) is not None:
@@ -350,7 +356,7 @@ class TeacherEnsemble(nn.Module):
         kwargs.pop("use_cache", None)
         if self.mode == "mixture":
             self._check_identity_size()
-            h = self.forward(input_ids, attention_mask, **kwargs).logits
+            h = cast(torch.Tensor, self.forward(input_ids, attention_mask, **kwargs).logits)
         else:
             parts = []
             for w, t in zip(self.weights, self.teachers):

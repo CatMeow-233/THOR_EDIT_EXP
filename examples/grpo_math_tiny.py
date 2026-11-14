@@ -55,7 +55,7 @@ def eos_token_ids(exp: ExperimentConfig, tokenizer: Any) -> list[int]:
     """EOS ids the way TRL collects them: the tokenizer's plus ``generation_config.eos_token_id``."""
     ids = [tokenizer.eos_token_id]
     try:
-        gen = GenerationConfig.from_pretrained(exp.model.name_or_path, revision=exp.model.revision)
+        gen = GenerationConfig.from_pretrained(exp.model.name_or_path, revision=exp.model.revision or "main")
     except (OSError, ValueError):  # no generation_config.json: the tokenizer's EOS is all TRL uses as well
         return ids
     extra = gen.eos_token_id

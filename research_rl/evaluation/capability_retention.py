@@ -105,7 +105,7 @@ def _neutralise_generation_configs(model: nn.Module) -> list[tuple[nn.Module, Ge
         if isinstance(original, GenerationConfig):
             saved.append((module, original))
     for module, _ in saved:
-        module.generation_config = GenerationConfig()
+        setattr(module, "generation_config", GenerationConfig())  # noqa: B010
     return saved
 
 
@@ -174,7 +174,7 @@ def greedy_generate(
     finally:
         model.train(was_training)
         for owner, original in saved:
-            owner.generation_config = original
+            setattr(owner, "generation_config", original)  # noqa: B010
     return outputs
 
 

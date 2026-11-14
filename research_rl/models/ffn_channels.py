@@ -275,9 +275,9 @@ def _owned_slice(proj: str, idx: torch.Tensor, shape: torch.Size, *, bias: bool)
     return m
 
 
-def _ffn_params(ref: SwiGLURef) -> list[tuple[str, str, nn.Parameter, bool]]:
+def _ffn_params(ref: SwiGLURef) -> list[tuple[str, str, torch.Tensor, bool]]:
     """``(qualified_name, proj, param, is_bias)`` for every weight/bias of the FFN."""
-    out: list[tuple[str, str, nn.Parameter, bool]] = []
+    out: list[tuple[str, str, torch.Tensor, bool]] = []
     for proj, lin in (("gate_proj", ref.gate), ("up_proj", ref.up), ("down_proj", ref.down)):
         out.append((f"{ref.module_path}.{proj}.weight", proj, lin.weight, False))
         if lin.bias is not None:
@@ -665,7 +665,7 @@ def rollback_channels(
     channels: dict[int, list[int]] = {}
     delta_l2: dict[int, torch.Tensor] = {}
     changed: dict[int, int] = {}
-    writes: list[tuple[nn.Parameter, int, torch.Tensor, torch.Tensor]] = []
+    writes: list[tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]] = []
     # Pass 1: validate everything and stage the casted values; no parameter is written here.
     for ref_ffn in find_swiglu_ffns(model, selection.layers(), expert=expert):
         layer = ref_ffn.layer_index
@@ -674,7 +674,7 @@ def rollback_channels(
         _check_path(reference[layer].module_path, ref_ffn.module_path, layer, allow_path_mismatch)
         chans = list(selection.channels(layer))
         src = reference[layer].select(chans)
-        pairs: list[tuple[str, nn.Parameter, torch.Tensor | None, int]] = [
+        pairs: list[tuple[str, torch.Tensor, torch.Tensor | None, int]] = [
             ("gate_proj.weight", ref_ffn.gate.weight, src.gate, 0),
             ("up_proj.weight", ref_ffn.up.weight, src.up, 0),
             ("down_proj.weight", ref_ffn.down.weight, src.down, 1),

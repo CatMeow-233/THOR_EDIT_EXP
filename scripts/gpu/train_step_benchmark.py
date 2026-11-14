@@ -27,6 +27,7 @@ import json
 import pickle
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import torch
 
@@ -69,9 +70,10 @@ def main(argv: list[str] | None = None) -> int:
 
     dev = torch.device(args.device)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+    model: Any
     if args.model == TINY:
         tok = build_char_tokenizer()
-        model = build_tiny_llama(len(tok)).to(dtype)
+        model = cast(Any, build_tiny_llama(len(tok))).to(dtype)
         vocab = len(tok)
     else:
         from transformers import AutoModelForCausalLM

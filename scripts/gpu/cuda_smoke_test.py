@@ -69,7 +69,8 @@ def main() -> int:
 
     # 3. tiny model fwd/bwd/step with HookedOptimizer + mask, bf16 autocast
     tok = build_char_tokenizer()
-    model = build_tiny_llama(len(tok), seed=0).to(dev)
+    model = build_tiny_llama(len(tok), seed=0)
+    model.to(dev)  # type: ignore[arg-type]
     name = "model.layers.0.mlp.gate_proj.weight"
     w = dict(model.named_parameters())[name]
     m = torch.ones_like(w, dtype=torch.bool)

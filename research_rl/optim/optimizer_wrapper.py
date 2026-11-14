@@ -28,8 +28,9 @@ Design guarantees (each covered by a numerical test):
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch.optim import Optimizer
@@ -60,12 +61,12 @@ class HookedOptimizer(Optimizer):
         self.defaults = inner.defaults
         self.rules: list[UpdateRule] = list(rules)
         self.clip_norm = clip_norm
-        self._optimizer_step_pre_hooks: dict[int, Callable] = {}
-        self._optimizer_step_post_hooks: dict[int, Callable] = {}
-        self._optimizer_state_dict_pre_hooks: dict[int, Callable] = {}
-        self._optimizer_state_dict_post_hooks: dict[int, Callable] = {}
-        self._optimizer_load_state_dict_pre_hooks: dict[int, Callable] = {}
-        self._optimizer_load_state_dict_post_hooks: dict[int, Callable] = {}
+        self._optimizer_step_pre_hooks = OrderedDict()
+        self._optimizer_step_post_hooks = OrderedDict()
+        self._optimizer_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_state_dict_post_hooks = OrderedDict()
+        self._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_load_state_dict_post_hooks = OrderedDict()
         self._zero_grad_profile_name = "Optimizer.zero_grad#HookedOptimizer.zero_grad"
 
         optimised = {id(p) for g in inner.param_groups for p in g["params"]}
@@ -130,7 +131,7 @@ class HookedOptimizer(Optimizer):
             params = param_group["params"]
             for p in [params] if isinstance(params, torch.Tensor) else params:
                 if id(p) not in known:
-                    self._named.append((f"<unnamed:{id(p)}>", p))
+                    self._named.append((f"<unnamed:{id(p)}>", cast(torch.nn.Parameter, p)))
 
     # ------------------------------------------------------------------ rule management
     def add_rule(self, rule: UpdateRule) -> None:

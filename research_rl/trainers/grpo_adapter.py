@@ -38,7 +38,7 @@ from research_rl.trainers.base import ResearchTrainerMixin
 from research_rl.trainers.rl_common import RLRolloutMixin, RLTrainerAdapter, group_deviation_signal
 
 
-class ResearchGRPOTrainer(RLRolloutMixin, ResearchTrainerMixin, GRPOTrainer):
+class ResearchGRPOTrainer(RLRolloutMixin, ResearchTrainerMixin, GRPOTrainer):  # type: ignore[misc]  # cooperative mixins refine TRL attributes
     """``GRPOTrainer`` + HookedOptimizer + policy-version stamps, trajectory log, zero-advantage skip."""
 
     multi_objective_aggregation: str
