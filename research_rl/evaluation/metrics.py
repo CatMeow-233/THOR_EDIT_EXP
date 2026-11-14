@@ -219,7 +219,7 @@ def sequence_nll(
         ids = p_ids + c_ids
         if not ids:
             raise ValueError(f"pair {(prompt, completion)!r} tokenizes to an empty sequence")
-        flags = [False] * len(p_ids) + [True] * len(c_ids) if completion_only else [True] * len(ids)
+        flags = [False] * (len(p_ids) - 1) + [True] * (len(c_ids) + 1) if completion_only else [True] * len(ids)
         flags[0] = False  # nothing predicts the first token
         if not any(flags):
             raise ValueError(f"pair {(prompt, completion)!r} has no scorable tokens")
@@ -241,7 +241,7 @@ def sequence_nll(
             target_mask = torch.zeros(len(chunk), width, dtype=torch.bool)
             for row, (ids, flags) in enumerate(zip(chunk, flags_chunk)):
                 input_ids[row, : len(ids)] = torch.tensor(ids)
-                attention[row, :] = 1
+                attention[row, : len(ids)] = 1
                 target_mask[row, : len(ids)] = torch.tensor(flags)
             logits = model(input_ids=input_ids.to(device), attention_mask=attention.to(device)).logits
             logp = torch.log_softmax(logits[:, :-1].double(), dim=-1).cpu()

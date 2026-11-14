@@ -176,7 +176,7 @@ class ChannelSelection:
     def complement(self, model: nn.Module) -> ChannelSelection:
         """All channels of the *affected* layers that are not selected."""
         sizes = _intermediate_sizes(model, self.layers())
-        return ChannelSelection({k: set(range(sizes[k])) - set(v) for k, v in self._channels.items()})
+        return ChannelSelection({k: set(range(sizes[k] - len(v))) for k, v in self._channels.items()})
 
     # ------------------------------------------------------------------ validation
     def validate(self, model: nn.Module) -> None:
@@ -222,7 +222,7 @@ def _intermediate_sizes(model: nn.Module, layers: Iterable[int]) -> dict[int, in
 def _rank_entries(
     entries: list[tuple[float, int, int]], k: int, *, per_layer: bool, largest: bool
 ) -> dict[int, list[int]]:
-    sign = -1.0
+    sign = -1.0 if largest else 1.0
     ordered = sorted(entries, key=lambda e: (sign * e[0], e[1], e[2]))
     out: dict[int, list[int]] = {}
     taken = 0
