@@ -1,0 +1,27 @@
+# Direct Preference Optimisation: offline preference optimisation on fixed (prompt, chosen, rejected) pairs,
+# not RL. Load with ExperimentConfig.load; run with examples/dpo_tiny.py.
+# model.name_or_path "research_rl:tiny" is a sentinel understood by the example script (offline tiny Llama).
+config_version: "1.0"
+study_id: example-dpo-tiny
+seed: 0
+output_dir: runs
+run_name: dpo-tiny
+tags: [example, cpu-smoke]
+model:
+  name_or_path: "research_rl:tiny"
+  dtype: float32
+data:
+  name: toy-arithmetic-preferences
+  split: train
+trainer:
+  algorithm: dpo
+  args:  # passed verbatim to trl.DPOConfig
+    max_steps: 10
+    per_device_train_batch_size: 8
+    learning_rate: 0.0005
+    lr_scheduler_type: constant
+    logging_steps: 1
+    beta: 0.1
+    loss_type: [sigmoid]
+    max_length: 256
+    bf16: false

@@ -1,0 +1,31 @@
+# On-policy knowledge distillation (TRL DistillationTrainer): the student samples completions and is trained
+# to match the teacher's token distribution under a generalized JSD. This is distillation, not RL.
+# "research_rl:tiny" (student or teacher) is a sentinel understood by examples/distillation_tiny.py: it writes a
+# random offline tiny Llama into the output dir. Pass --model / --teacher <hf id or path> for real models
+# (they must share the vocabulary).
+config_version: "1.0"
+study_id: example-distillation-tiny
+seed: 0
+output_dir: runs
+run_name: distillation-tiny
+tags: [example, cpu-smoke]
+model:
+  name_or_path: "research_rl:tiny"
+  dtype: float32
+data:
+  name: toy-arithmetic-prompts
+  split: train
+trainer:
+  algorithm: distillation
+  args:  # passed verbatim to trl.DistillationConfig
+    teacher_model_name_or_path: "research_rl:tiny"
+    max_steps: 5
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 2
+    learning_rate: 0.0005
+    lr_scheduler_type: constant
+    logging_steps: 1
+    max_completion_length: 16
+    beta: 0.5          # 0 = forward KL, 1 = reverse KL (TRL default), in between = generalized JSD
+    temperature: 1.0   # sampling and loss temperature
+    bf16: false

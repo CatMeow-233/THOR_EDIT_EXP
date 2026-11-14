@@ -141,3 +141,10 @@ If you find our work helpful, please consider giving us a ⭐ and citing our pap
 
 
 
+
+## 🧪 ResearchRL (modular research framework in this repository)
+
+This repository also contains **ResearchRL**, a modular framework for LLM training and RL research
+built on Hugging Face TRL (`research_rl/`, independent of the THOR / verl code above). See
+[docs/research_rl/README.md](docs/research_rl/README.md) and
+[docs/research_rl/DEPLOY_GPU.md](docs/research_rl/DEPLOY_GPU.md).
