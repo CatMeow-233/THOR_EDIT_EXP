@@ -74,8 +74,16 @@ def get_decoder_layers(model: nn.Module) -> tuple[str, nn.ModuleList]:
     raise ModelInterfaceError(f"cannot locate decoder layers in {type(model).__name__}")
 
 
-def find_swiglu_ffns(model: nn.Module, layers: Iterable[int] | None = None) -> list[SwiGLURef]:
-    """Locate the SwiGLU FFN (``layer.mlp``) of each decoder layer."""
+def find_swiglu_ffns(
+    model: nn.Module, layers: Iterable[int] | None = None, *, expert: str | None = None
+) -> list[SwiGLURef]:
+    """Locate the SwiGLU FFN (``layer.mlp``) of each decoder layer.
+
+    If ``layer.mlp`` is an expert container (duck-typed: an ``experts`` ``nn.ModuleDict`` and an
+    ``active`` name, e.g. :class:`research_rl.models.expert_manager.ExpertFFN`), the SwiGLU of
+    ``expert`` (default: the container's active expert) is returned with its real parameter path
+    ``<layers>.<i>.mlp.experts.<name>``, so channel-level tools can operate inside one expert.
+    """
     path, block_list = get_decoder_layers(model)
     wanted = None if layers is None else set(layers)
     refs: list[SwiGLURef] = []
@@ -83,9 +91,19 @@ def find_swiglu_ffns(model: nn.Module, layers: Iterable[int] | None = None) -> l
         if wanted is not None and i not in wanted:
             continue
         mlp = getattr(layer, "mlp", None)
+        module_path = f"{path}.{i}.mlp"
+        experts = getattr(mlp, "experts", None)
+        if isinstance(experts, nn.ModuleDict):
+            name = expert if expert is not None else getattr(mlp, "active", None)
+            if name not in experts:
+                raise ModelInterfaceError(f"layer {i}: unknown expert {name!r}; have {list(experts)}")
+            mlp = experts[name]
+            module_path = f"{module_path}.experts.{name}"
+        elif expert is not None:
+            raise ModelInterfaceError(f"layer {i} has no expert container but expert={expert!r} was given")
         if mlp is None or not is_swiglu(mlp):
             raise ModelInterfaceError(f"layer {i} has no SwiGLU `mlp` (found {type(mlp).__name__})")
-        refs.append(SwiGLURef(layer_index=i, module_path=f"{path}.{i}.mlp", module=mlp))
+        refs.append(SwiGLURef(layer_index=i, module_path=module_path, module=mlp))
     if wanted is not None and len(refs) != len(wanted):
         missing = sorted(wanted - {r.layer_index for r in refs})
         raise ModelInterfaceError(f"layer indices out of range: {missing}")

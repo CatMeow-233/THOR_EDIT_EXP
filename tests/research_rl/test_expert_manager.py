@@ -596,3 +596,27 @@ def test_manager_state_roundtrip_and_config_hash_is_stable(tokenizer, tmp_path):
         build_tiny_llama(len(tokenizer), intermediate_size=48).config
     )
     assert fingerprint(model, mgr.backbone_parameter_names()) == mgr.backbone_fingerprint()
+
+
+def test_find_swiglu_ffns_resolves_experts_for_channel_tools(tiny_model):
+    """Core model_interface sees inside ExpertFFN, so FFN channel ops can target one expert."""
+    from research_rl.models.ffn_channels import ChannelSelection, channel_mask
+    from research_rl.models.model_interface import ModelInterfaceError, find_swiglu_ffns
+
+    mgr = ExpertManager(tiny_model)
+    mgr.attach([0])
+    mgr.create_expert("a")
+    params = dict(tiny_model.named_parameters())
+    refs = find_swiglu_ffns(tiny_model, [0], expert="a")
+    assert refs[0].module_path == "model.layers.0.mlp.experts.a"
+    for full in refs[0].param_names().values():
+        assert full in params
+    assert refs[0].gate.weight is params["model.layers.0.mlp.experts.a.gate_proj.weight"]
+    mask = channel_mask(tiny_model, ChannelSelection({0: [1, 5]}))
+    assert set(mask.names()) == {
+        f"model.layers.0.mlp.experts.base.{k}.weight" for k in ("gate_proj", "up_proj", "down_proj")
+    }
+    with pytest.raises(ModelInterfaceError):
+        find_swiglu_ffns(tiny_model, [0], expert="missing")
+    with pytest.raises(ModelInterfaceError):
+        find_swiglu_ffns(tiny_model, [1], expert="a")
