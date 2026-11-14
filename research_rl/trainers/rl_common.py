@@ -193,7 +193,7 @@ class RLRolloutMixin:
         return rewards_per_func
 
     def _generate_and_score_completions(self, inputs: list[dict[str, Any]]) -> dict[str, Any]:
-        version = self.policy_version
+        version = int(self.state.global_step)
         self._rr_rewards_per_func = None
         output: dict[str, Any] = super()._generate_and_score_completions(inputs)  # type: ignore[misc]
         mode = "train" if self.model.training else "eval"

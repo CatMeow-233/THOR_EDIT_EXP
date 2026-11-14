@@ -65,7 +65,7 @@ _THOUSANDS_RE = re.compile(r"-?[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?")
 _WS_RE = re.compile(r"\s+")
 _UNICODE_MINUS = ("\u2212", "\ufe63", "\uff0d")
 _TIMES_TEN = ("\\times10^", "\\cdot10^", "×10^", "*10^")
-_DEGREE_MARKERS = ("^{\\circ}", "^\\circ", "\\degree", "°")
+_DEGREE_MARKERS = ("^\\circ", "^{\\circ}", "\\degree", "°")
 
 
 class _FormatError(Exception):
@@ -399,7 +399,7 @@ class MathVerifier(BaseVerifier):
         text, terminated = self.strip_terminators(completion or "")
         cut = bool(truncated) and not terminated
         details: dict[str, Any] = {"terminated": terminated, "truncated": cut}
-        if cut:
+        if cut and not self.grade_truncated:
             return "truncated", None, ref, {**details, "reason": "cut_by_length"}
         if len(text) > self.max_completion_chars:
             return "format_error", None, ref, {**details, "reason": "completion_too_long"}
