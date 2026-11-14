@@ -232,6 +232,6 @@ class TrajectoryBuffer:
             "zero_signal_windows",
             "skipped_windows",
         ):
-            pass
+            setattr(self, key, int(state.get(key, 0)))
         last = state.get("last_policy_version")
         self.last_policy_version = None if last is None else int(last)

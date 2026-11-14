@@ -92,6 +92,7 @@ def test_precision_is_fp32_unless_bf16_requested(tmp_path, name):
 # ---------------------------------------------------------------------------------------------- SFT
 
 
+@pytest.mark.integration
 def test_sft_overfits_small_data_and_writes_record(tokenizer, tmp_path):
     steps = 40
     exp = make_exp(
@@ -168,6 +169,7 @@ def test_sft_completion_only_loss_matches_reference(tokenizer, tmp_path, complet
     assert trl_loss.item() == pytest.approx(expected.item(), abs=2e-5)
 
 
+@pytest.mark.integration
 def test_sft_gradient_accumulation_is_token_weighted(tokenizer, tmp_path):
     """One SGD step with GA=2 x bs=2 equals one step with bs=4 (loss normalised by all tokens)."""
 
@@ -199,6 +201,7 @@ def test_sft_gradient_accumulation_is_token_weighted(tokenizer, tmp_path):
         torch.testing.assert_close(accum[k], full[k], rtol=0, atol=1e-6)
 
 
+@pytest.mark.integration
 def test_sft_bf16_autocast_and_fp32_paths_differ_but_agree(tokenizer, tmp_path):
     losses = {}
     for bf16 in (False, True):
@@ -221,6 +224,7 @@ def test_sft_bf16_autocast_and_fp32_paths_differ_but_agree(tokenizer, tmp_path):
     assert losses[True] == pytest.approx(losses[False], rel=5e-2)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("bf16", [False, True])
 def test_sft_checkpoint_resume_restores_step_and_optimizer_counters(tokenizer, tmp_path, bf16):
     common = {
@@ -310,6 +314,7 @@ def test_dpo_loss_matches_reference(tokenizer, tmp_path):
     assert trl_loss == pytest.approx(expected, abs=1e-5)
 
 
+@pytest.mark.integration
 def test_dpo_short_run_and_reference_identity_recorded(tokenizer, tmp_path):
     exp = make_exp(tmp_path, "dpo", max_steps=4, learning_rate=5e-3, per_device_train_batch_size=3, beta=0.5)
     model = build_tiny_llama(len(tokenizer), seed=0)
@@ -492,6 +497,7 @@ def test_distillation_loss_matches_generalized_jsd_reference(tokenizer, tmp_path
         torch.testing.assert_close(trl_grads[name], param.grad.float(), rtol=1e-3, atol=1e-6, msg=name)
 
 
+@pytest.mark.integration
 def test_distillation_short_on_policy_run(tokenizer, tmp_path):
     exp = make_exp(
         tmp_path,
