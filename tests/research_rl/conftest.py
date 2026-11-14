@@ -10,7 +10,8 @@ import torch
 os.environ.setdefault("WANDB_DISABLED", "true")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-torch.set_num_threads(min(4, os.cpu_count() or 1))
+# Tiny models: 1 thread is ~20x faster than 4 on a loaded CI box (thread oversubscription).
+torch.set_num_threads(1)
 
 from research_rl.models.tiny import build_char_tokenizer, build_tiny_llama, save_tiny_model  # noqa: E402
 
