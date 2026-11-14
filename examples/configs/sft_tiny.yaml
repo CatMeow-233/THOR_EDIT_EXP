@@ -1,0 +1,25 @@
+# Supervised fine-tuning (not RL). Load with ExperimentConfig.load; run with examples/sft_tiny.py.
+# model.name_or_path "research_rl:tiny" is a sentinel understood by the example script: it writes a random,
+# offline tiny Llama + char tokenizer into the output dir. Pass --model <hf id or path> for a real model.
+study_id: example-sft-tiny
+seed: 0
+output_dir: runs
+run_name: sft-tiny
+tags: [example, cpu-smoke]
+model:
+  name_or_path: "research_rl:tiny"
+  dtype: float32
+data:
+  name: toy-arithmetic
+  split: train
+trainer:
+  algorithm: sft
+  args:  # passed verbatim to trl.SFTConfig
+    max_steps: 20
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 1
+    learning_rate: 0.001
+    lr_scheduler_type: constant
+    logging_steps: 1
+    max_length: 256
+    bf16: false

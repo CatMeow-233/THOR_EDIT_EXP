@@ -1,0 +1,37 @@
+# Math RLVR with RLOO (reinforcement learning). Load with ExperimentConfig.load; run with
+# examples/rloo_math_tiny.py. model.name_or_path "research_rl:tiny" is a sentinel understood by the example
+# script: it writes a random, offline tiny Llama + char tokenizer into the output dir (CPU smoke run, the
+# numbers say nothing about quality). Pass --model <hf id or path> --bf16 for a real run on CUDA.
+study_id: example-rloo-math-tiny
+seed: 0
+output_dir: runs
+run_name: rloo-math-tiny
+tags: [example, cpu-smoke, rlvr]
+model:
+  name_or_path: "research_rl:tiny"
+  dtype: float32
+data:
+  name: synthetic-arithmetic-boxed
+  split: train
+trainer:
+  algorithm: rloo
+  args:  # passed verbatim to trl.RLOOConfig
+    max_steps: 4
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 1
+    num_generations: 4
+    max_completion_length: 32
+    temperature: 1.0
+    learning_rate: 0.000001
+    beta: 0.05  # TRL default; KL penalty subtracted from the reward
+    normalize_advantages: false
+    mask_truncated_completions: false
+    logging_steps: 1
+    bf16: false
+optim:
+  hooked: true
+  clip_in_wrapper: null
+  # all-zero advantages in an optimizer window -> exact no-op step (counted as skipped, not applied)
+  skip_zero_advantage_steps: true
+extra:
+  num_train_examples: 64
