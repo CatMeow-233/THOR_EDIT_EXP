@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-rl"
+version = "1.0.0"
+description = "ResearchRL: modular research framework for LLM training and reinforcement learning (built on Hugging Face TRL)."
+readme = "docs/research_rl/README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# Versions below are the exact versions the V1.0 test-suite was run against.
+dependencies = [
+    "torch==2.15.0",
+    "transformers==5.23.0",
+    "trl==1.18.0",
+    "accelerate==1.15.0",
+    "peft==0.21.3",
+    "datasets==5.2.0",
+    "safetensors==0.8.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0", "ruff==0.17.5", "mypy==2.4.1"]
+
+[tool.setuptools.packages.find]
+# Only ship the ResearchRL package; the THOR / verl code in this repository is not part of it.
+include = ["research_rl*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+include = ["research_rl/**/*.py", "tests/research_rl/**/*.py", "examples/**/*.py", "scripts/gpu/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "B905", "SIM108"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["research_rl"]
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = false
+check_untyped_defs = true
+no_implicit_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/research_rl"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning", "ignore::UserWarning"]
+markers = ["integration: end-to-end TRL training runs on a tiny CPU model (slower)"]
