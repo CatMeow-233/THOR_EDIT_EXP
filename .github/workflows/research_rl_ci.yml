@@ -1,0 +1,104 @@
+name: ResearchRL CI
+
+# CPU-only CI for the research_rl package. Uses tiny randomly-initialised models built
+# in-process; never downloads real checkpoints and never needs a GPU.
+on:
+  push:
+    paths:
+      - "research_rl/**"
+      - "tests/research_rl/**"
+      - "examples/**"
+      - "scripts/gpu/**"
+      - "scripts/ci_examples_smoke.sh"
+      - "pyproject.toml"
+      - ".github/workflows/research_rl_ci.yml"
+  pull_request:
+    paths:
+      - "research_rl/**"
+      - "tests/research_rl/**"
+      - "examples/**"
+      - "scripts/gpu/**"
+      - "scripts/ci_examples_smoke.sh"
+      - "pyproject.toml"
+      - ".github/workflows/research_rl_ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: research-rl-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  TORCH_VERSION: "2.15.0"
+  TRL_EXPERIMENTAL_SILENCE: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  HF_HUB_OFFLINE: "1"          # guarantee: no model downloads in CI
+  WANDB_DISABLED: "true"
+
+jobs:
+  lint:
+    name: Format, lint, type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu \
+            || pip install "torch==${TORCH_VERSION}"
+          pip install -e ".[dev]"
+      - name: ruff format --check
+        run: ruff format --check
+      - name: ruff check
+        run: ruff check
+      - name: mypy
+        run: mypy
+
+  unit:
+    name: CPU unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu \
+            || pip install "torch==${TORCH_VERSION}"
+          pip install -e ".[dev]"
+          python -c "import torch; print('torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"
+      - name: Unit tests (verifiers, masks, FFN channels, experts, optimizer, checkpoint resume)
+        run: pytest -m "not integration" -q --durations=15
+
+  integration:
+    name: Tiny-model training integration (SFT / DPO / GRPO / RLOO / distillation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu \
+            || pip install "torch==${TORCH_VERSION}"
+          pip install -e ".[dev]"
+      - name: Integration tests
+        run: pytest -m integration -q --durations=15
+      - name: Example smoke runs (tiny offline model, CPU)
+        run: bash scripts/ci_examples_smoke.sh
