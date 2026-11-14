@@ -12,6 +12,7 @@ from typing import Any
 
 from research_rl.core.config import ExperimentConfig
 from research_rl.core.registry import TRAINERS
+from research_rl.trainers import multi_teacher  # noqa: F401  (multi-teacher distillation utilities)
 from research_rl.trainers.base import (
     ResearchCallback,
     ResearchRun,

@@ -1,5 +1,6 @@
 """Rollout bookkeeping for RL trainers: trajectories, bounded rollout logs and policy versions."""
 
+from research_rl.rollout import agent_env  # noqa: F401  (registers environments)
 from research_rl.rollout.policy_version import (
     POLICY_VERSION_KEY,
     policy_lag,

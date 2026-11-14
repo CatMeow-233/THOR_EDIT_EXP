@@ -74,6 +74,10 @@ class UpdateRule:
     def post_step(self, ctx: StepContext, displacements: Mapping[str, torch.Tensor]) -> None:
         return None
 
+    def on_attach(self, optimizer: Any) -> None:
+        """Called once when the rule is added to a HookedOptimizer (validate / bind here)."""
+        return None
+
     def on_skip(self, ctx: StepContext) -> None:
         """Called instead of the other hooks when the step is skipped."""
         return None

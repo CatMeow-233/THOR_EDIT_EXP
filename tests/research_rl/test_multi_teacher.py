@@ -217,11 +217,12 @@ def test_mixture_identity_head_is_guarded():
 def test_distillation_trainer_with_teacher_ensemble(tmp_path, tiny_model_dir, tokenizer, mode):
     from trl import DistillationConfig, DistillationTrainer
 
-    teacher_a = AutoModelForCausalLM.from_pretrained(tiny_model_dir)
     teacher_b = build_tiny_llama(len(tokenizer), seed=3)
     ens = TeacherEnsemble.from_specs(
-        [TeacherSpec("a", teacher_a, 1.0), TeacherSpec("b", teacher_b, 3.0)], mode=mode
+        [TeacherSpec("a", tiny_model_dir, 1.0), TeacherSpec("b", teacher_b, 3.0)], mode=mode
     )
+    ref_a = AutoModelForCausalLM.from_pretrained(tiny_model_dir)  # string path was loaded
+    assert all(torch.equal(p, q) for p, q in zip(ens.teachers[0].parameters(), ref_a.parameters()))
     torch.testing.assert_close(ens.weights, torch.tensor([0.25, 0.75], dtype=torch.float64))
     student = build_tiny_llama(len(tokenizer), seed=11)
     before = {n: p.detach().clone() for n, p in student.named_parameters()}

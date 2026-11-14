@@ -560,14 +560,16 @@ class P2PriorRule(UpdateRule):
         self._tau_cache: dict[tuple[str, torch.device], torch.Tensor] = {}
         self._optimizer: HookedOptimizer | None = None
         self._prior_ids: set[int] = set()
+        self._prior_params: list[torch.nn.Parameter] = []
 
     # ------------------------------------------------------------------ setup
     def attach(self, optimizer: Any) -> None:
         """Bind to the optimizer and validate it (fails closed).
 
         ``optimizer`` may be a :class:`HookedOptimizer` or any wrapper around one (accelerate).
-        Raises if this rule is not in its rules, a prior module is not optimised, or a param group
-        holding a prior module has non-zero ``weight_decay``.
+        Raises if this rule is not in its rules, a prior module is not optimised or has
+        ``requires_grad=False``, or a param group holding a prior module has non-zero
+        ``weight_decay``. The frozen/decay checks are repeated at every step.
         """
         hooked = unwrap_hooked(optimizer)
         if hooked is None:
@@ -581,12 +583,19 @@ class P2PriorRule(UpdateRule):
         for n in self.modules:
             if tuple(named[n].shape) != tuple(self._tau[n].shape[1:]):
                 raise ValueError(f"task-vector shape for {n!r} does not match the parameter")
-        self._prior_ids = {id(named[n]) for n in self.modules}
+        self._prior_params = [named[n] for n in self.modules]
+        self._prior_ids = {id(p) for p in self._prior_params}
         self._optimizer = hooked
-        self._validate_weight_decay()
+        self._validate()
 
-    def _validate_weight_decay(self) -> None:
+    def _validate(self) -> None:
         assert self._optimizer is not None
+        frozen = [n for n, p in zip(self.modules, self._prior_params) if not p.requires_grad]
+        if frozen:
+            raise ValueError(
+                f"prior modules with requires_grad=False: {frozen[:5]}; the two-channel update needs trainable W "
+                "(drop them from `modules` instead of freezing them)"
+            )
         for i, group in enumerate(self._optimizer.inner.param_groups):
             if any(id(p) in self._prior_ids for p in group["params"]) and float(
                 group.get("weight_decay", 0.0)
@@ -595,6 +604,10 @@ class P2PriorRule(UpdateRule):
                     f"param group {i} holds P2-prior modules with weight_decay={group['weight_decay']}; it must "
                     "be 0 (with decay, optimising the materialised W is no longer equivalent to optimising B)"
                 )
+
+    def on_attach(self, optimizer: Any) -> None:
+        """HookedOptimizer calls this when the rule is registered: validate immediately (fail closed)."""
+        self.attach(optimizer)
 
     def callback(self) -> TrainerCallback:
         """A ``TrainerCallback`` that calls :meth:`attach` with the trainer's optimizer at train begin."""
@@ -653,7 +666,13 @@ class P2PriorRule(UpdateRule):
                 "P2PriorRule is not attached: call rule.attach(optimizer) (or add rule.callback() to the "
                 "trainer callbacks) so weight decay on prior modules can be validated"
             )
-        self._validate_weight_decay()
+        if float(ctx.extras.get("hf_max_grad_norm", 0.0)) > 0:
+            raise RuntimeError(
+                "P2PriorRule needs the UNCLIPPED weight gradient, but the trainer clips before optimizer.step() "
+                "(max_grad_norm > 0). Use OptimSpec.clip_in_wrapper=c_W (HookedOptimizer clip_norm) and "
+                "max_grad_norm=0."
+            )
+        self._validate()
         self._delta = None
         if not any(n in self._index and p.grad is not None for n, p in named_params):
             return

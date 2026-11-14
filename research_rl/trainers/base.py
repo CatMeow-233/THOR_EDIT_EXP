@@ -87,9 +87,10 @@ class ResearchTrainerMixin:
         opt = self.optimizer  # type: ignore[has-type]
         if self._rr_hooked and not isinstance(opt, HookedOptimizer):
             target = self.model if model is None else model  # type: ignore[attr-defined]
-            self.optimizer = HookedOptimizer(
-                opt, target.named_parameters(), self._rr_rules, clip_norm=self._rr_clip
-            )
+            hooked = HookedOptimizer(opt, target.named_parameters(), self._rr_rules, clip_norm=self._rr_clip)
+            # HF clips *before* optimizer.step(); rules that need unclipped gradients check this flag.
+            hooked.step_extras["hf_max_grad_norm"] = float(self.args.max_grad_norm or 0.0)  # type: ignore[attr-defined]
+            self.optimizer = hooked
         return self.optimizer
 
     @property

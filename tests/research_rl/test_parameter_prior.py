@@ -449,9 +449,9 @@ def test_p2_state_dict_round_trip_resumes_bit_exactly():
 
 
 def test_p2_validation_weight_decay_attach_and_callback():
-    s = make_rule_setup("model", 2, lr_alpha=1e-2, clip_w=1.0, clip_alpha=None, lam=None, wd=0.01)
+    # HookedOptimizer calls rule.on_attach() at registration: decay on prior modules fails immediately
     with pytest.raises(ValueError, match="weight_decay"):
-        s.rule.attach(s.opt)
+        make_rule_setup("model", 2, lr_alpha=1e-2, clip_w=1.0, clip_alpha=None, lam=None, wd=0.01)
     # decay only on non-prior parameters is allowed
     s = make_rule_setup("model", 2, lr_alpha=1e-2, clip_w=1.0, clip_alpha=None, lam=None)
     params = dict(s.model.named_parameters())
@@ -460,9 +460,7 @@ def test_p2_validation_weight_decay_attach_and_callback():
         {"params": [p for n, p in params.items() if n not in PRIOR_NAMES], "weight_decay": 0.1},
     ]
     opt = HookedOptimizer(torch.optim.AdamW(groups, lr=1e-3), s.model.named_parameters(), [s.rule])
-    with pytest.raises(RuntimeError, match="not attached"):
-        lm_loss(s.model, 0).backward()
-        opt.step()
+    # the explicit callback path still works (idempotent re-attach)
     P2PriorAttachCallback(s.rule).on_train_begin(None, None, None, optimizer=SimpleNamespace(optimizer=opt))
     opt.zero_grad()
     lm_loss(s.model, 0).backward()
@@ -472,6 +470,16 @@ def test_p2_validation_weight_decay_attach_and_callback():
     opt.param_groups[0]["weight_decay"] = 0.05
     with pytest.raises(ValueError, match="weight_decay"):
         opt.step()
+    # a frozen prior module (even with a stale .grad) is rejected instead of being moved by dα·τ
+    opt.param_groups[0]["weight_decay"] = 0.0
+    frozen = params[PRIOR_NAMES[0]]
+    frozen.requires_grad_(False)
+    assert frozen.grad is not None  # stale gradient from the previous backward
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        opt.step()
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        s.rule.attach(opt)
+    frozen.requires_grad_(True)
     # a rule not registered in the optimizer cannot attach
     other = P2PriorRule(s.tvs, PRIOR_NAMES)
     with pytest.raises(ValueError, match="not registered"):
@@ -485,3 +493,13 @@ def test_registries():
     assert PARAMETER_PRIORS.get("task_vector") is TaskVector
     assert UPDATE_RULES.get("p2_prior") is P2PriorRule
     assert UPDATE_RULES.get("prior_subspace") is PriorSubspaceRule
+
+
+def test_p2_refuses_when_trainer_clips_before_step():
+    """HF/TRL clipping (max_grad_norm>0) happens before optimizer.step(): the rule must refuse."""
+    s = make_rule_setup("model", 2, lr_alpha=1e-2, clip_w=1.0, clip_alpha=None, lam=None)
+    s.opt.step_extras["hf_max_grad_norm"] = 1.0
+    s.opt.zero_grad()
+    lm_loss(s.model, 0).backward()
+    with pytest.raises(RuntimeError, match="UNCLIPPED"):
+        s.opt.step()

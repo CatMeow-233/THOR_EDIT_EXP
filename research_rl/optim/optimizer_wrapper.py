@@ -83,6 +83,11 @@ class HookedOptimizer(Optimizer):
         self.skipped_steps = 0
         self.last_grad_norm: float | None = None
         self._skip_next = False
+        # Copied into StepContext.extras at every step (e.g. the trainer mixin records whether HF
+        # clips gradients *before* optimizer.step(), which some rules must refuse).
+        self.step_extras: dict[str, Any] = {}
+        for rule in self.rules:
+            rule.on_attach(self)
 
     # ------------------------------------------------------------------ delegation
     @property  # type: ignore[override]
@@ -129,6 +134,7 @@ class HookedOptimizer(Optimizer):
     # ------------------------------------------------------------------ rule management
     def add_rule(self, rule: UpdateRule) -> None:
         self.rules.append(rule)
+        rule.on_attach(self)
 
     def request_skip(self) -> None:
         """Make the next ``step()`` a no-op (counted in ``skipped_steps``)."""
@@ -149,6 +155,7 @@ class HookedOptimizer(Optimizer):
             nominal_step=self.nominal_steps,
             update_step=self.applied_updates,
             lrs=[float(g["lr"]) for g in self.inner.param_groups],
+            extras=dict(self.step_extras),
         )
         if self._skip_next:
             self._skip_next = False
