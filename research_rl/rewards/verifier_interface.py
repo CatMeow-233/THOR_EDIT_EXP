@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -83,7 +84,7 @@ class Verifier(Protocol):
     def verify(self, completion: str | None, reference: Any, **meta: Any) -> VerificationResult: ...
 
 
-class BaseVerifier:
+class BaseVerifier(ABC):
     """Convenience base: subclasses implement :meth:`_verify` returning ``(status, parsed, reference, details)``."""
 
     name: str = "verifier"
@@ -91,10 +92,11 @@ class BaseVerifier:
     def __init__(self, rewards: RewardScheme | None = None) -> None:
         self.rewards = rewards if rewards is not None else RewardScheme()
 
+    @abstractmethod
     def _verify(
         self, completion: str | None, reference: Any, **meta: Any
     ) -> tuple[Status, str | None, str | None, dict[str, Any]]:
-        raise NotImplementedError
+        """Grade one completion; may raise (non-fatal exceptions become ``status="error"``)."""
 
     def make_result(
         self,

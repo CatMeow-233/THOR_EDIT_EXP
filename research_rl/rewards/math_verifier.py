@@ -338,6 +338,8 @@ class MathVerifier(BaseVerifier):
             ref = _unwrap_box(boxes[-1][0])
         elif "####" in ref:
             ref = _rest_of_line(ref, ref.rfind("####") + 4)[0]
+        if len(ref) > self.max_answer_chars:
+            raise ValueError("reference answer longer than max_answer_chars")
         normalized = self.normalize(ref)
         if not normalized:
             raise ValueError("empty reference answer")

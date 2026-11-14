@@ -213,6 +213,7 @@ def test_case_ids_unique():
         ("a" * 40000 + "\\boxed{5}", {}, "completion_too_long"),
         ("\\boxed{" * 20 + "5" + "}" * 20, {}, "nested_boxes_too_deep"),
     ],
+    ids=lambda v: v if isinstance(v, str) and len(v) < 40 else "",
 )
 def test_format_error_reasons(completion, cfg, reason):
     result = MathVerifier(**cfg).verify(completion, "5")
@@ -222,7 +223,8 @@ def test_format_error_reasons(completion, cfg, reason):
 def test_huge_integers_beyond_digit_limit_compare_as_strings():
     nines = "9" * 2000  # > max_number_digits (1000): exact string comparison, no int conversion
     v = MathVerifier(max_answer_chars=4096)
-    assert MathVerifier().verify(f"\\boxed{{{nines}}}", nines).details["reason"] == "answer_too_long"
+    assert MathVerifier().verify(f"\\boxed{{{nines}}}", "9").details["reason"] == "answer_too_long"
+    assert MathVerifier().verify("\\boxed{9}", nines).details["reason"] == "bad_reference"
     assert v.verify(f"\\boxed{{{nines}}}", nines).status == "correct"
     assert v.verify(f"\\boxed{{{nines[:-1]}8}}", nines).status == "incorrect"
     within = "9" * 900
@@ -232,7 +234,13 @@ def test_huge_integers_beyond_digit_limit_compare_as_strings():
 
 @pytest.mark.parametrize(
     ("reference", "reason"),
-    [(None, "bad_reference"), ("", "bad_reference"), ("   $ $ ", "bad_reference"), (True, "bad_reference")],
+    [
+        (None, "bad_reference"),
+        ("", "bad_reference"),
+        ("   $ $ ", "bad_reference"),
+        (True, "bad_reference"),
+        ("1" * 600, "bad_reference"),
+    ],
 )
 def test_bad_reference_is_error(reference, reason):
     result = MathVerifier().verify("\\boxed{5}", reference)
@@ -375,12 +383,26 @@ def test_seeded_equivalence_against_fraction_reference():
         ("a" * 2_000_000, {}),
         ("1" * 30000 + "e" + "9" * 20, {"extractors": ("answer_phrase",)}),
     ],
+    ids=[
+        "open_boxes",
+        "open_braces",
+        "box_then_braces",
+        "answer_is_repeat",
+        "hash_repeat",
+        "answer_spaces",
+        "strict_many_boxes",
+        "nested_text",
+        "strict_trailing_many",
+        "tail_after_eos",
+        "long_no_eos",
+        "long_number",
+    ],
 )
 def test_pathological_inputs_are_fast(completion, cfg):
     v = MathVerifier(**cfg)
     start = time.perf_counter()
     result = v.verify(completion, "5")
-    assert time.perf_counter() - start < 0.5, result
+    assert time.perf_counter() - start < 2.0, result  # ~30 ms measured; loose for shared CI
     assert result.status in ("correct", "incorrect", "format_error", "no_answer")
 
 
