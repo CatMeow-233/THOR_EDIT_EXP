@@ -182,7 +182,7 @@ class RLRolloutMixin:
         rewards = (rpf * weights).nansum(dim=1)
         rewards[torch.isnan(rpf).all(dim=1)] = float("nan")
         start = self.accelerator.process_index * n_local
-        return rewards.roll(1)[start : start + n_local]
+        return rewards[start : start + n_local]
 
     # ------------------------------------------------------------------ TRL overrides
     def _calculate_rewards(
