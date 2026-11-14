@@ -76,7 +76,7 @@ def token_resume_trainer_class(trl_cls: type) -> type:
 
 
 def track_train_tokens(run: ResearchRun) -> ResearchRun:
-    pass
+    run.trainer.add_callback(TrainTokensCallback(run.trainer, run.callback))
     return run
 
 
