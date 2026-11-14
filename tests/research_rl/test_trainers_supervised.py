@@ -411,7 +411,10 @@ def test_dpo_with_prewrapped_peft_model_uses_frozen_initial_adapter(tokenizer, t
     trainer = run.trainer
     assert isinstance(trainer.model, PeftModel) and trainer.ref_model is None
     assert "ref" in trainer.model.peft_config
-    assert run.recorder.record["reference_model"] == "policy with frozen copy of its initial PEFT adapter ('ref')"
+    assert (
+        run.recorder.record["reference_model"]
+        == "policy with frozen copy of its initial PEFT adapter ('ref')"
+    )
     batch = trainer.data_collator([trainer.train_dataset[i] for i in range(len(DPO_ROWS))])
     peft_model = trainer.model
     with torch.no_grad():

@@ -147,6 +147,11 @@ class ResearchCallback(TrainerCallback):
             "global_step": int(state.global_step),
         }
 
+    def on_train_begin(self, args: Any, state: Any, control: Any, **kw: Any) -> None:
+        # HF has already restored trainer_state.json here when resuming from a checkpoint.
+        if self.recorder is not None and int(state.global_step) > 0:
+            self.recorder.resume_from(int(state.global_step))
+
     def on_log(
         self, args: Any, state: Any, control: Any, logs: dict[str, Any] | None = None, **kw: Any
     ) -> None:
@@ -259,11 +264,14 @@ class TrainerAdapter:
         if exp.trainer.algorithm != self.algorithm:
             raise ValueError(f"config asks for {exp.trainer.algorithm!r}, adapter is {self.algorithm!r}")
         torch.manual_seed(exp.seed)
+        # A model path passed here overrides exp.model for weights, tokenizer and the recorded identity.
+        spec = exp.model
+        if isinstance(model, str):
+            spec = dataclasses.replace(exp.model, name_or_path=model, revision=None)
         if model is None or isinstance(model, str):
-            spec = exp.model if model is None else dataclasses.replace(exp.model, name_or_path=model)
             model = load_causal_lm(spec)
         if processing_class is None:
-            processing_class = load_tokenizer(exp.model)
+            processing_class = load_tokenizer(spec)
         recorder = ExperimentRecorder(exp) if record else None
         callback = ResearchCallback(recorder)
         trainer = self.trainer_class()(
@@ -281,6 +289,6 @@ class TrainerAdapter:
         )
         callback.bind(trainer)
         if recorder is not None:
-            recorder.set_model(trainer.model, exp.model.revision)
+            recorder.set_model(trainer.model, spec.revision)
             recorder.set_dataset(train_dataset, exp.data.name)
         return ResearchRun(config=exp, trainer=trainer, recorder=recorder, callback=callback)

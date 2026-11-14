@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import torch
 from datasets import Dataset
 from transformers import TrainerCallback
@@ -115,3 +117,36 @@ def test_bit_exact_resume_through_trl(tokenizer, tmp_path):
     assert ledger_full.keys() == ledger_resumed.keys()
     for k in ledger_full:
         assert abs(ledger_full[k] - ledger_resumed[k]) <= 1e-9 * max(1.0, ledger_full[k])
+
+
+def test_recorder_continues_history_on_resume(tmp_path):
+    """record.json / metrics.jsonl of a resumed run continue the interrupted run (no loss, no duplicates)."""
+    from research_rl.core.config import DataSpec, ExperimentConfig, ModelSpec, TrainerSpec
+    from research_rl.core.experiment import ExperimentRecorder
+
+    cfg = ExperimentConfig(
+        study_id="s",
+        run_name="r",
+        model=ModelSpec(name_or_path="m"),
+        data=DataSpec(name="d"),
+        trainer=TrainerSpec(algorithm="sft"),
+        output_dir=str(tmp_path),
+    )
+    rec = ExperimentRecorder(cfg)
+    for step in (1, 2, 3, 4):
+        rec.log_metrics(step, {"loss": float(10 - step), "num_tokens": 10.0 * step})
+    rec.add_checkpoint(tmp_path / "checkpoint-2", 2)
+    rec.add_checkpoint(tmp_path / "checkpoint-4", 4)
+
+    resumed = ExperimentRecorder(cfg)  # new process, same run dir
+    resumed.resume_from(2)
+    for step in (3, 4):
+        resumed.log_metrics(step, {"loss": float(10 - step), "num_tokens": 10.0 * step})
+    rows = [json.loads(x) for x in (resumed.run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in rows] == [1, 2, 3, 4]
+    assert resumed.history("loss") == [9.0, 8.0, 7.0, 6.0]
+    assert [c["global_step"] for c in resumed.record["checkpoints"]] == [2]
+    assert resumed.finalize()["training_tokens"] == 40.0
+
+    fresh = ExperimentRecorder(cfg)  # not resumed: starts clean
+    assert (fresh.run_dir / "metrics.jsonl").read_text() == ""

@@ -190,6 +190,50 @@ class ExperimentRecorder:
             "hardware": {"gpu_metrics": NOT_TESTED},
         }
         self._history: dict[str, list[float]] = {}
+        # A previous run in the same directory: keep its rows/record aside. They are restored up to the
+        # checkpoint step by resume_from(); a fresh (non-resumed) run starts with clean files.
+        self._prior_rows: list[dict[str, Any]] = []
+        self._prior_record: dict[str, Any] = {}
+        if self.metrics_path.exists():
+            for line in self.metrics_path.read_text().splitlines():
+                if line.strip():
+                    self._prior_rows.append(json.loads(line))
+        if (self.run_dir / "record.json").exists():
+            try:
+                self._prior_record = json.loads((self.run_dir / "record.json").read_text())
+            except json.JSONDecodeError:
+                self._prior_record = {}
+        self.metrics_path.write_text("")
+        self._flush()
+
+    def resume_from(self, global_step: int) -> None:
+        """Continue the record of an interrupted run from checkpoint ``global_step``.
+
+        Metric rows, checkpoints and evaluations of the previous run up to that step are kept (later
+        ones are discarded, they will be re-produced), and the metric history is rebuilt from them.
+        """
+        rows = [r for r in self._prior_rows if int(r.get("step", 0)) <= global_step]
+        with self.metrics_path.open("w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        self._history = {}
+        for r in rows:
+            for k, v in r.items():
+                if k != "step" and isinstance(v, (int, float)) and not isinstance(v, bool):
+                    self._history.setdefault(k, []).append(float(v))
+            if "num_tokens" in r:
+                self.record["training_tokens"] = r["num_tokens"]
+        self.record["checkpoints"] = [
+            c
+            for c in self._prior_record.get("checkpoints", [])
+            if int(c.get("global_step", 0)) <= global_step
+        ]
+        self.record["evaluations"] = [
+            e
+            for e in self._prior_record.get("evaluations", [])
+            if e.get("step") is None or int(e["step"]) <= global_step
+        ]
+        self.record["resumed_from_step"] = int(global_step)
         self._flush()
 
     # ------------------------------------------------------------------ identity

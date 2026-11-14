@@ -101,9 +101,13 @@ class DPOAdapter(TrainerAdapter):
             model = load_causal_lm(spec)
         if isinstance(ref_model, str):
             ref_model = load_causal_lm(dataclasses.replace(exp.model, name_or_path=ref_model, revision=None))
-        elif ref_model is None and kwargs.get("peft_config") is None:
-            if not exp.trainer.args.get("precompute_ref_log_probs"):
-                ref_model = frozen_copy(model)
+        elif (
+            ref_model is None
+            and kwargs.get("peft_config") is None
+            and not _is_peft_model(model)
+            and not exp.trainer.args.get("precompute_ref_log_probs")  # TRL then needs no reference copy
+        ):
+            ref_model = frozen_copy(model)
         run = super().build(exp, train_dataset=train_dataset, model=model, ref_model=ref_model, **kwargs)
         trainer = run.trainer
         ref = getattr(trainer, "ref_model", None)
