@@ -100,6 +100,7 @@ def make_run(
     model=None,
     callbacks=(),
     update_rules=(),
+    eval_dataset=None,
     **overrides,
 ):
     exp = make_config(tmp_path, algorithm, rl_args(algorithm, **overrides), skip=skip, run_name=run_name)
@@ -111,8 +112,10 @@ def make_run(
         callbacks=list(callbacks),
         update_rules=list(update_rules),
     )
-    if shapers:
-        kwargs["advantage_shapers"] = list(shapers)
+    if eval_dataset is not None:
+        kwargs["eval_dataset"] = eval_dataset
+    if shapers:  # passed as given: a single shaper / a bare name is accepted too
+        kwargs["advantage_shapers"] = shapers
     if adapter is not None:
         return adapter.build(exp, **kwargs)
     return build_run(exp, **kwargs)
@@ -260,6 +263,7 @@ def fake_output(b: int = 4, t: int = 3) -> dict:
         (lambda o: ShapedAdvantages(torch.zeros(4, 5)), ValueError, r"shape \(4, 5\).*\(4,\) or \(4, 3\)"),
         (lambda o: ShapedAdvantages(torch.zeros(4, 3, 1)), ValueError, "shape"),
         (lambda o: ShapedAdvantages(torch.zeros(4, dtype=torch.float64)), ValueError, "dtype torch.float64"),
+        (lambda o: ShapedAdvantages(torch.zeros(4, device="meta")), ValueError, "on meta"),
         (lambda o: ShapedAdvantages(torch.tensor([0.0, float("nan"), 0.0, 0.0])), ValueError, "non-finite"),
         (lambda o: ShapedAdvantages([0.0] * 4), TypeError, "torch.Tensor"),  # type: ignore[arg-type]
         (lambda o: o["advantages"], TypeError, "ShapedAdvantages"),
@@ -314,6 +318,25 @@ def test_shapers_resolve_from_registry(tokenizer, tmp_path):
     trainer = make_run(tokenizer, tmp_path, skip=False, shapers=["test_add_bonus", AddBonus(0.1)]).trainer
     assert [type(s) for s in trainer.advantage_shapers] == [AddBonus, AddBonus]
     assert trainer.advantage_shapers[0].bonus == 0.5 and trainer.advantage_shapers[1].bonus == 0.1
+
+
+@pytest.mark.parametrize("given", ["test_add_bonus", AddBonus(0.5)])
+def test_single_shaper_or_name_is_one_shaper(tokenizer, tmp_path, given):
+    """A bare registry name must not be iterated per character; a bare shaper is wrapped."""
+    ADVANTAGE_SHAPERS.add("test_add_bonus", AddBonus, overwrite=True)
+    trainer = make_run(tokenizer, tmp_path, skip=False, shapers=given).trainer
+    assert len(trainer.advantage_shapers) == 1 and isinstance(trainer.advantage_shapers[0], AddBonus)
+
+
+@pytest.mark.parametrize("given", [[AddBonus], AddBonus, (AddBonus(), AddBonus)])
+def test_shaper_class_is_rejected_at_construction(tokenizer, tmp_path, given):
+    with pytest.raises(TypeError, match="AddBonus is a class; pass an instance"):
+        make_run(tokenizer, tmp_path, skip=False, shapers=given)
+
+
+def test_non_sequence_shapers_are_rejected(tokenizer, tmp_path):
+    with pytest.raises(TypeError, match="sequence of AdvantageShaper"):
+        make_run(tokenizer, tmp_path, skip=False, shapers=lambda o, t: None)
 
 
 def test_advantage_stamp_travels_through_trl_shuffle_and_split():
@@ -442,7 +465,9 @@ def test_declared_zero_signal_skips_bit_identically(tokenizer, tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(("value", "applied"), [(0.0, 0), (1e-6, 2)])
+@pytest.mark.parametrize(
+    ("value", "applied"), [(0.0, 0), (1e-6, 2), (1e-30, 2), (torch.finfo(torch.float32).tiny, 2)]
+)
 def test_none_signal_means_exact_non_zero(tokenizer, tmp_path, value, applied):
     """TRL's advantages are non-zero here (varied reward); the shaper's are exactly 0 or carry one
     tiny round-off-sized value. ``signal=None`` must skip only the exact zeros."""
@@ -502,22 +527,187 @@ class PostHocTrainer(ResearchGRPOTrainer):
         return output
 
 
+class InPlacePostHocTrainer(ResearchGRPOTrainer):
+    """The same edit in place: a stamp that aliases the advantages would change with them."""
+
+    def _generate_and_score_completions(self, inputs):
+        output = super()._generate_and_score_completions(inputs)
+        output["advantages"].add_(0.5)
+        return output
+
+
 class PostHocAdapter(GRPOAdapter):
     research_trainer_cls = PostHocTrainer
 
 
+class InPlacePostHocAdapter(GRPOAdapter):
+    research_trainer_cls = InPlacePostHocTrainer
+
+
 @pytest.mark.integration
-def test_post_hoc_modification_is_detected(tokenizer, tmp_path):
+@pytest.mark.parametrize("adapter_cls", [PostHocAdapter, InPlacePostHocAdapter])
+def test_post_hoc_modification_is_detected(tokenizer, tmp_path, adapter_cls):
     """Constant reward: the stamped flags say "no signal", but the trained advantages are 0.5."""
     model = build_tiny_llama(len(tokenizer), seed=0)
     before = snapshot(model)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        run = make_run(tokenizer, tmp_path, model=model, adapter=PostHocAdapter(), max_steps=3)
+        run = make_run(tokenizer, tmp_path, model=model, adapter=adapter_cls(), max_steps=3)
         run.train()
     assert sum(MODIFIED_WARNING in str(w.message) for w in caught) == 1  # once, not per micro-batch
     assert steps(run) == (3, 3, 0)
     assert not same_params(before, snapshot(run.trainer.model))
+
+
+class EditBufferedInputs(TrainerCallback):
+    """Edits TRL's buffered (already split) micro-batches between optimizer steps."""
+
+    def __init__(self) -> None:
+        self.trainer: Any = None
+        self.edited = 0
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        buffered = getattr(self.trainer, "_buffered_inputs", None)
+        if buffered is not None:
+            buffered[self.trainer._step % args.steps_per_generation]["advantages"].add_(0.5)
+            self.edited += 1
+
+
+@pytest.mark.integration
+def test_callback_editing_buffered_inputs_is_detected(tokenizer, tmp_path):
+    """Constant reward, one generation per two steps: step 1 has no signal and is skipped; the
+    callback edits the second micro-batch before step 2, which must then be applied."""
+    edit = EditBufferedInputs()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run = make_run(tokenizer, tmp_path, callbacks=[edit], steps_per_generation=2, max_steps=2)
+        edit.trainer = run.trainer
+        run.train()
+    assert edit.edited == 1  # the buffer exists only after the first generation
+    assert sum(MODIFIED_WARNING in str(w.message) for w in caught) == 1
+    assert steps(run) == (2, 1, 1)
+
+
+# ---- empty completion masks: no sample has signal, whatever the shaper says --------------------
+class DeclareAllSignal(AdvantageShaper):
+    name = "declare_all_signal"
+
+    def __call__(self, output, trainer):
+        adv = output["advantages"] + 0.5
+        return ShapedAdvantages(adv, signal=torch.ones(adv.shape[0], dtype=torch.bool))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("shapers", "adapter_cls"),
+    [((DeclareAllSignal(),), None), ((AddBonus(0.5),), None), ((), PostHocAdapter)],
+    ids=["declared_signal", "none_signal", "post_hoc_edit"],
+)
+def test_empty_completion_masks_are_never_signal(tokenizer, tmp_path, shapers, adapter_cls):
+    """``mask_truncated_completions`` with ``max_completion_length=2`` masks every completion (the
+    tiny model does not emit EOS that early). Non-zero advantages or a declared signal must not
+    count: the steps carry no advantage gradient and are skipped, parameters bit-identical."""
+    model = build_tiny_llama(len(tokenizer), seed=0)
+    before = snapshot(model)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run = make_run(
+            tokenizer,
+            tmp_path,
+            model=model,
+            shapers=shapers,
+            adapter=adapter_cls() if adapter_cls is not None else None,
+            mask_truncated_completions=True,
+            max_completion_length=2,
+        )
+        run.train()
+    buf = run.trainer.trajectory_buffer
+    assert len(buf) == 2
+    for batch in buf:  # not vacuous: every mask is empty
+        assert int(batch.completion_mask.sum()) == 0
+        if shapers:
+            assert bool((batch.advantages != 0).all())
+    if adapter_cls is not None:  # the edit was seen and the fallback flags still honour the mask
+        assert sum(MODIFIED_WARNING in str(w.message) for w in caught) == 1
+    assert steps(run) == (2, 0, 2)
+    assert same_params(before, snapshot(run.trainer.model))
+
+
+# ---- eval batches and the transient trl_advantage_signal --------------------------------------
+class Recording(AdvantageShaper):
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[bool, bool]] = []  # (model.training, trl_advantage_signal set)
+
+    def __call__(self, output, trainer):
+        self.calls.append((bool(trainer.model.training), trainer.trl_advantage_signal is not None))
+        return ShapedAdvantages(output["advantages"] + 0.5)
+
+
+@pytest.mark.integration
+def test_shapers_run_on_eval_batches_and_signal_is_transient(tokenizer, tmp_path):
+    shaper = Recording()
+    run = make_run(
+        tokenizer,
+        tmp_path,
+        shapers=[shaper],
+        eval_dataset=dataset().select(range(4)),
+        per_device_eval_batch_size=4,
+        max_steps=1,
+    )
+    run.train()
+    assert shaper.calls == [(True, True)]
+    assert run.trainer.trl_advantage_signal is None  # reset after the shapers ran
+    metrics = run.trainer.evaluate()
+    assert shaper.calls[1:] and all(c == (False, True) for c in shaper.calls[1:])
+    assert run.trainer.trl_advantage_signal is None
+    assert metrics["eval_rollout/frac_zero_advantage"] == 0.0  # the shaped (eval) advantages
+    assert len(run.trainer.trajectory_buffer) == 1  # eval batches are not logged in the buffer
+
+
+# ---- shaper state across a checkpoint resume --------------------------------------------------
+class StatefulApplyThenDeclareZero(ApplyThenDeclareZero):
+    name = "stateful_apply_then_declare_zero"
+
+    def state_dict(self) -> dict:
+        return {"calls": self.calls}
+
+    def load_state_dict(self, state) -> None:
+        self.calls = int(state["calls"])
+
+
+@pytest.mark.integration
+def test_stateful_shaper_is_restored_on_resume(tokenizer, tmp_path):
+    """Uninterrupted: step 1 applied, steps 2-4 declared signal-free. A resume from step 2 must
+    continue the shaper's call count (a fresh shaper would apply step 3)."""
+    common: dict[str, Any] = dict(
+        reward=varied_reward,
+        max_steps=4,
+        lr_scheduler_type="constant",
+        save_strategy="steps",
+        save_steps=2,
+        run_name="resume",
+    )
+    first = StatefulApplyThenDeclareZero()
+    full = make_run(tokenizer, tmp_path, shapers=[first], **common)
+    full.train()
+    assert steps(full) == (4, 1, 3) and first.calls == 4
+    key = "advantage_shaper/0/stateful_apply_then_declare_zero"
+    assert full.trainer.research_components[key] is first
+    full_params = snapshot(full.trainer.model)
+
+    second = StatefulApplyThenDeclareZero()
+    resumed = make_run(tokenizer, tmp_path, shapers=[second], **common)
+    ckpt = resumed.config.run_dir / "trainer" / "checkpoint-2"
+    resumed.train(resume_from_checkpoint=str(ckpt))
+    assert second.calls == 4  # 2 restored + 2 after the resume
+    assert steps(resumed) == (4, 1, 3)
+    assert same_params(full_params, snapshot(resumed.trainer.model))
+
+
+def test_stateless_shaper_is_not_a_component(grpo_trainer):
+    assert not [k for k in grpo_trainer.research_components if k.startswith("advantage_shaper")]
 
 
 @pytest.mark.integration
@@ -541,3 +731,34 @@ def test_rloo_beta_with_skip_is_allowed_and_skips_only_signal_free_windows(
     assert len(has_signal) == 3 and any(has_signal)
     nominal, applied, skipped = steps(run)
     assert nominal == 3 and applied == sum(has_signal) and skipped == 3 - applied
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("perturb", [False, True], ids=["policy_is_ref", "policy_moved"])
+def test_rloo_beta_constant_reward_skips_iff_kl_is_zero(tokenizer, tmp_path, tiny_model_dir, perturb):
+    """Constant reward, ``beta=0.05``. While the policy equals the reference the KL penalty is 0,
+    every advantage is (round-off) zero and every step is skipped bit-identically. A policy moved
+    away from the reference makes the KL, and with it the advantage, differ per sample: the
+    reward rule (KL rebuilt from TRL's log-probs) sees signal and the steps are applied."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(tiny_model_dir)  # TRL reloads the ref from this path
+    if perturb:
+        gen = torch.Generator().manual_seed(1)
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(0.05 * torch.randn(p.shape, generator=gen))
+    before = snapshot(model)
+    run = make_run(tokenizer, tmp_path, algorithm="rloo", model=model, beta=0.05, max_steps=2)
+    assert run.trainer.ref_model is not None
+    run.train()
+    buf = run.trainer.trajectory_buffer
+    if perturb:
+        assert all(bool((b.advantages != 0).any()) for b in buf)
+        assert [b.has_nonzero_advantage for b in buf] == [True, True]
+        assert steps(run) == (2, 2, 0)
+        assert not same_params(before, snapshot(run.trainer.model))
+    else:
+        assert [b.has_nonzero_advantage for b in buf] == [False, False]
+        assert steps(run) == (2, 0, 2)
+        assert same_params(before, snapshot(run.trainer.model))

@@ -102,6 +102,9 @@ RL-specific bookkeeping (GRPO/RLOO):
   signal flags and the trajectory log; the "no signal" decision then comes from the last shaper's
   `signal`, or from "advantage exactly non-zero" if it returns none. Advantages edited later (e.g.
   by a subclass) are detected per micro-batch and fall back to the exact non-zero test, with a warning.
+  TRL's completions table (`log_completions`) still shows TRL's unshaped advantages; the shaped ones
+  are in `trajectory_buffer` and the `rollout/*` metrics. Shapers with `state_dict`/`load_state_dict`
+  are checkpointed; other shapers restart from their constructor state on resume.
 * **TRL 1.18 facts found while testing**: a custom `rollout_func` is used verbatim (no cut at the
   first EOS) — wrap it with `research_rl.trainers.rl_common.eos_truncating_rollout`; GRPO's default
   `loss_type` is `dapo`; RLOO's default `beta=0.05` reloads the reference model from

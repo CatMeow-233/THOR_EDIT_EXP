@@ -41,6 +41,9 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   one, else "final advantage exactly non-zero" — conservative, a sample with any non-zero
   advantage is never treated as signal-free. A shaper that keeps TRL's zeros (e.g. a positive
   rescaling) can return :attr:`RLRolloutMixin.trl_advantage_signal`, today's reward-based flags.
+  TRL's own completions table (``log_completions``, ``_logs["advantages"]``) is filled inside TRL's
+  ``_generate_and_score_completions`` and so still records TRL's *unshaped* advantages; the shaped
+  values are in :attr:`RLRolloutMixin.trajectory_buffer` and the ``rollout/*`` metrics.
 * **Post-hoc modification detection.** A detached copy of the advantages the flags were computed
   from travels with the batch under :data:`ADVANTAGES_STAMP_KEY` (TRL's ``shuffle_sequence_dict``
   and ``split_tensor_dict`` permute and slice every tensor with ``ndim >= 1`` along dim 0, so it
@@ -78,7 +81,11 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   (:func:`resume_is_generation_aligned`). For example, with ``gradient_accumulation_steps=1``,
   ``save_steps`` must be a multiple of ``steps_per_generation × num_iterations``. Otherwise a
   ``UserWarning`` is emitted at the start of the resumed training. ResearchRL's own state
-  (policy version, counters, HookedOptimizer) is restored either way.
+  (policy version, counters, HookedOptimizer) is restored either way, and so is the state of every
+  advantage shaper that implements ``state_dict``/``load_state_dict``
+  (:class:`~research_rl.core.checkpoint.StatefulComponent`; registered as research component
+  ``f"advantage_shaper/{index}/{name}"``). A shaper without these methods restarts from its
+  constructor state on resume.
 * :func:`eos_truncating_rollout`, an *opt-in* wrapper for GRPO ``rollout_func``. TRL takes
   rollout token lists verbatim: the completion mask is 1 on every returned token, including
   tokens after an EOS. It treats a row whose last token is EOS **or pad** as terminated (see the
@@ -102,6 +109,7 @@ from typing import Any, ClassVar
 import torch
 from transformers import TrainerCallback
 
+from research_rl.core.checkpoint import StatefulComponent
 from research_rl.core.config import ExperimentConfig
 from research_rl.core.experiment import ExperimentRecorder
 from research_rl.core.registry import ADVANTAGE_SHAPERS
@@ -110,6 +118,8 @@ from research_rl.rollout.trajectory import RolloutBatch, TrajectoryBuffer
 from research_rl.trainers.base import ResearchRun, TrainerAdapter
 
 ROLLOUT_COMPONENT = "rl_rollouts"
+# research_components key prefix of stateful advantage shapers: f"{prefix}/{index}/{name}".
+ADVANTAGE_SHAPER_COMPONENT = "advantage_shaper"
 # Per-sample bool (B,) stamped on generation batches: does the sample carry a learning signal?
 SIGNAL_KEY = "rr_signal"
 # Detached copy of the advantages SIGNAL_KEY was computed from, (B,) or (B, T): detects later edits.
@@ -147,6 +157,12 @@ class AdvantageShaper(abc.ABC):
     ``trainer.model.training`` tells train from eval batches, :attr:`RLRolloutMixin.trl_advantage_signal`
     holds the reward-based flags of TRL's own advantages. Register reusable shapers in
     :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` to refer to them by name.
+
+    State across a resume: a shaper with ``state_dict()``/``load_state_dict(state)`` (the
+    :class:`~research_rl.core.checkpoint.StatefulComponent` protocol) is checkpointed with the
+    research components and restored on ``train(resume_from_checkpoint=...)``; the state must be
+    loadable with ``torch.load(weights_only=True)`` (tensors, numbers, strings, lists, dicts). Any
+    other shaper is not saved: it restarts from its constructor state.
     """
 
     name: str = "advantage_shaper"
@@ -314,9 +330,7 @@ class RLRolloutMixin:
     ) -> None:
         self.skip_zero_advantage_steps = bool(skip_zero_advantage_steps)
         self.trajectory_buffer = TrajectoryBuffer(trajectory_capacity)
-        self.advantage_shapers: list[AdvantageShaper] = [
-            self._rr_resolve_shaper(s) for s in advantage_shapers
-        ]
+        self.advantage_shapers: list[AdvantageShaper] = self._rr_resolve_shapers(advantage_shapers)
         #: Reward-based signal flags of TRL's *own* advantages for the batch being shaped (local (B,)
         #: bool, set only while the shapers run). A shaper that keeps TRL's zeros may return it.
         self.trl_advantage_signal: torch.Tensor | None = None
@@ -338,12 +352,37 @@ class RLRolloutMixin:
                     "advantage: " + "; ".join(conflicts) + ". Disable these terms or the step skipping."
                 )
         self.research_components.setdefault(ROLLOUT_COMPONENT, self.trajectory_buffer)
+        for index, shaper in enumerate(self.advantage_shapers):
+            if isinstance(shaper, StatefulComponent):  # its state travels with checkpoints
+                key = f"{ADVANTAGE_SHAPER_COMPONENT}/{index}/{self._rr_shaper_name(shaper)}"
+                self.research_components.setdefault(key, shaper)
         self.add_callback(_WindowCallback(self))  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ helpers
+    @classmethod
+    def _rr_resolve_shapers(cls, shapers: Any) -> list[AdvantageShaper]:
+        """``advantage_shapers`` as a list of shaper instances (registry names are built).
+
+        A single shaper or a single registry name is accepted as a one-element sequence (a bare
+        string must not be iterated character by character).
+        """
+        if isinstance(shapers, (str, type, AdvantageShaper)):  # a class is rejected with a clear message
+            shapers = [shapers]
+        elif not isinstance(shapers, Sequence):
+            raise TypeError(
+                "advantage_shapers must be a sequence of AdvantageShaper instances or ADVANTAGE_SHAPERS "
+                f"names, got {shapers!r}"
+            )
+        return [cls._rr_resolve_shaper(s) for s in shapers]
+
     @staticmethod
     def _rr_resolve_shaper(shaper: AdvantageShaper | str) -> AdvantageShaper:
         resolved = ADVANTAGE_SHAPERS.build(shaper) if isinstance(shaper, str) else shaper
+        if isinstance(resolved, type):
+            raise TypeError(
+                f"advantage shaper {resolved.__name__} is a class; pass an instance "
+                f"({resolved.__name__}(...)) or an ADVANTAGE_SHAPERS registry name"
+            )
         if not callable(resolved):
             raise TypeError(f"advantage shaper {shaper!r} is not callable")
         return resolved  # type: ignore[no-any-return]
