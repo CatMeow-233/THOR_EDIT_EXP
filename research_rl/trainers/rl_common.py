@@ -28,7 +28,27 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   has signal iff its (weighted, clipped, KL-shaped where applicable) reward differs from its
   group's mean, recomputed in float64, where a constant group's mean is exact. If the rule cannot
   be evaluated, the flag falls back to "advantage exactly non-zero". The flags feed the
-  ``rollout/*`` statistics and the step skipping below.
+  ``rollout/*`` statistics and the step skipping below. The reward rule is only valid for TRL's
+  own advantages; it is not used once advantages were shaped (next item).
+* **Advantage shaping** (``advantage_shapers=[...]`` constructor keyword, forwarded from the
+  adapter's ``algo_kwargs``; registry names of :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS`
+  are accepted). Each :class:`AdvantageShaper` maps the generation batch TRL returned to
+  :class:`ShapedAdvantages`. Shapers run in order right after TRL's
+  ``_generate_and_score_completions`` (train and eval batches), before the signal flags are
+  computed and the batch is logged, and ``output["advantages"]`` is replaced by the last result
+  (shape, dtype, device and finiteness are checked; see :meth:`RLRolloutMixin._rr_check_advantages`).
+  Signal with shapers: the last shaper's ``signal`` (AND completion mask non-empty) if it returns
+  one, else "final advantage exactly non-zero" — conservative, a sample with any non-zero
+  advantage is never treated as signal-free. A shaper that keeps TRL's zeros (e.g. a positive
+  rescaling) can return :attr:`RLRolloutMixin.trl_advantage_signal`, today's reward-based flags.
+* **Post-hoc modification detection.** A detached copy of the advantages the flags were computed
+  from travels with the batch under :data:`ADVANTAGES_STAMP_KEY` (TRL's ``shuffle_sequence_dict``
+  and ``split_tensor_dict`` permute and slice every tensor with ``ndim >= 1`` along dim 0, so it
+  stays aligned with its samples; TRL's losses only read named keys). If a micro-batch's
+  ``advantages`` differ from the stamp in ``_prepare_inputs`` (a subclass overriding
+  ``_generate_and_score_completions`` on top of this mixin, a callback editing the buffered
+  inputs, ...), the micro-batch's flags become "advantage exactly non-zero" and a
+  ``UserWarning`` is emitted once per trainer.
 * **Zero-advantage step skipping** (``OptimSpec.skip_zero_advantage_steps``). TRL generates once
   per ``steps_per_generation × num_iterations`` micro-batches, shuffles the generation batch and
   slices it into micro-batches. So the decision cannot be made at generation time. It is made per
@@ -38,8 +58,18 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   clipping, before ``optimizer.step()``), a window with no signal on any process leads to
   ``HookedOptimizer.request_skip()``. The step still counts as nominal, so the LR schedule
   advances and ``global_step`` increments, but parameters and optimizer state stay bit-identical.
-  Caveat: the skip also drops gradient from loss terms that do not depend on the advantage
-  (GRPO ``beta > 0`` KL term, entropy bonus, MoE aux loss).
+  A skip would also drop every gradient that does not come from the advantage, so
+  ``skip_zero_advantage_steps=True`` is refused (``ValueError``) when such a term is active
+  (checked against TRL 1.18's ``_compute_loss``): at construction for GRPO ``beta != 0`` (the KL
+  term is added to the per-token loss), the GRPO entropy bonus (``entropy_coef != 0`` or
+  ``use_adaptive_entropy``) and the MoE router aux loss of both trainers (TRL's
+  ``aux_loss_enabled``, i.e. the config declares ``output_router_logits`` and the coefficient is
+  non-zero, or ``output_router_logits=True`` in the model config); at ``on_train_begin`` (the
+  HookedOptimizer exists by then) for any :class:`~research_rl.optim.UpdateRule` with
+  ``needs_every_step=True``. RLOO ``beta != 0`` stays allowed: TRL subtracts the KL penalty from
+  the *reward* before the leave-one-out baseline, so it is part of the advantage. All other GRPO
+  terms (clipping, ``top_entropy_quantile`` mask, off-policy mask, vLLM IS ratios, every
+  ``loss_type``) multiply the advantage.
 * **Resume alignment.** TRL keeps the current generation batch (``_buffered_inputs``) and its
   micro-batch counter only in memory. After ``train(resume_from_checkpoint=...)`` it generates a
   fresh batch at once. The resumed run therefore matches the uninterrupted one only if the
@@ -63,8 +93,10 @@ generation is also not tested.
 
 from __future__ import annotations
 
+import abc
 import warnings
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -72,6 +104,7 @@ from transformers import TrainerCallback
 
 from research_rl.core.config import ExperimentConfig
 from research_rl.core.experiment import ExperimentRecorder
+from research_rl.core.registry import ADVANTAGE_SHAPERS
 from research_rl.rollout.policy_version import policy_lag, policy_version_of, stamp_policy_version
 from research_rl.rollout.trajectory import RolloutBatch, TrajectoryBuffer
 from research_rl.trainers.base import ResearchRun, TrainerAdapter
@@ -79,10 +112,48 @@ from research_rl.trainers.base import ResearchRun, TrainerAdapter
 ROLLOUT_COMPONENT = "rl_rollouts"
 # Per-sample bool (B,) stamped on generation batches: does the sample carry a learning signal?
 SIGNAL_KEY = "rr_signal"
+# Detached copy of the advantages SIGNAL_KEY was computed from, (B,) or (B, T): detects later edits.
+ADVANTAGES_STAMP_KEY = "rr_signal_advantages"
 # Per-token fields a GRPO rollout_func may return next to ``completion_ids``.
 PER_TOKEN_ROLLOUT_KEYS = ("logprobs", "logprob_token_ids", "env_mask")
 
 RolloutFunc = Callable[[list[Any], Any], dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------------- advantage shaping
+@dataclass(frozen=True)
+class ShapedAdvantages:
+    """Result of an :class:`AdvantageShaper`.
+
+    * ``advantages``: the new *local* advantages, ``(B,)`` (GRPO and RLOO) or ``(B, T)`` with
+      ``T = completion_ids.shape[1]`` (GRPO only: its loss unsqueezes ``(B,)`` and uses ``(B, T)``
+      per token; RLOO's loss is per sequence). Same dtype and device as TRL's advantages, finite.
+      A tensor that requires grad is detached.
+    * ``signal``: optional local ``(B,)`` bool, "does this sample carry a learning signal?". Only
+      the last shaper's ``signal`` is used; ``None`` means "advantage exactly non-zero".
+    """
+
+    advantages: torch.Tensor
+    signal: torch.Tensor | None = None
+
+
+class AdvantageShaper(abc.ABC):
+    """Rewrites the advantages of a generation batch (turn/step credit, sign rebalancing, per-token
+    KL rewards, ...). See the module docstring for where it runs and how its ``signal`` is used.
+
+    ``output`` is the local generation batch dict TRL's ``_generate_and_score_completions``
+    returned (``prompt_ids``, ``completion_ids``, ``completion_mask``, ``advantages`` (already
+    replaced by earlier shapers), ...); treat it as read-only. ``trainer`` is the research trainer:
+    ``trainer.model.training`` tells train from eval batches, :attr:`RLRolloutMixin.trl_advantage_signal`
+    holds the reward-based flags of TRL's own advantages. Register reusable shapers in
+    :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` to refer to them by name.
+    """
+
+    name: str = "advantage_shaper"
+
+    @abc.abstractmethod
+    def __call__(self, output: Mapping[str, Any], trainer: Any) -> ShapedAdvantages:
+        """Return the new advantages (and optionally per-sample signal flags)."""
 
 
 # ---------------------------------------------------------------------------------- EOS handling
@@ -177,13 +248,17 @@ def resume_is_generation_aligned(
 class _WindowCallback(TrainerCallback):
     """Calls the trainer's end-of-window decision right before ``optimizer.step()``.
 
-    Also warns at ``on_train_begin`` when a resumed run starts off a generation boundary.
+    At ``on_train_begin`` it refuses ``needs_every_step`` update rules under step skipping and warns
+    when a resumed run starts off a generation boundary.
     """
 
     def __init__(self, trainer: RLRolloutMixin) -> None:
         self._trainer = trainer
 
     def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        check = getattr(self._trainer, "_rr_check_every_step_rules", None)
+        if check is not None:
+            check()
         step = int(state.global_step or 0)
         spg = int(getattr(args, "steps_per_generation", None) or args.gradient_accumulation_steps)
         num_iterations = int(getattr(self._trainer, "num_iterations", 1) or 1)
@@ -205,11 +280,18 @@ class _WindowCallback(TrainerCallback):
 
 
 class RLRolloutMixin:
-    """Policy-version stamps, trajectory log and zero-advantage skipping for TRL GRPO/RLOO trainers.
+    """Policy-version stamps, trajectory log, advantage shaping and zero-advantage skipping for TRL
+    GRPO/RLOO trainers.
 
-    Extra constructor keywords: ``skip_zero_advantage_steps`` (requires the hooked optimizer) and
-    ``trajectory_capacity`` (max generation batches kept in :attr:`trajectory_buffer`).
+    Extra constructor keywords: ``skip_zero_advantage_steps`` (requires the hooked optimizer and
+    no advantage-independent loss term, see the module docstring), ``trajectory_capacity`` (max
+    generation batches kept in :attr:`trajectory_buffer`) and ``advantage_shapers`` (a sequence of
+    :class:`AdvantageShaper` objects or :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` names,
+    applied in order).
     """
+
+    # Accepted ``advantages.ndim`` of the trainer's loss (RLOO: per-sequence only; GRPO adds (B, T)).
+    _rr_advantage_ndims: ClassVar[tuple[int, ...]] = (1,)
 
     # Attributes provided by ResearchTrainerMixin / the TRL trainer (declared for type checkers).
     _rr_hooked: bool
@@ -227,23 +309,82 @@ class RLRolloutMixin:
         *args: Any,
         skip_zero_advantage_steps: bool = False,
         trajectory_capacity: int = 16,
+        advantage_shapers: Sequence[AdvantageShaper | str] = (),
         **kwargs: Any,
     ) -> None:
         self.skip_zero_advantage_steps = bool(skip_zero_advantage_steps)
         self.trajectory_buffer = TrajectoryBuffer(trajectory_capacity)
+        self.advantage_shapers: list[AdvantageShaper] = [
+            self._rr_resolve_shaper(s) for s in advantage_shapers
+        ]
+        #: Reward-based signal flags of TRL's *own* advantages for the batch being shaped (local (B,)
+        #: bool, set only while the shapers run). A shaper that keeps TRL's zeros may return it.
+        self.trl_advantage_signal: torch.Tensor | None = None
         self._rr_window_signal = False
         self._rr_window_microbatches = 0
         self._rr_rewards_per_func: torch.Tensor | None = None
+        self._rr_warned_modified = False
         super().__init__(*args, **kwargs)
         if self.skip_zero_advantage_steps and not self._rr_hooked:
             raise ValueError(
                 "skip_zero_advantage_steps needs the HookedOptimizer (OptimSpec.hooked=True): only it can "
                 "turn an optimizer step into an exact no-op"
             )
+        if self.skip_zero_advantage_steps:
+            conflicts = self._rr_skip_conflicts()
+            if conflicts:
+                raise ValueError(
+                    "skip_zero_advantage_steps would silently drop gradient that does not come from the "
+                    "advantage: " + "; ".join(conflicts) + ". Disable these terms or the step skipping."
+                )
         self.research_components.setdefault(ROLLOUT_COMPONENT, self.trajectory_buffer)
         self.add_callback(_WindowCallback(self))  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _rr_resolve_shaper(shaper: AdvantageShaper | str) -> AdvantageShaper:
+        resolved = ADVANTAGE_SHAPERS.build(shaper) if isinstance(shaper, str) else shaper
+        if not callable(resolved):
+            raise TypeError(f"advantage shaper {shaper!r} is not callable")
+        return resolved  # type: ignore[no-any-return]
+
+    @staticmethod
+    def _rr_shaper_name(shaper: Any) -> str:
+        return str(getattr(shaper, "name", type(shaper).__name__))
+
+    def _rr_skip_conflicts(self) -> list[str]:
+        """Active loss terms that do not depend on the advantage (a skipped step would drop them).
+
+        Called after TRL's constructor, so it reads TRL's own flags. Both TRL 1.18 trainers add the
+        MoE router aux loss when ``aux_loss_enabled`` (config declares ``output_router_logits`` and
+        the coefficient is non-zero); ``output_router_logits=True`` in the model config is refused
+        as well. The GRPO trainer adds its KL and entropy terms.
+        """
+        conflicts = []
+        text_config = self.model.config.get_text_config()
+        router_logits = getattr(text_config, "output_router_logits", False) is True
+        if getattr(self, "aux_loss_enabled", False) or router_logits:
+            conflicts.append(
+                "the MoE router auxiliary loss is (or may be) active (model config output_router_logits="
+                f"{getattr(text_config, 'output_router_logits', None)}, router_aux_loss_coef="
+                f"{getattr(self, 'router_aux_loss_coef', None)}); set router_aux_loss_coef=0 in the TRL "
+                "config and output_router_logits=False in the model config"
+            )
+        return conflicts
+
+    def _rr_check_every_step_rules(self) -> None:
+        """Raise if step skipping is on and a HookedOptimizer rule must act every step (train begin)."""
+        if not self.skip_zero_advantage_steps:
+            return
+        hooked = self.hooked_optimizer  # type: ignore[attr-defined]
+        rules = [] if hooked is None else hooked.rules
+        needy = [self._rr_shaper_name(r) for r in rules if getattr(r, "needs_every_step", False)]
+        if needy:
+            raise ValueError(
+                f"update rules {needy} have needs_every_step=True, but skip_zero_advantage_steps=True turns "
+                "zero-signal steps into no-ops (only UpdateRule.on_skip runs). Disable the step skipping."
+            )
+
     @property
     def policy_version(self) -> int:
         """Applied parameter updates so far (see :func:`research_rl.rollout.policy_version_of`)."""
@@ -275,13 +416,19 @@ class RLRolloutMixin:
         """
         return None
 
+    @staticmethod
+    def _rr_exact_signal(advantages: torch.Tensor, completion_mask: torch.Tensor) -> torch.Tensor:
+        """Per sample: some advantage entry is exactly non-zero AND the completion mask is non-empty."""
+        n = advantages.shape[0]
+        exact_nonzero = (advantages != 0).reshape(n, -1).any(dim=1)
+        return exact_nonzero & completion_mask.reshape(n, -1).bool().any(dim=1).to(exact_nonzero.device)
+
     def _rr_local_signal(
         self, mode: str, advantages: torch.Tensor, completion_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Local per-sample learning-signal flags (see the module docstring)."""
+        """Local per-sample learning-signal flags of TRL's own advantages (see the module docstring)."""
         n_local = advantages.shape[0]
-        exact_nonzero = (advantages != 0).reshape(n_local, -1).any(dim=1)
-        signal = exact_nonzero & completion_mask.reshape(n_local, -1).bool().any(dim=1)
+        signal = self._rr_exact_signal(advantages, completion_mask)
         reward_signal = self._rr_reward_signal(mode, completion_mask)
         if reward_signal is not None:
             start = self.accelerator.process_index * n_local
@@ -295,6 +442,60 @@ class RLRolloutMixin:
             return torch.full((n_local,), float("nan"), device=device)
         start = self.accelerator.process_index * n_local
         return rewards[start : start + n_local]
+
+    def _rr_check_advantages(
+        self, shaper: Any, value: Any, reference: torch.Tensor, output: Mapping[str, Any]
+    ) -> torch.Tensor:
+        """Validate a shaper's advantages against what this trainer's loss accepts; returns them detached.
+
+        TRL 1.18: GRPO's ``_compute_loss`` unsqueezes ``(B,)`` advantages to ``(B, 1)`` and otherwise
+        multiplies them with the ``(B, T)`` per-token terms, so ``(B,)`` and ``(B, T)`` work. RLOO's
+        loss is per sequence (``coef_1`` is ``(B,)``), so only ``(B,)`` is accepted.
+        """
+        who = f"advantage shaper {self._rr_shaper_name(shaper)!r}"
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"{who} returned advantages of type {type(value).__name__}, expected a torch.Tensor"
+            )
+        n = reference.shape[0]
+        allowed: list[tuple[int, ...]] = [(n,)]
+        if 2 in self._rr_advantage_ndims:
+            allowed.append((n, int(output["completion_ids"].shape[1])))
+        if tuple(value.shape) not in allowed:
+            raise ValueError(
+                f"{who} returned advantages of shape {tuple(value.shape)}; the {type(self).__name__} loss "
+                f"accepts {' or '.join(str(s) for s in allowed)} (local batch size, completion length)"
+            )
+        if value.dtype != reference.dtype or value.device != reference.device:
+            raise ValueError(
+                f"{who} returned advantages with dtype {value.dtype} on {value.device}; expected "
+                f"{reference.dtype} on {reference.device} (as TRL's advantages)"
+            )
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{who} returned non-finite advantages")
+        return value.detach()
+
+    def _rr_apply_shapers(self, output: dict[str, Any]) -> torch.Tensor | None:
+        """Run the shapers on ``output`` (in place); returns the last shaper's validated signal."""
+        signal: torch.Tensor | None = None
+        for shaper in self.advantage_shapers:
+            who = f"advantage shaper {self._rr_shaper_name(shaper)!r}"
+            result = shaper(output, self)
+            if not isinstance(result, ShapedAdvantages):
+                raise TypeError(f"{who} must return ShapedAdvantages, got {type(result).__name__}")
+            reference = output["advantages"]
+            output["advantages"] = self._rr_check_advantages(shaper, result.advantages, reference, output)
+            signal = result.signal
+            if signal is not None:
+                n = reference.shape[0]
+                if (
+                    not isinstance(signal, torch.Tensor)
+                    or signal.dtype != torch.bool
+                    or tuple(signal.shape) != (n,)
+                ):
+                    raise ValueError(f"{who} must return signal=None or a bool tensor of shape ({n},)")
+                signal = signal.detach().to(reference.device)
+        return signal
 
     # ------------------------------------------------------------------ TRL overrides
     def _calculate_rewards(
@@ -310,13 +511,26 @@ class RLRolloutMixin:
         self._rr_begin_generation()
         output: dict[str, Any] = super()._generate_and_score_completions(inputs)  # type: ignore[misc]
         mode = "train" if self.model.training else "eval"
+        completion_mask = output["completion_mask"]
+        # Always evaluated, also with shapers: it consumes per-generation captures (RLOO log-probs).
+        signal = self._rr_local_signal(mode, output["advantages"], completion_mask)
+        if self.advantage_shapers:
+            self.trl_advantage_signal = signal
+            try:
+                shaper_signal = self._rr_apply_shapers(output)
+            finally:
+                self.trl_advantage_signal = None
+            if shaper_signal is not None:
+                non_empty = completion_mask.reshape(len(shaper_signal), -1).bool().any(dim=1)
+                signal = shaper_signal & non_empty.to(shaper_signal.device)
+            else:
+                signal = self._rr_exact_signal(output["advantages"], completion_mask)
         advantages = output["advantages"]
-        signal = self._rr_local_signal(mode, advantages, output["completion_mask"])
         batch = RolloutBatch.from_tensors(
             prompt_ids=output["prompt_ids"],
             prompt_mask=output["prompt_mask"],
             completion_ids=output["completion_ids"],
-            completion_mask=output["completion_mask"],
+            completion_mask=completion_mask,
             rewards=self._rr_local_rewards(len(inputs), advantages.device),
             advantages=advantages,
             policy_version=version,
@@ -331,16 +545,45 @@ class RLRolloutMixin:
         self._rr_log(mode, "rollout/has_nonzero_advantage", float(batch.has_nonzero_advantage))
         # Appended last: TRL sizes a batch dict from its first value.
         output[SIGNAL_KEY] = signal
+        output[ADVANTAGES_STAMP_KEY] = advantages.detach().clone()
         stamp_policy_version(output, version)
         return output
+
+    def _rr_microbatch_flags(self, inputs: Mapping[str, Any]) -> torch.Tensor:
+        """Signal flags of a training micro-batch; exact non-zero test if its advantages were edited."""
+        advantages = inputs["advantages"]
+        flags = inputs.get(SIGNAL_KEY)
+        if flags is None:  # batch not produced by this mixin: exact test on the advantages
+            return advantages != 0  # type: ignore[no-any-return]
+        stamp = inputs.get(ADVANTAGES_STAMP_KEY)
+        if stamp is None:
+            return flags  # type: ignore[no-any-return]
+        unchanged = (
+            isinstance(advantages, torch.Tensor)
+            and advantages.shape == stamp.shape
+            and advantages.dtype == stamp.dtype
+            and advantages.device == stamp.device
+            and torch.equal(advantages, stamp)
+        )
+        if unchanged:
+            return flags  # type: ignore[no-any-return]
+        if not self._rr_warned_modified:
+            self._rr_warned_modified = True
+            warnings.warn(
+                "the advantages of a training micro-batch differ from the ones its learning-signal flags were "
+                "computed from (modified after RLRolloutMixin._generate_and_score_completions, e.g. by a "
+                "subclass or a callback); using 'advantage exactly non-zero' flags for such micro-batches. "
+                "Use advantage_shapers=[...] to shape advantages with an explicit signal.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self._rr_exact_signal(advantages, inputs["completion_mask"])
 
     def _prepare_inputs(self, generation_batch: Any) -> Any:
         inputs = super()._prepare_inputs(generation_batch)  # type: ignore[misc]
         if self.model.training and isinstance(inputs, Mapping) and "advantages" in inputs:
             self._rr_window_microbatches += 1
-            flags = inputs.get(SIGNAL_KEY)
-            if flags is None:  # batch not produced by this mixin: exact test on the advantages
-                flags = inputs["advantages"] != 0
+            flags = self._rr_microbatch_flags(inputs)
             if not self._rr_window_signal and bool(flags.any()):
                 self._rr_window_signal = True
             lag = policy_lag(self.policy_version, inputs)
@@ -382,7 +625,8 @@ class RLTrainerAdapter(TrainerAdapter):
     """Base for RL adapters: ``trainer_class()`` returns :attr:`research_trainer_cls`.
 
     ``OptimSpec.skip_zero_advantage_steps`` is forwarded to the trainer. Extra ``algo_kwargs``
-    (``reward_funcs``, ``rollout_func``, ``peft_config``, ``trajectory_capacity``, ...) go to the
+    (``reward_funcs``, ``rollout_func``, ``peft_config``, ``trajectory_capacity``,
+    ``advantage_shapers``, ...) go to the
     trainer unchanged. ``bf16`` defaults to ``False``: TRL's configs enable bf16 autocast
     whenever ``fp16`` is unset, also on CPU. Precision must be requested explicitly.
     """
