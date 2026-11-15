@@ -98,7 +98,9 @@ RL-specific bookkeeping (GRPO/RLOO):
   begin). RLOO `beta != 0` is allowed: TRL folds its KL penalty into the reward, i.e. into the advantage.
   With an `expert_manager` and a frozen backbone, only rows of experts with trainable parameters
   count: signal on rows of frozen experts does not keep a window from being skipped (it cannot move
-  a trainable parameter, while the trainable expert's round-off advantages would).
+  a trainable parameter, while the trainable expert's round-off advantages would). The skip is
+  all-or-nothing per window: with a trainable backbone, a window with signal on some rows still
+  updates from the round-off advantages of the others (no per-parameter-group skip).
 * **Advantage shaping**: pass `advantage_shapers=[...]` to `build_run` (objects implementing
   `research_rl.trainers.rl_common.AdvantageShaper`, or names registered in
   `ADVANTAGE_SHAPERS`). They rewrite TRL's advantages (`(B,)`, or `(B, T)` for GRPO) before the

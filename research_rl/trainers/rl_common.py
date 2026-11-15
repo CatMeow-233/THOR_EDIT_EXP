@@ -69,7 +69,10 @@ It adds:
   row whose expert has no trainable parameter (a frozen expert) is ignored, since its signal cannot
   move any parameter while the round-off advantages of the trainable expert's rows in the same
   window would (``rollout/window_has_signal`` and the window counters use the same rule; the
-  per-sample flags and ``rollout/*`` batch statistics do not). At ``on_pre_optimizer_step`` (after HF
+  per-sample flags and ``rollout/*`` batch statistics do not). The decision is all-or-nothing per
+  window: with a trainable backbone parameter (or several experts made trainable by hand), a window
+  with real signal on some rows also steps parameters that only signal-free rows reach, from their
+  round-off advantages (a per-parameter-group skip is not implemented). At ``on_pre_optimizer_step`` (after HF
   clipping, before ``optimizer.step()``), a window with no signal on any process leads to
   ``HookedOptimizer.request_skip()``. The step still counts as nominal, so the LR schedule
   advances and ``global_step`` increments, but parameters and optimizer state stay bit-identical.
