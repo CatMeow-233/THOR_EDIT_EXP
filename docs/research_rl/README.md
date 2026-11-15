@@ -134,6 +134,22 @@ Gradient clipping: HF clips *before* `optimizer.step()`. Rules that must see unc
 `optim.clip_in_wrapper: <norm>` (the TRL `max_grad_norm` is then forced to 0 and the wrapper clips
 after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
 
+Precision: a parameter *stored* in bf16 (model loaded with `dtype: bfloat16`, no fp32 master copy)
+silently loses every update below ≈ `|w|·2⁻⁸`, because AdamW writes it back with round-to-nearest
+(HF `bf16: true` autocast keeps fp32 parameters and is not affected). `HookedOptimizer` warns about
+this at construction (`optim.precision_check: warn | error | off`). `optim.master_weights: true`
+keeps an fp32 master of every bf16/fp16 parameter: the inner optimizer (fp32 state) and the
+`transform_update`/`pre_write` rules run on the master, the model receives
+`round_to(master, dtype, optim.write_rounding)` (`nearest`, or unbiased `stochastic`, seeded from the
+experiment seed), `post_step` sees fp32 master displacements, and the masters are checkpointed in the
+optimizer state (exact HF resume). `P2PriorRule` refuses bf16 prior modules without masters
+(`allow_low_precision=True` to override). The record stores `precision` (trainable dtypes, options).
+Writes to the weights from outside the optimizer (`restore_frozen`, `rollback_channels`,
+`model.load_state_dict`, ...) reach the master for every element whose value changed; an element
+rewritten with its current bits keeps its master, so for an exact rollback call
+`optimizer.set_master(...)` or `resync_masters()`.
+See `research_rl/optim/precision.py` and the `HookedOptimizer` docstring.
+
 ## Parameter-level research tools
 
 * **FFN channels** (`models/ffn_channels.py`): a SwiGLU channel *c* = row *c* of `gate_proj`, row *c*

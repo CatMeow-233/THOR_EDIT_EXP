@@ -668,6 +668,8 @@ def test_p2_lr_schedule_follows_nominal_steps_and_lambda_equals_warmup():
 
 # ------------------------------------------------------------------------------------------- P2: dtypes / memory
 def single_param_setup(dtype: torch.dtype, k: int = 2, **rule_kwargs):
+    if dtype == torch.bfloat16:  # this setup deliberately tests the non-master bf16 write path
+        rule_kwargs.setdefault("allow_low_precision", True)
     g = torch.Generator().manual_seed(0)
     net = nn.Linear(16, 12, bias=False).to(dtype)
     with torch.no_grad():

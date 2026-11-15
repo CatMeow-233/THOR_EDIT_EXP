@@ -18,6 +18,11 @@ GPUs are never treated as one 64 GB device.
 Without CUDA the script writes ``"status": "NOT_TESTED"`` and exits with code 2; it never reports
 CPU numbers as GPU results. ``--model research_rl:tiny`` uses the offline tiny model (for a quick
 pipeline check only).
+
+``--master-weights`` keeps fp32 master copies of the bf16 parameters inside HookedOptimizer (fp32
+AdamW state, +4 bytes/parameter for the masters and a transient fp32 gradient copy per step); without
+it, updates below ~|w|*2**-8 are rounded away in bf16 (the wrapper warns). ``--write-rounding
+stochastic`` rounds the served bf16 weights stochastically (needs ``--master-weights``).
 """
 
 from __future__ import annotations
@@ -53,11 +58,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--master-weights", action="store_true", help="fp32 master weights in HookedOptimizer")
+    p.add_argument("--write-rounding", choices=["nearest", "stochastic"], default="nearest")
     p.add_argument("--memory-summary", action="store_true", help="include torch.cuda.memory_summary()")
     p.add_argument("--memory-snapshot", default=None, help="write a CUDA memory snapshot pickle here")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default="runs/gpu/train_step_benchmark.json")
     args = p.parse_args(argv)
+    if args.write_rounding == "stochastic" and not args.master_weights:
+        p.error("--write-rounding stochastic needs --master-weights")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -89,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     torch.cuda.reset_peak_memory_stats(dev)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = HookedOptimizer(
-        torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, fused=True), model.named_parameters()
+        torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, fused=True),
+        model.named_parameters(),
+        master_weights=args.master_weights,
+        write_rounding=args.write_rounding,
     )
     g = torch.Generator(device=dev).manual_seed(0)
     ids = torch.randint(0, vocab, (args.batch_size, args.seq_len), device=dev, generator=g)
@@ -113,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         "optimizer_state": _bytes(
             v for s in opt.state.values() for v in s.values() if isinstance(v, torch.Tensor)
         ),
+        "master_weights": _bytes(m for p in params if (m := opt.master_of(p)) is not None),
     }
     report["num_parameters"] = sum(p.numel() for p in model.parameters())
     report["optimizer_steps_applied"] = opt.applied_updates

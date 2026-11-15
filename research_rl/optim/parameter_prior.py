@@ -37,6 +37,7 @@ from transformers import TrainerCallback
 
 from research_rl.core.registry import PARAMETER_PRIORS, UPDATE_RULES
 from research_rl.optim.optimizer_wrapper import HookedOptimizer, unwrap_hooked
+from research_rl.optim.precision import is_low_precision
 from research_rl.optim.update_interface import StepContext, UpdateRule
 
 Coefficients: TypeAlias = Mapping[str, float | torch.Tensor] | Sequence[float | torch.Tensor] | torch.Tensor
@@ -512,6 +513,13 @@ class P2PriorRule(UpdateRule):
     4. ``pre_write``: W_{t+1,m} = W_after_AdamW + Σ_k (α_{t+1} − α_t)_{k,m} τ_{k,m}, computed in
        ``promote_types(param dtype, float32)`` (fp32 for bf16/fp16/fp32 weights) and rounded once.
 
+    Precision: with bf16/fp16 weights and no fp32 masters, both the AdamW step and the correction
+    Σ Δα τ are rounded to the weight dtype at every step, so corrections below ≈ ``|W| * 2**-8``
+    vanish (P²-MOPD itself keeps FP32 master weights). The rule therefore refuses (``ValueError``
+    at attach and at every step) a low-precision prior module unless the optimizer has
+    ``master_weights=True`` (then ``pre_write`` sees and returns the fp32 master, and the
+    correction accumulates there) or ``allow_low_precision=True`` is passed.
+
     Requirements (documented, partly validated):
 
     * Clipping of W must happen **after** step 1: run HF/TRL with ``max_grad_norm=0`` and let the
@@ -569,6 +577,7 @@ class P2PriorRule(UpdateRule):
         allow_foreign_writes: bool = False,
         tau_dtype: torch.dtype = torch.float32,
         cache_tau_on_device: bool = True,
+        allow_low_precision: bool = False,
     ) -> None:
         if granularity not in ("module", "layer", "model"):
             raise ValueError(f"granularity must be module/layer/model, got {granularity!r}")
@@ -590,6 +599,7 @@ class P2PriorRule(UpdateRule):
         self.lr_lambda = lr_lambda
         self.skip_nonfinite = skip_nonfinite
         self.allow_foreign_writes = allow_foreign_writes
+        self.allow_low_precision = allow_low_precision
         self.cache_tau_on_device = cache_tau_on_device
         if not tau_dtype.is_floating_point:
             raise ValueError("tau_dtype must be a floating-point dtype")
@@ -675,6 +685,21 @@ class P2PriorRule(UpdateRule):
                     f"param group {i} holds P2-prior modules with weight_decay={group['weight_decay']}; it must "
                     "be 0 (with decay, optimising the materialised W is no longer equivalent to optimising B)"
                 )
+        if not self.allow_low_precision:
+            low = [
+                n
+                for n, p in zip(self.modules, self._prior_params)
+                if is_low_precision(p.dtype) and not self._optimizer.has_master(p)
+            ]
+            if low:
+                raise ValueError(
+                    f"P2-prior modules stored in low precision without fp32 master weights: {low[:3]} "
+                    f"({self._prior_params[self.modules.index(low[0])].dtype}). The coefficient correction "
+                    "sum(dalpha*tau) is typically far below the ~|W|*2**-8 resolution of bf16 and would be rounded "
+                    "away at every step (P2-MOPD keeps FP32 master weights). Use HookedOptimizer(master_weights=True) "
+                    "(OptimSpec.master_weights), load the model in float32, or pass allow_low_precision=True to "
+                    "accept the rounding."
+                )
         if self.allow_foreign_writes:
             return
         for rule in self._optimizer.rules:
@@ -699,7 +724,11 @@ class P2PriorRule(UpdateRule):
 
     @torch.no_grad()
     def materialize(self, model: nn.Module, base: Mapping[str, torch.Tensor]) -> None:
-        """Write W_m = B_m + Σ_k α_{k,m} τ_{k,m} (current α) into ``model`` for every prior module."""
+        """Write W_m = B_m + Σ_k α_{k,m} τ_{k,m} (current α) into ``model`` for every prior module.
+
+        If the rule is attached to a ``master_weights`` optimizer, the fp32 value is written into the
+        master (:meth:`HookedOptimizer.set_master`) and the served weight is its nearest rounding.
+        """
         params = dict(model.named_parameters())
         for n in self.modules:
             p = params[n]
@@ -707,7 +736,10 @@ class P2PriorRule(UpdateRule):
             alpha = self.coefficients[self._index[n]].to(device=p.device, dtype=cd)
             tau = self._tau_on(n, p.device).to(cd)
             w = base[n].to(device=p.device, dtype=cd) + torch.tensordot(alpha, tau, dims=1)
-            p.copy_(w.to(p.dtype))
+            if self._optimizer is not None and self._optimizer.has_master(p):
+                self._optimizer.set_master(p, w)
+            else:
+                p.copy_(w.to(p.dtype))
 
     def _tau_on(self, name: str, device: torch.device) -> torch.Tensor:
         """τ of ``name`` on ``device`` (in ``tau_dtype``); cached only with ``cache_tau_on_device``."""
