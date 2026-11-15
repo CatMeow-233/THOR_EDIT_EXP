@@ -76,9 +76,12 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   A batch whose rows all share one expert uses ``ExpertManager.using`` (bit-identical to plain
   single-expert training with ``activate``); only mixed batches need row routing. The manager's
   previous selection is restored after every routed region, also on exceptions. A micro-batch
-  none of whose rows reaches a trainable parameter (only frozen experts) gets a graph-less loss;
-  it is made a grad-requiring leaf so ``backward`` is a no-op and the trainable expert keeps
-  ``grad=None`` (unchanged by the optimizer if its whole window has no rows of it). A manual
+  none of whose rows reaches a trainable parameter (only frozen experts) contributes no gradient
+  to the trainable expert, which keeps ``grad=None`` (unchanged by the optimizer if its whole
+  window has no rows of it). With gradient checkpointing on (TRL's default) HF's input-require-grads
+  hook still attaches such a loss to an autograd graph (through frozen parameters only); with it
+  off the loss may have no graph at all and is then made a grad-requiring leaf, so ``backward`` is
+  a no-op instead of an error. A manual
   ``compute_loss(...).backward()`` outside ``training_step`` must run inside
   ``trainer.expert_routing(batch)`` when gradient checkpointing (TRL's default) is on.
   :class:`~research_rl.rollout.trajectory.RolloutBatch` records ``expert_ids``, the trajectory
@@ -97,8 +100,15 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   equal the base expert's (a checkpoint saved with experts attached would have re-initialised
   FFNs) and rejects a reference that shares the policy's ExpertFFN modules.
 
-Not tested here (NOT_TESTED): multi-process / DeepSpeed / FSDP runs. The skip decision is
-all-gathered across processes, but HookedOptimizer itself is not DeepSpeed-aware. vLLM
+Multi-process runs with an ``expert_manager`` (DDP / DeepSpeed / FSDP, ``num_processes > 1``) are
+rejected at construction: ranks train on different rows, a rank whose micro-batch has no row of
+the trainable expert produces no gradient for it, and DDP's gradient all-reduce on the other ranks
+then waits forever (verified with a 2-process gloo run, see the tests). Multi-process training of a
+*single* expert works without the trainer integration: ``activate`` / ``set_trainable`` the expert
+and do not pass ``expert_manager``.
+
+Not tested here (NOT_TESTED): multi-process / DeepSpeed / FSDP runs without experts. The skip
+decision is all-gathered across processes, but HookedOptimizer itself is not DeepSpeed-aware. vLLM
 generation is also not tested.
 """
 
@@ -135,6 +145,26 @@ _FLAG_KWARGS = frozenset({"compute_entropy", "compute_aux_loss"})
 PER_TOKEN_ROLLOUT_KEYS = ("logprobs", "logprob_token_ids", "env_mask")
 
 RolloutFunc = Callable[[list[Any], Any], dict[str, Any]]
+
+
+def _world_size(training_args: Any) -> int:
+    """``training_args.world_size`` (1 if it cannot be determined yet)."""
+    try:
+        return int(training_args.world_size)
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
+def _reject_multi_process(num_processes: int) -> None:
+    """Expert routing is single-process only: under DDP it would deadlock instead of failing."""
+    if num_processes > 1:
+        raise ExpertError(
+            f"an ExpertManager is not supported with {num_processes} processes (DDP / DeepSpeed / FSDP): "
+            "ranks train on different rows, and a rank whose micro-batch has no row of the trainable expert "
+            "produces no gradient for it, so the gradient all-reduce of the other ranks never completes "
+            "(a hang, not an error). For multi-process training of a single expert, select it with "
+            "ExpertManager.activate()/set_trainable() and do not pass expert_manager to the trainer."
+        )
 
 
 # ---------------------------------------------------------------------------------- EOS handling
@@ -325,6 +355,7 @@ class RLRolloutMixin:
             )
         training_args = kwargs.get("args", args[2] if len(args) > 2 else None)
         if training_args is not None:
+            _reject_multi_process(_world_size(training_args))
             if getattr(training_args, "use_vllm", False):
                 raise ExpertError(
                     "use_vllm=True is not supported with an ExpertManager: the vLLM engine serves a vanilla "
@@ -351,6 +382,7 @@ class RLRolloutMixin:
     def _rr_check_experts_after_init(self) -> None:
         manager = self.expert_manager
         assert manager is not None
+        _reject_multi_process(int(self.accelerator.num_processes))
         from accelerate.utils import is_peft_model
 
         if is_peft_model(self.model):
@@ -657,10 +689,11 @@ class RLRolloutMixin:
         recomputation in backward sees the same experts (``training_step`` does this itself).
 
         If no row of the micro-batch reaches a trainable parameter (all its rows belong to frozen
-        experts), the loss has no autograd graph; it is then returned as a detached leaf that
-        requires grad, so ``backward`` is a no-op and the trainable parameters keep ``grad=None``
-        (PyTorch optimizers skip such parameters: a window without rows of the trainable expert
-        leaves it unchanged).
+        experts), the trainable parameters receive no gradient and keep ``grad=None`` (PyTorch
+        optimizers skip such parameters: a window without rows of the trainable expert leaves it
+        unchanged). The loss itself may still have an autograd graph through frozen parameters
+        (gradient checkpointing on: HF's input-require-grads hook); when it has none (checkpointing
+        off) it is returned as a detached leaf that requires grad, so ``backward`` is a no-op.
         """
         if self.expert_manager is None or not isinstance(inputs, Mapping):
             return super().compute_loss(model, inputs, *args, **kwargs)  # type: ignore[misc]

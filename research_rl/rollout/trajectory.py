@@ -53,6 +53,26 @@ def _to_cpu(t: torch.Tensor) -> torch.Tensor:
     return t.detach().to("cpu").clone()
 
 
+def _expert_id_tuple(expert_ids: Any) -> tuple[str, ...]:
+    """``expert_ids`` as a tuple of names; a bare ``str`` or any non-``str`` entry is a ``TypeError``.
+
+    No coercion: ``"ab"`` would otherwise become ``("a", "b")`` and ``None`` / ints the names
+    ``"None"`` / ``"1"``, which the buffer's per-expert counters would then record and checkpoint.
+    """
+    if isinstance(expert_ids, (str, bytes)) or not isinstance(expert_ids, Sequence):
+        raise TypeError(
+            f"RolloutBatch.expert_ids must be a sequence of expert names (one per row), got "
+            f"{type(expert_ids).__name__} {expert_ids!r}"
+        )
+    bad = [(i, e) for i, e in enumerate(expert_ids) if not isinstance(e, str)]
+    if bad:
+        i, e = bad[0]
+        raise TypeError(
+            f"RolloutBatch.expert_ids[{i}] must be a str expert name, got {type(e).__name__} {e!r}"
+        )
+    return tuple(expert_ids)
+
+
 @dataclass
 class RolloutBatch:
     """One generation batch (the local, per-process part) together with its scores."""
@@ -81,7 +101,7 @@ class RolloutBatch:
         if self.signal is not None and tuple(self.signal.shape) != (n,):
             raise ValueError(f"RolloutBatch.signal must have shape ({n},), got {tuple(self.signal.shape)}")
         if self.expert_ids is not None:
-            self.expert_ids = tuple(str(e) for e in self.expert_ids)
+            self.expert_ids = _expert_id_tuple(self.expert_ids)
             if len(self.expert_ids) != n:
                 raise ValueError(f"RolloutBatch.expert_ids has {len(self.expert_ids)} entries, expected {n}")
 
@@ -113,7 +133,7 @@ class RolloutBatch:
             global_step=int(global_step),
             mode=mode,
             signal=None if signal is None else _to_cpu(signal).bool(),
-            expert_ids=None if expert_ids is None else tuple(expert_ids),
+            expert_ids=None if expert_ids is None else _expert_id_tuple(expert_ids),
         )
 
     # ------------------------------------------------------------------ statistics

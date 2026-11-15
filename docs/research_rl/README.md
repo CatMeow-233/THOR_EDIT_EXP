@@ -151,8 +151,9 @@ after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
   generation, TRL's chunked old-log-prob forwards and the loss forward/backward of each shuffled
   micro-batch all run every row through its own expert. `RolloutBatch.expert_ids`, the trajectory
   counters (`expert_samples`) and `rollout/expert_frac/<name>` record which expert produced each sample.
-  The KL reference (`beta > 0`) is the vanilla base FFN for every row; vLLM, PEFT and, for mixed-expert
-  batches, continuous batching / `rollout_func` / multimodal inputs are rejected with an error.
+  The KL reference (`beta > 0`) is the vanilla base FFN for every row; vLLM, PEFT, multi-process runs
+  (DDP would deadlock on ranks without rows of the trainable expert) and, for mixed-expert batches,
+  continuous batching / `rollout_func` / multimodal inputs are rejected with an error.
 * **Parameter priors** (`optim/parameter_prior.py`): `TaskVector`, `TaskVectorPrior`,
   `project_onto_span`, `PriorSubspaceRule`, and `P2PriorRule` — the two-channel update of P²-MOPD
   (arXiv 2611.03953): `W = B + Σ α_k τ_k` per module, coefficient gradient `⟨G, τ⟩` from the unclipped

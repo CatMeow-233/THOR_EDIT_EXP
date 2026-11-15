@@ -17,13 +17,20 @@ mis-routing would be numerically invisible).
 from __future__ import annotations
 
 import io
+import os
+import signal
+import subprocess
+import sys
+import textwrap
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 import trl.trainer.grpo_trainer as grpo_trainer_module
 import trl.trainer.rloo_trainer as rloo_trainer_module
+from accelerate import Accelerator
 from datasets import Dataset
 from transformers import AutoModelForCausalLM
 from trl import GRPOConfig, GRPOTrainer, RLOOConfig, RLOOTrainer
@@ -37,7 +44,7 @@ from research_rl.models.tiny import build_tiny_llama
 from research_rl.optim.update_interface import MaskRule
 from research_rl.rollout.policy_version import read_policy_version
 from research_rl.rollout.trajectory import RolloutBatch, TrajectoryBuffer
-from research_rl.trainers import build_run
+from research_rl.trainers import build_run, rl_common
 from research_rl.trainers.grpo_adapter import ResearchGRPOTrainer
 from research_rl.trainers.rl_common import EXPERT_KEY, ROLLOUT_COMPONENT
 from research_rl.trainers.rloo_adapter import ResearchRLOOTrainer
@@ -318,6 +325,22 @@ def test_rollout_batch_expert_ids_and_buffer_counters_round_trip():
             policy_version=0,
             expert_ids=("a",),
         )
+    # no coercion: a str is not split into characters, None / ints are not turned into names
+    for bad in ("ab", ["math", None], [1, 2], (b"math", "code")):
+        with pytest.raises(TypeError, match="expert_ids"):
+            batch(bad)
+        with pytest.raises(TypeError, match="expert_ids"):
+            RolloutBatch(
+                prompt_ids=torch.zeros(2, 1),
+                prompt_mask=torch.zeros(2, 1),
+                completion_ids=torch.zeros(2, 1),
+                completion_mask=torch.zeros(2, 1),
+                rewards=torch.zeros(2),
+                advantages=torch.zeros(2),
+                policy_version=0,
+                expert_ids=bad,  # type: ignore[arg-type]
+            )
+    assert batch(["math", "code"]).expert_ids == ("math", "code")  # a list is fine
     buf = TrajectoryBuffer()
     buf.append(batch(None))
     assert "expert_samples" not in buf.counters()  # no experts: counters unchanged
@@ -426,6 +449,116 @@ def test_invalid_expert_setups_raise(tokenizer, tmp_path):
             expert_manager=mgr,
             peft_config=LoraConfig(target_modules=["q_proj"]),
         )
+    assert (mgr.active, mgr.routing) == ("math", None)
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_multi_process_runs_are_rejected_at_construction(tokenizer, tmp_path, monkeypatch, algorithm):
+    """DDP would deadlock on a rank without rows of the trainable expert: both checks reject it."""
+    model, mgr = experts_model(tokenizer)
+    args = rl_config(algorithm, tmp_path)
+    with monkeypatch.context() as patch:  # before TRL's constructor: the training arguments' world size
+        patch.setattr(type(args), "world_size", property(lambda self: 2))
+        with pytest.raises(ExpertError, match="not supported with 2 processes"):
+            TRAINERS[algorithm](
+                model=model,
+                reward_funcs=digit_fraction,
+                args=args,
+                train_dataset=mixed_dataset(),
+                processing_class=tokenizer,
+                expert_manager=mgr,
+            )
+    with monkeypatch.context() as patch:  # after it: the accelerator's process count
+        patch.setattr(rl_common, "_world_size", lambda training_args: 1)
+        patch.setattr(Accelerator, "num_processes", property(lambda self: 3))
+        with pytest.raises(ExpertError, match="not supported with 3 processes"):
+            make_trainer(algorithm, tokenizer, tmp_path, model, mgr)
+    assert (mgr.active, mgr.routing) == ("math", None)
+    make_trainer(algorithm, tokenizer, tmp_path, model, mgr)  # single process: accepted
+
+
+_DDP_SCRIPT = """
+import os
+import torch
+from datasets import Dataset
+from trl import GRPOConfig
+from research_rl.models.expert_manager import ExpertError, ExpertManager
+from research_rl.models.tiny import build_char_tokenizer, build_tiny_llama
+from research_rl.trainers.grpo_adapter import ResearchGRPOTrainer
+
+torch.set_num_threads(1)
+tok = build_char_tokenizer()
+model = build_tiny_llama(len(tok), seed=0)
+mgr = ExpertManager(model)
+mgr.attach()
+for name in ("math", "code"):
+    mgr.create_expert(name)
+mgr.set_trainable("math")
+rows = [{"prompt": f"{c}{i}+1=", "expert": e} for i in range(8) for c, e in (("a", "math"), ("b", "code"))]
+args = GRPOConfig(
+    output_dir=os.environ["RR_OUT"], per_device_train_batch_size=4, num_generations=2,
+    gradient_accumulation_steps=2, steps_per_generation=4, max_completion_length=4, max_steps=4,
+    save_strategy="no", report_to=[], use_cpu=True, bf16=False,
+)
+try:
+    trainer = ResearchGRPOTrainer(
+        model=model, reward_funcs=lambda completions, **kw: [0.0] * len(completions), args=args,
+        train_dataset=Dataset.from_list(rows), processing_class=tok, expert_manager=mgr,
+    )
+    trainer.train()
+    print("RANK", os.environ["RANK"], "TRAINED", flush=True)
+except ExpertError as exc:
+    print("RANK", os.environ["RANK"], "REJECTED", exc, flush=True)
+"""
+
+
+@pytest.mark.integration
+def test_two_process_ddp_run_raises_instead_of_hanging(tmp_path):
+    """A real 2-process gloo run (torchrun, CPU): every rank fails fast with the ExpertError.
+
+    Before the check, mixed-expert routing hung forever once a rank's micro-batch held only rows of
+    the frozen expert (no gradient for the trainable expert, so DDP's all-reduce never completed).
+    """
+    script = tmp_path / "ddp_experts.py"
+    script.write_text(textwrap.dedent(_DDP_SCRIPT))
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=os.pathsep.join([str(root), env.get("PYTHONPATH", "")]),
+        HF_HUB_OFFLINE="1",
+        OMP_NUM_THREADS="1",
+        RR_OUT=str(tmp_path / "out"),
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", str(script)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,  # own process group: a hang is killed together with both ranks
+    )
+    try:
+        out, _ = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the regression
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        pytest.fail("2-process run with experts hung (DDP all-reduce deadlock)")
+    for rank in (0, 1):
+        assert f"RANK {rank} REJECTED" in out and "not supported with 2 processes" in out, out[-4000:]
+    assert "TRAINED" not in out
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_constructor_rejects_a_reference_whose_ffn_is_not_the_base_expert(
+    tokenizer, tiny_model_dir, tmp_path, algorithm
+):
+    """beta > 0: TRL reloads the vanilla checkpoint as reference; it must equal the base expert."""
+    model = AutoModelForCausalLM.from_pretrained(tiny_model_dir)
+    mgr = attach_experts(model)
+    perturb(mgr, "base", seed=3)  # the policy's base expert no longer matches the checkpoint on disk
+    with pytest.raises(ExpertError, match="different FFN"):
+        make_trainer(algorithm, tokenizer, tmp_path, model, mgr, beta=0.1)
     assert (mgr.active, mgr.routing) == ("math", None)
 
 
@@ -601,6 +734,66 @@ def test_mixed_experts_route_every_forward_record_and_train_only_their_expert(to
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_custom_expert_column_through_build_run(tokenizer, tmp_path, algorithm):
+    """``expert_column="domain"`` (an adapter algo_kwarg) is read; a decoy ``"expert"`` column is not."""
+    decoy = {"math": "code", "code": "math", None: "code"}
+    rows = [
+        {"prompt": r["prompt"], "domain": r["expert"], "expert": decoy[r["expert"]]} for r in mixed_dataset()
+    ]
+    model, mgr = experts_model(tokenizer)
+    exp = ExperimentConfig(
+        study_id="experts",
+        model=ModelSpec(name_or_path="tiny"),
+        data=DataSpec(name="synthetic"),
+        trainer=TrainerSpec(
+            algorithm=algorithm,
+            args={
+                "per_device_train_batch_size": 2,
+                "num_generations": 2,
+                "gradient_accumulation_steps": 2,
+                "steps_per_generation": 4,
+                "max_completion_length": 6,
+                "max_steps": 4,
+                "save_strategy": "no",
+                **({"beta": 0.0} if algorithm == "rloo" else {}),
+            },
+        ),
+        seed=0,
+        output_dir=str(tmp_path),
+    )
+    run = build_run(
+        exp,
+        train_dataset=Dataset.from_list(rows),
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=digit_fraction,
+        expert_manager=mgr,
+        expert_column="domain",
+        record=False,
+    )
+    assert run.trainer.expert_column == "domain"
+    checker = RoutingChecker(model, mgr, tokenizer)
+    try:
+        run.train()
+    finally:
+        checker.close()
+    assert checker.errors == []
+    buf = run.trainer.trajectory_buffer
+    assert len(buf) == 2
+    seen: set[str] = set()
+    for batch in buf:
+        expected = tuple(
+            EXPERT_OF_CHAR[first_char(tokenizer, ids, mask)]
+            for ids, mask in zip(batch.prompt_ids, batch.prompt_mask)
+        )
+        assert batch.expert_ids == expected
+        seen.update(expected)
+    assert seen == {"math", "code"}
+    assert (mgr.active, mgr.routing) == ("math", None)
+
+
+@pytest.mark.integration
 def test_mixed_experts_with_gradient_checkpointing_route_the_recomputation(tokenizer, tmp_path):
     finals = []
     for gc in (False, True):
@@ -655,7 +848,11 @@ def test_mixed_experts_with_num_iterations_and_evaluation(tokenizer, tmp_path, a
 @pytest.mark.integration
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_rows_of_frozen_experts_only_leave_the_trainable_expert_unchanged(tokenizer, tmp_path, checkpointing):
-    """No row reaches a trainable parameter: the loss has no graph, grads stay None, nothing moves."""
+    """No row reaches a trainable parameter: its grads stay None and nothing moves.
+
+    With checkpointing off the loss has no graph (made a leaf); with it on, HF's input-require-grads
+    hook keeps it attached through frozen parameters only. Both paths must leave the model unchanged.
+    """
     model, mgr = experts_model(tokenizer)
     before = snapshot(model)
     data = Dataset.from_list([{"prompt": f"b{i}+1=", "expert": "code"} for i in range(4)])
