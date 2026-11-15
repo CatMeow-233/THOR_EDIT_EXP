@@ -96,12 +96,17 @@ RL-specific bookkeeping (GRPO/RLOO):
   advantage, so the flag is refused (`ValueError`) with GRPO `beta != 0`, the GRPO entropy bonus,
   the MoE router aux loss, or an `UpdateRule` with `needs_every_step = True` (checked at train
   begin). RLOO `beta != 0` is allowed: TRL folds its KL penalty into the reward, i.e. into the advantage.
+  With an `expert_manager` and a frozen backbone, only rows of experts with trainable parameters
+  count: signal on rows of frozen experts does not keep a window from being skipped (it cannot move
+  a trainable parameter, while the trainable expert's round-off advantages would).
 * **Advantage shaping**: pass `advantage_shapers=[...]` to `build_run` (objects implementing
   `research_rl.trainers.rl_common.AdvantageShaper`, or names registered in
   `ADVANTAGE_SHAPERS`). They rewrite TRL's advantages (`(B,)`, or `(B, T)` for GRPO) before the
   signal flags and the trajectory log; the "no signal" decision then comes from the last shaper's
   `signal`, or from "advantage exactly non-zero" if it returns none. Advantages edited later (e.g.
   by a subclass) are detected per micro-batch and fall back to the exact non-zero test, with a warning.
+  With an `expert_manager`, shapers run under the batch's per-row routing and `output` carries the
+  per-row expert index (`rl_common.EXPERT_KEY`, names in `trainer.expert_vocab`).
   TRL's completions table (`log_completions`) still shows TRL's unshaped advantages; the shaped ones
   are in `trajectory_buffer` and the `rollout/*` metrics. Shapers with `state_dict`/`load_state_dict`
   are checkpointed; other shapers restart from their constructor state on resume.
@@ -149,7 +154,8 @@ after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
 Precision: a parameter *stored* in bf16 (model loaded with `dtype: bfloat16`, no fp32 master copy)
 silently loses every update below ≈ `|w|·2⁻⁸`, because AdamW writes it back with round-to-nearest
 (HF `bf16: true` autocast keeps fp32 parameters and is not affected). `HookedOptimizer` warns about
-this at construction (`optim.precision_check: warn | error | off`). `optim.master_weights: true`
+this at construction (`optim.precision_check: warn | error | off`; with `optim.hooked: false` there is
+no check, so `warn` does nothing and `error` is refused). `optim.master_weights: true`
 keeps an fp32 master of every bf16/fp16 parameter: the inner optimizer (fp32 state) and the
 `transform_update`/`pre_write` rules run on the master, the model receives
 `round_to(master, dtype, optim.write_rounding)` (`nearest`, or unbiased `stochastic`, seeded from the
@@ -157,9 +163,13 @@ experiment seed), `post_step` sees fp32 master displacements, and the masters ar
 optimizer state (exact HF resume). `P2PriorRule` refuses bf16 prior modules without masters
 (`allow_low_precision=True` to override). The record stores `precision` (trainable dtypes, options).
 Writes to the weights from outside the optimizer (`restore_frozen`, `rollback_channels`,
-`model.load_state_dict`, ...) reach the master for every element whose value changed; an element
-rewritten with its current bits keeps its master, so for an exact rollback call
-`optimizer.set_master(...)` or `resync_masters()`.
+`model.load_state_dict`, `p.copy_(...)` under `torch.no_grad()`, `p.data = ...`) reach the master
+for every element whose value changed; an element rewritten with its current bits keeps its master,
+so for an exact rollback call `optimizer.set_master(...)` or `resync_masters()`. In-place writes
+through `param.data` (`p.data.copy_(...)`, `p.data[...] = ...`, `p.data.<op>_()`) are **not**
+detected (they bypass the version counter the detection relies on): the next step silently
+overwrites them from the stale master. Use `p.copy_(...)` under `torch.no_grad()` or
+`optimizer.set_master(p, value)` instead.
 See `research_rl/optim/precision.py` and the `HookedOptimizer` docstring.
 
 ## Parameter-level research tools
@@ -212,8 +222,10 @@ evaluation outputs, environment (package versions, device). `hardware.gpu_metric
 | Code-execution reward | `rewards/code_sandbox.py` | disabled by default; refuses to run without an isolated backend that declares no-network + resource limits; no local executor ships |
 
 Plugins register themselves in `research_rl.core.registry` (`TRAINERS`, `UPDATE_RULES`, `VERIFIERS`,
-`RECURRENT_STATES`, `COMPUTE_CONTROLLERS`, `PARAMETER_PRIORS`, `ENVIRONMENTS`), so a paper's code can
-live in its own package and be selected by name from an experiment config.
+`RECURRENT_STATES`, `COMPUTE_CONTROLLERS`, `PARAMETER_PRIORS`, `ENVIRONMENTS`, `ADVANTAGE_SHAPERS`),
+so a paper's code can live in its own package and be selected by name from an experiment config
+(advantage shapers by name through `build_run(..., advantage_shapers=["name"])`, not through an
+`ExperimentConfig` field).
 
 ## Tests and CI
 

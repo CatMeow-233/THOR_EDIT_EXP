@@ -25,7 +25,8 @@ ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, 
 skipping, per-row expert routing with ``expert_manager=``) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages must be
 ``(B,)`` (the loss is per sequence). ``skip_zero_advantage_steps=True`` is compatible with
 ``beta != 0``: the KL penalty is folded into the reward and hence into the advantage, so a window
-whose advantages are all zero has no KL gradient either. It is refused with the MoE aux loss.
+whose advantages are all zero has no KL gradient either. It is refused with the MoE aux loss and,
+at ``on_train_begin``, with any HookedOptimizer ``UpdateRule`` with ``needs_every_step=True``.
 """
 
 from __future__ import annotations

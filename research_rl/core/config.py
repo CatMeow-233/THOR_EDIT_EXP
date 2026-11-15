@@ -79,7 +79,8 @@ class OptimSpec:
     skip_zero_advantage_steps: bool = False
     # Precision of low-precision (bf16/fp16) trainable parameters, see HookedOptimizer: keep fp32
     # master weights, how the served weights are rounded ("nearest" | "stochastic"), and what to do
-    # when low-precision trainable parameters have no masters ("warn" | "error" | "off").
+    # when low-precision trainable parameters have no masters ("warn" | "error" | "off"; the check is
+    # done by HookedOptimizer, so with hooked=False "warn" does nothing and "error" is refused).
     # Stochastic rounding is seeded from the experiment seed.
     master_weights: bool = False
     write_rounding: str = "nearest"
@@ -100,6 +101,11 @@ class OptimSpec:
             raise ConfigError("optim.write_rounding='stochastic' needs optim.hooked=True")
         if self.master_weights and not self.hooked:
             raise ConfigError("optim.master_weights=True needs optim.hooked=True")
+        if self.precision_check == "error" and not self.hooked:
+            raise ConfigError(
+                "optim.precision_check='error' needs optim.hooked=True: the check is done by HookedOptimizer "
+                "(without it, 'warn' and 'error' do nothing)"
+            )
 
 
 @dataclass

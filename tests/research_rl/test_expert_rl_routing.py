@@ -1081,3 +1081,157 @@ def test_expert_counters_survive_checkpoint_resume(tokenizer, tmp_path):
     for name in latest.expert_ids:
         expected[name] = expected.get(name, 0) + 1
     assert buf.expert_samples == expected
+
+
+# ================================================================================== skip + frozen experts
+def _math_constant_reward(prompts, completion_ids, **kwargs):
+    """'a' (math) prompts: constant 0.9 (mathematically zero advantage, float32 round-off != 0);
+    'b' (code) prompts: reward varying with the completion (real signal)."""
+    return [
+        0.9 if p.startswith("a") else float(len(c)) + float(c[0] % 3) for p, c in zip(prompts, completion_ids)
+    ]
+
+
+def _varied_reward(prompts, completion_ids, **kwargs):
+    return [float(len(c)) + float(c[0] % 3) for c in completion_ids]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scenario", ["frozen_signal_only", "backbone_trainable", "math_signal"])
+def test_skip_decision_ignores_signal_of_rows_that_reach_no_trainable_parameter(
+    tokenizer, tmp_path, scenario
+):
+    """Only rows whose expert has trainable parameters can make a window "have signal".
+
+    "math" is the only trainable expert. Its rows have round-off advantages (no signal), the frozen
+    "code" rows have real signal: every window must be skipped and "math" must stay bit-identical
+    (Adam would otherwise turn the round-off into full learning-rate updates). Controls: with a
+    trainable backbone parameter the code rows reach it (windows are not skipped); with real signal
+    on the math rows the math expert trains.
+    """
+    model, mgr = experts_model(tokenizer)
+    if scenario == "backbone_trainable":
+        model.get_output_embeddings().weight.requires_grad_(True)
+    rows = []
+    for i in range(6):
+        rows.append({"prompt": f"a{i}+1=", "expert": "math"})
+        rows.append({"prompt": f"b{i}+2=", "expert": "code"})
+    trainer = ResearchGRPOTrainer(
+        model=model,
+        reward_funcs=_varied_reward if scenario == "math_signal" else _math_constant_reward,
+        args=rl_config(
+            "grpo",
+            tmp_path,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            gradient_accumulation_steps=2,
+            steps_per_generation=2,
+            max_completion_length=4,
+            max_steps=6,
+        ),
+        train_dataset=Dataset.from_list(rows),
+        processing_class=tokenizer,
+        expert_manager=mgr,
+        skip_zero_advantage_steps=True,
+    )
+    batches: list[tuple[list[str], list[float], list[bool]]] = []
+    original = trainer._generate_and_score_completions
+
+    def recording(inputs):
+        out = original(inputs)
+        names = [trainer.expert_vocab[int(i)] for i in out[EXPERT_KEY]]
+        batches.append((names, out["advantages"].tolist(), out[rl_common.SIGNAL_KEY].tolist()))
+        return out
+
+    trainer._generate_and_score_completions = recording  # type: ignore[method-assign]
+    math_before = [p.detach().clone() for p in mgr.expert_parameters("math")]
+    trainer.train()
+    opt = trainer.hooked_optimizer
+    assert opt is not None and opt.nominal_steps == 6
+    math_unchanged = all(torch.equal(a, b) for a, b in zip(mgr.expert_parameters("math"), math_before))
+    counters = trainer.trajectory_buffer.counters()
+    # one optimizer window per generation batch (steps_per_generation == gradient_accumulation_steps)
+    windows_with_code_signal = [
+        b for b in batches if any(n == "code" and s for n, s in zip(b[0], b[2])) and "math" in b[0]
+    ]
+    assert windows_with_code_signal, "the setup must produce a mixed window with signal on frozen rows"
+    if scenario == "math_signal":
+        assert any(s for b in batches for n, s in zip(b[0], b[2]) if n == "math")
+        assert opt.applied_updates > 0 and not math_unchanged
+        return
+    math_rows = [(a, s) for b in batches for n, a, s in zip(*b) if n == "math"]
+    assert math_rows and not any(s for _, s in math_rows)
+    assert any(a != 0.0 for a, _ in math_rows), "float32 round-off advantages expected on the math rows"
+    if scenario == "frozen_signal_only":
+        assert counters["skipped_windows"] == counters["windows"] == 6
+        assert opt.applied_updates == 0 and opt.skipped_steps == 6
+        assert math_unchanged
+    else:  # backbone_trainable: code rows reach the trainable lm_head, their windows are trained
+        code_signal = [b for b in batches if any(n == "code" and s for n, s in zip(b[0], b[2]))]
+        assert counters["skipped_windows"] == counters["windows"] - len(code_signal) < 6
+        assert opt.applied_updates == len(code_signal)
+
+
+# ================================================================================== shapers + experts
+@pytest.mark.integration
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_advantage_shapers_run_under_the_batch_routing(tokenizer, tmp_path, algorithm):
+    """A shaper that re-scores the batch with the policy sees each row through its own expert."""
+    model, mgr = experts_model(tokenizer)
+    seen: list[dict[str, Any]] = []
+
+    class Rescore(rl_common.AdvantageShaper):
+        name = "rescore"
+
+        def __call__(self, output, trainer):
+            ids = torch.cat([output["prompt_ids"], output["completion_ids"]], dim=1)
+            mask = torch.cat([output["prompt_mask"], output["completion_mask"]], dim=1)
+            keep = output["completion_ids"].shape[1]
+            with torch.no_grad():
+                logps, _, _ = trainer._get_per_token_logps_and_entropies(trainer.model, ids, mask, keep, 2)
+                with trainer.expert_routing(output):  # documented: works on a generation batch
+                    routed, _, _ = trainer._get_per_token_logps_and_entropies(
+                        trainer.model, ids, mask, keep, 2
+                    )
+            m = output["completion_mask"]
+            if "old_per_token_logps" in output:  # GRPO, per token
+                old = output["old_per_token_logps"]
+                logps, routed = logps * m, routed * m
+                old = old * m
+            else:  # RLOO keeps the per-sequence sum of TRL's routed old log-probs
+                old = output["old_logps"]
+                logps, routed = (logps * m).sum(1), (routed * m).sum(1)
+            names = [trainer.expert_vocab[int(i)] for i in output[EXPERT_KEY]]
+            seen.append(
+                {
+                    "mixed": len(set(names)) > 1,
+                    "diff": float((logps - old).abs().max()),
+                    "routed_diff": float((routed - old).abs().max()),
+                    "routing": mgr.routing,
+                }
+            )
+            return rl_common.ShapedAdvantages(
+                output["advantages"].clone(), signal=trainer.trl_advantage_signal
+            )
+
+    trainer = make_trainer(
+        algorithm, tokenizer, tmp_path, model, mgr, trainer_kwargs={"advantage_shapers": [Rescore()]}
+    )
+    trainer.train()
+    assert any(s["mixed"] for s in seen)
+    for s in seen:
+        assert s["diff"] < 1e-5 and s["routed_diff"] < 1e-5, s
+        if s["mixed"]:
+            assert s["routing"] is not None
+    assert (mgr.active, mgr.routing) == ("math", None) and trainer._rr_rows is None
+
+    class Failing(rl_common.AdvantageShaper):
+        def __call__(self, output, trainer):
+            raise RuntimeError("shaper failed")
+
+    trainer = make_trainer(
+        algorithm, tokenizer, tmp_path, model, mgr, trainer_kwargs={"advantage_shapers": [Failing()]}
+    )
+    with pytest.raises(RuntimeError, match="shaper failed"):
+        trainer.train()
+    assert (mgr.active, mgr.routing) == ("math", None) and trainer._rr_rows is None

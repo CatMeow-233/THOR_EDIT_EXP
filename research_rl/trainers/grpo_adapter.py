@@ -25,7 +25,8 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
 ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, zero-advantage
 skipping, per-row expert routing with ``expert_manager=``) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages may be
 ``(B,)`` or per token ``(B, T)``. ``skip_zero_advantage_steps=True`` is refused with ``beta != 0``
-(the KL term is a separate loss term), with the entropy bonus and with the MoE aux loss.
+(the KL term is a separate loss term), with the entropy bonus, with the MoE aux loss and, at
+``on_train_begin``, with any HookedOptimizer ``UpdateRule`` with ``needs_every_step=True``.
 """
 
 from __future__ import annotations

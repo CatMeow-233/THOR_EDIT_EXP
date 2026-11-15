@@ -5,7 +5,12 @@ into a TRL trainer class (``GRPOTrainer`` / ``RLOOTrainer``)::
 
     class ResearchGRPOTrainer(RLRolloutMixin, ResearchTrainerMixin, GRPOTrainer): ...
 
-It changes nothing in how TRL generates, scores or optimises. It adds:
+With its defaults (no ``advantage_shapers``, no ``expert_manager``,
+``skip_zero_advantage_steps=False``) it changes nothing in how TRL generates, scores or optimises:
+it only records. Shapers rewrite the advantages TRL's loss uses, an ``expert_manager`` reroutes
+every policy forward (generation, old log-probs, loss and backward) through per-row experts, and
+step skipping turns optimizer steps into no-ops and refuses some TRL configurations (all below).
+It adds:
 
 * **Policy-version stamps.** ``_generate_and_score_completions`` (TRL's, called via ``super``)
   is wrapped. The returned generation batch gets the number of *applied* parameter updates
@@ -37,6 +42,8 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   ``_generate_and_score_completions`` (train and eval batches), before the signal flags are
   computed and the batch is logged, and ``output["advantages"]`` is replaced by the last result
   (shape, dtype, device and finiteness are checked; see :meth:`RLRolloutMixin._rr_check_advantages`).
+  With an ``expert_manager`` they run under the batch's per-row routing and ``output`` already
+  carries :data:`EXPERT_KEY`, so a shaper's policy forwards see each row through its own expert.
   Signal with shapers: the last shaper's ``signal`` (AND completion mask non-empty) if it returns
   one, else "final advantage exactly non-zero" — conservative, a sample with any non-zero
   advantage is never treated as signal-free. A shaper that keeps TRL's zeros (e.g. a positive
@@ -57,7 +64,12 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   slices it into micro-batches. So the decision cannot be made at generation time. It is made per
   optimizer window instead. The flags travel with the samples through TRL's shuffle and split.
   ``_prepare_inputs`` ORs them over the micro-batches of the current gradient-accumulation window,
-  i.e. exactly the samples that reach ``compute_loss``. At ``on_pre_optimizer_step`` (after HF
+  i.e. exactly the samples that reach ``compute_loss``. With an ``expert_manager``, only rows that
+  can reach a trainable parameter count: if no parameter of the shared backbone requires grad, a
+  row whose expert has no trainable parameter (a frozen expert) is ignored, since its signal cannot
+  move any parameter while the round-off advantages of the trainable expert's rows in the same
+  window would (``rollout/window_has_signal`` and the window counters use the same rule; the
+  per-sample flags and ``rollout/*`` batch statistics do not). At ``on_pre_optimizer_step`` (after HF
   clipping, before ``optimizer.step()``), a window with no signal on any process leads to
   ``HookedOptimizer.request_skip()``. The step still counts as nominal, so the LR schedule
   advances and ``global_step`` increments, but parameters and optimizer state stay bit-identical.
@@ -141,8 +153,8 @@ Multi-process runs with an ``expert_manager`` (DDP / DeepSpeed / FSDP, ``num_pro
 rejected at construction: ranks train on different rows, a rank whose micro-batch has no row of
 the trainable expert produces no gradient for it, and DDP's gradient all-reduce on the other ranks
 then waits forever (verified with a 2-process gloo run, see the tests). Multi-process training of a
-*single* expert works without the trainer integration: ``activate`` / ``set_trainable`` the expert
-and do not pass ``expert_manager``.
+*single* expert is meant to go without the trainer integration (``activate`` / ``set_trainable``
+the expert and do not pass ``expert_manager``); NOT_TESTED: no test covers it.
 
 Not tested here (NOT_TESTED): multi-process / DeepSpeed / FSDP runs without experts. The skip
 decision is all-gathered across processes, but HookedOptimizer itself is not DeepSpeed-aware. vLLM
@@ -215,7 +227,11 @@ class AdvantageShaper(abc.ABC):
 
     ``output`` is the local generation batch dict TRL's ``_generate_and_score_completions``
     returned (``prompt_ids``, ``completion_ids``, ``completion_mask``, ``advantages`` (already
-    replaced by earlier shapers), ...); treat it as read-only. ``trainer`` is the research trainer:
+    replaced by earlier shapers), ...); treat it as read-only. With an ``expert_manager`` it also
+    carries :data:`EXPERT_KEY` (row ``i``'s expert is ``trainer.expert_vocab[output[EXPERT_KEY][i]]``)
+    and the shaper runs under the batch's per-row routing, so policy forwards on the whole batch
+    (e.g. ``trainer._get_per_token_logps_and_entropies``) route every row through its expert;
+    ``trainer.expert_routing(output)`` selects the same routing explicitly. ``trainer`` is the research trainer:
     ``trainer.model.training`` tells train from eval batches, :attr:`RLRolloutMixin.trl_advantage_signal`
     holds the reward-based flags of TRL's own advantages. Register reusable shapers in
     :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` to refer to them by name.
@@ -251,7 +267,8 @@ def _reject_multi_process(num_processes: int) -> None:
             "ranks train on different rows, and a rank whose micro-batch has no row of the trainable expert "
             "produces no gradient for it, so the gradient all-reduce of the other ranks never completes "
             "(a hang, not an error). For multi-process training of a single expert, select it with "
-            "ExpertManager.activate()/set_trainable() and do not pass expert_manager to the trainer."
+            "ExpertManager.activate()/set_trainable() and do not pass expert_manager to the trainer "
+            "(that path is not covered by ResearchRL's tests)."
         )
 
 
@@ -808,10 +825,17 @@ class RLRolloutMixin:
         completion_mask = output["completion_mask"]
         # Always evaluated, also with shapers: it consumes per-generation captures (RLOO log-probs).
         signal = self._rr_local_signal(mode, output["advantages"], completion_mask)
+        if rows is not None:
+            # (B,) like SIGNAL_KEY: permuted by TRL's shuffle_sequence_dict, sliced by split_tensor_dict.
+            # Stamped before the shapers so that they (and expert_routing(output)) know each row's expert;
+            # appended after TRL's keys: TRL sizes a batch dict from its first value.
+            output[EXPERT_KEY] = self._rr_expert_index(rows, signal.device)
         if self.advantage_shapers:
             self.trl_advantage_signal = signal
             try:
-                shaper_signal = self._rr_apply_shapers(output)
+                # Under the batch's routing: a shaper's policy forwards see each row through its expert.
+                with self._rr_rows_scope(rows):
+                    shaper_signal = self._rr_apply_shapers(output)
             finally:
                 self.trl_advantage_signal = None
             if shaper_signal is not None:
@@ -844,9 +868,6 @@ class RLRolloutMixin:
         # Appended last: TRL sizes a batch dict from its first value.
         output[SIGNAL_KEY] = signal
         output[ADVANTAGES_STAMP_KEY] = advantages.detach().clone()
-        if rows is not None:
-            # (B,) like SIGNAL_KEY: permuted by TRL's shuffle_sequence_dict, sliced by split_tensor_dict.
-            output[EXPERT_KEY] = self._rr_expert_index(rows, signal.device)
         stamp_policy_version(output, version)
         return output
 
@@ -990,7 +1011,8 @@ class RLRolloutMixin:
 
     @contextlib.contextmanager
     def expert_routing(self, batch: Mapping[str, Any]) -> Iterator[None]:
-        """Select the experts of ``batch``'s rows (a generation batch or micro-batch of this trainer).
+        """Select the experts of ``batch``'s rows (a generation batch or micro-batch of this trainer,
+        including the ``output`` an :class:`AdvantageShaper` receives).
 
         For forwards / backwards outside ``training_step``, e.g. a manual ``compute_loss`` followed
         by ``backward``. The previous selection is restored on exit. No-op without a manager.
@@ -1027,12 +1049,50 @@ class RLRolloutMixin:
         if self.model.training and isinstance(inputs, Mapping) and "advantages" in inputs:
             self._rr_window_microbatches += 1
             flags = self._rr_microbatch_flags(inputs)
+            if not self._rr_window_signal and self.expert_manager is not None and EXPERT_KEY in inputs:
+                flags = self._rr_reachable_flags(flags, inputs[EXPERT_KEY])
             if not self._rr_window_signal and bool(flags.any()):
                 self._rr_window_signal = True
             lag = policy_lag(self.policy_version, inputs)
             if lag is not None:
                 self._rr_log("train", "rollout/policy_lag", lag)
         return inputs
+
+    def _rr_trainable_experts(self) -> set[str] | None:
+        """Experts whose rows reach a trainable parameter (``requires_grad``), read live.
+
+        ``None``: every row does (some parameter outside the experts, i.e. of the shared backbone,
+        is trainable). Otherwise the experts with at least one trainable parameter; rows of the
+        other experts pass through frozen parameters only and produce no gradient.
+        """
+        manager = self.expert_manager
+        assert manager is not None
+        params = dict(manager.model.named_parameters())
+        if any(params[n].requires_grad for n in manager.backbone_parameter_names()):
+            return None
+        return {
+            name
+            for name in manager.expert_names
+            if any(params[n].requires_grad for n in manager.expert_parameter_names(name))
+        }
+
+    def _rr_reachable_flags(self, flags: torch.Tensor, expert_index: torch.Tensor) -> torch.Tensor:
+        """Per-row signal flags restricted to rows whose expert has trainable parameters.
+
+        A frozen expert's row cannot move a trainable parameter, so its signal must not keep the
+        window's (round-off) gradient of the trainable expert's rows from being skipped.
+        """
+        trainable = self._rr_trainable_experts()
+        n = int(expert_index.shape[0])
+        per_row = flags.reshape(n, -1).any(dim=1)
+        if trainable is None:
+            return per_row
+        reach = torch.tensor(
+            [self.expert_vocab[int(i)] in trainable for i in expert_index.reshape(-1).tolist()],
+            dtype=torch.bool,
+            device=per_row.device,
+        )
+        return per_row & reach
 
     # ------------------------------------------------------------------ window decision
     def _rr_end_of_window(self) -> None:

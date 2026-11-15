@@ -62,7 +62,9 @@ class ResearchTrainerMixin:
 
     ``master_weights``, ``write_rounding`` and ``precision_check`` are forwarded to
     :class:`HookedOptimizer` (see its docstring; ``rounding_seed`` is ``TrainingArguments.seed``).
-    Setting ``master_weights=True`` or stochastic rounding implies the hooked optimizer.
+    Setting ``master_weights=True`` or stochastic rounding implies the hooked optimizer. The
+    precision check is done by :class:`HookedOptimizer`: without it, ``precision_check="warn"``
+    does nothing and ``precision_check="error"`` is refused (``ValueError``).
     """
 
     def __init__(
@@ -92,6 +94,11 @@ class ResearchTrainerMixin:
             or bool(master_weights)
             or write_rounding != "nearest"
         )
+        if precision_check == "error" and not self._rr_hooked:
+            raise ValueError(
+                "precision_check='error' needs the HookedOptimizer (hooked_optimizer=True): the low-precision "
+                "check is done by HookedOptimizer, without it the request would be silently ignored"
+            )
         self.research_components: dict[str, StatefulComponent] = dict(components or {})
         if clip_in_wrapper is not None:
             training_args = kwargs.get("args")

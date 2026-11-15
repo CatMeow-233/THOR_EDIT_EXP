@@ -1140,6 +1140,11 @@ def test_optim_spec_precision_fields_and_back_compat():
         OptimSpec(hooked=False, write_rounding="stochastic")
     with pytest.raises(ConfigError, match="master_weights must be a bool"):
         OptimSpec(master_weights="yes")  # type: ignore[arg-type]
+    # the check lives in HookedOptimizer: an 'error' request without it would be a silent no-op
+    with pytest.raises(ConfigError, match=r"precision_check='error' needs optim\.hooked=True"):
+        OptimSpec(hooked=False, precision_check="error")
+    assert OptimSpec(hooked=False).precision_check == "warn"  # the default stays valid unhooked
+    OptimSpec(hooked=False, precision_check="off")
 
 
 # ------------------------------------------------------------------------------- TRL / HF Trainer
@@ -1266,6 +1271,18 @@ def test_precision_options_imply_the_hooked_optimizer(tokenizer, tmp_path, preci
     assert hooked is not None
     assert hooked.master_weights == precision["master_weights"]
     assert hooked.write_rounding == precision.get("write_rounding", "nearest")
+
+
+def test_precision_check_error_without_the_hooked_optimizer_is_refused(tokenizer, tmp_path):
+    with pytest.raises(ValueError, match="precision_check='error' needs the HookedOptimizer"):
+        _sft_trainer(
+            tokenizer,
+            tmp_path / "unhooked",
+            max_steps=1,
+            rounding="nearest",
+            master_weights=False,
+            hooked_optimizer=False,
+        )
 
 
 def test_precision_info_counts_trainable_parameters_only():

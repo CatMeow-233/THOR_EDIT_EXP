@@ -657,7 +657,7 @@ Shared machinery of the RL adapters (GRPO, RLOO).
 - **class `AdvantageShaper`** — Rewrites the advantages of a generation batch (turn/step credit, sign rebalancing, per-token KL rewards, ...). See the module docstring for where it runs and how its ``signal`` is used.
 - **class `RLRolloutMixin`** — Policy-version stamps, trajectory log, advantage shaping, zero-advantage skipping and expert routing for TRL GRPO/RLOO trainers.
   - `compute_loss(self, model: 'Any', inputs: 'Any', *args: 'Any', **kwargs: 'Any') -> 'Any'` — TRL's loss with the micro-batch's rows routed through their experts (from :data:`EXPERT_KEY`).
-  - `expert_routing(self, batch: 'Mapping[str, Any]') -> 'Iterator[None]'` — Select the experts of ``batch``'s rows (a generation batch or micro-batch of this trainer).
+  - `expert_routing(self, batch: 'Mapping[str, Any]') -> 'Iterator[None]'` — Select the experts of ``batch``'s rows (a generation batch or micro-batch of this trainer, including the ``output`` an :class:`AdvantageShaper` receives).
   - `policy_version` — Applied parameter updates so far (see :func:`research_rl.rollout.policy_version_of`).
   - `training_step(self, model: 'Any', inputs: 'Any', *args: 'Any', **kwargs: 'Any') -> 'Any'` — Keeps the micro-batch's expert selection active through ``compute_loss`` *and* backward.
 - **class `RLTrainerAdapter`** — Base for RL adapters: ``trainer_class()`` returns :attr:`research_trainer_cls`.

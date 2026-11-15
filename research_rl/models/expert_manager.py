@@ -53,7 +53,8 @@ single-expert training with :meth:`ExpertManager.activate`. The KL reference mod
 ``beta > 0`` is the vanilla checkpoint, i.e. the ``"base"`` FFN for every row. vLLM generation and
 PEFT are rejected (vLLM would serve the vanilla weights only), and so are multi-process runs (a DDP
 rank without rows of the trainable expert would leave the gradient all-reduce waiting forever;
-train a single expert across processes with ``activate`` and no ``expert_manager`` instead).
+train a single expert across processes with ``activate`` and no ``expert_manager`` instead;
+NOT_TESTED: no test covers that path).
 
 Limitations: the routing assumes the FFN input has the sample on dim 0 (true for dense HF decoder
 models; beam search / ``num_return_sequences`` change the batch and are rejected).
