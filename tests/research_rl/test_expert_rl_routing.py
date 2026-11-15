@@ -478,8 +478,11 @@ def test_multi_process_runs_are_rejected_at_construction(tokenizer, tmp_path, mo
 
 
 _DDP_SCRIPT = """
+import faulthandler
 import os
 import torch
+
+faulthandler.dump_traceback_later(90, exit=True)  # a deadlocked rank ends itself (and so the run)
 from datasets import Dataset
 from trl import GRPOConfig
 from research_rl.models.expert_manager import ExpertError, ExpertManager
@@ -536,14 +539,17 @@ def test_two_process_ddp_run_raises_instead_of_hanging(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        start_new_session=True,  # own process group: a hang is killed together with both ranks
     )
     try:
-        out, _ = proc.communicate(timeout=120)
-    except subprocess.TimeoutExpired:  # pragma: no cover - the regression
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+        out, _ = proc.communicate(timeout=240)
+    except subprocess.TimeoutExpired:  # pragma: no cover - backstop; the ranks normally end themselves
+        proc.send_signal(signal.SIGTERM)  # torchrun tears its workers down on SIGTERM
+        try:
+            proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         pytest.fail("2-process run with experts hung (DDP all-reduce deadlock)")
+    assert "Timeout (0:01:30)!" not in out, "a rank hung (DDP all-reduce deadlock):\n" + out[-4000:]
     for rank in (0, 1):
         assert f"RANK {rank} REJECTED" in out and "not supported with 2 processes" in out, out[-4000:]
     assert "TRAINED" not in out
