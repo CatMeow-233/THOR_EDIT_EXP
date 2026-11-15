@@ -272,9 +272,9 @@ class StateStore:
     ``store.scatter(ids, state)``; or simply ``store.step(ids, inputs)``.
 
     ``dtype`` is the requested state dtype passed to ``module.init``; the module may store keys at other
-    precisions (e.g. :class:`FastSlowMemory` keeps ``slow`` in fp32 for a bf16 store). ``gather`` casts
-    each key to the dtype of a fresh row; ``scatter``, ``state_dict`` and ``load_state_dict`` keep each
-    stored key's dtype unchanged.
+    precisions (e.g. :class:`FastSlowMemory` keeps ``slow`` in fp32 for a bf16 store). ``gather``
+    concatenates each key with type promotion (it never lowers a stored row's precision); ``scatter``,
+    ``state_dict`` and ``load_state_dict`` keep each stored key's dtype unchanged.
     """
 
     def __init__(
@@ -318,12 +318,14 @@ class StateStore:
         keys = self._keys(ids)
         if not keys:
             raise ValueError("empty batch")
-        fresh = self.module.init(1, self.device, self.dtype)
-        rows = [self._states.get(k, fresh) for k in keys]
+        rows = [
+            self._states[k] if k in self._states else self.module.init(1, self.device, self.dtype)
+            for k in keys
+        ]
         self._checked_out = keys
-        # every key is batched in the module's per-key dtype (that of ``fresh``, e.g. fast bf16 / slow
-        # fp32), so rows stored at another precision (older checkpoints) cannot change the batch layout
-        return {name: torch.cat([r[name].to(t.dtype) for r in rows], dim=0) for name, t in fresh.items()}
+        # torch.cat type-promotes per key, so rows of different precision (e.g. an all-bf16 row from an
+        # older checkpoint next to a fresh fp32-slow row) are batched without lowering any row's precision
+        return {name: torch.cat([r[name] for r in rows], dim=0) for name in rows[0]}
 
     def scatter(self, ids: Sequence[Hashable], state: State) -> None:
         """Store row i of ``state`` under ``ids[i]``; ids must equal those of the last ``gather``."""

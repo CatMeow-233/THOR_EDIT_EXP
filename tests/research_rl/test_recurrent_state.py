@@ -277,12 +277,22 @@ def test_mixed_dtype_state_store_round_trip_and_reset(tmp_path):
     st = store.gather(["new", "x"])
     assert (st["fast"].dtype, st["slow"].dtype) == (torch.bfloat16, torch.float32)
     store.release()
-    # rows stored at another precision (e.g. an older all-bf16 checkpoint) are cast to the module layout
+    # rows stored at another precision (e.g. an older all-bf16 checkpoint) are type-promoted, and the
+    # first update gives an all-bf16 row fp32 slow storage
     store._states["str:old"] = {k: v.to(torch.bfloat16) if k == "slow" else v for k, v in row.items()}
     st = store.gather(["old", "x"])
     assert st["slow"].dtype == torch.float32
     store.release()
+    store.step(["old"], xs[0, :1])
+    assert store.get("old")["slow"].dtype == torch.float32
     del store._states["str:old"]
+    # gather never lowers a stored row's precision (float64 row in a bf16 store stays float64)
+    wide = StateStore(mem, dtype=torch.bfloat16)
+    st = wide.gather(["w"])
+    wide.scatter(["w"], {k: v.double() if v.is_floating_point() else v for k, v in st.items()})
+    st = wide.gather(["w", "fresh"])
+    assert (st["fast"].dtype, st["slow"].dtype) == (torch.float64, torch.float64)
+    wide.release()
 
     save_components(tmp_path, {"memory": store})
     restored_mem = FastSlowMemory(D, 0.1, 0.1, 2, slow_dtype=None)
