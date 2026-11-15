@@ -687,6 +687,18 @@ def test_repo_write_tools_reach_the_masters_and_temporary_edits_keep_them(tokeni
     prior.register("t", TaskVector({n: torch.zeros(reference[n].shape) for n in ffn}))
     check_restored(lambda: prior.apply_to(model, [0.0]), everything)
 
+    # ablate_channels is a detected write too: the next step keeps the ablated slices at zero.
+    train(2)
+    ablation = ChannelSelection({0: [2], 1: [3]})
+    ablate_channels(model, ablation)
+    with pytest.warns(UserWarning, match="modified outside the optimizer"):
+        zero_update_step(model, opt)
+    for layer, chan in ((0, 2), (1, 3)):
+        mlp = model.model.layers[layer].mlp
+        for t in (mlp.gate_proj.weight[chan], mlp.up_proj.weight[chan], mlp.down_proj.weight[:, chan]):
+            assert torch.equal(t.detach(), torch.zeros_like(t))
+        assert torch.equal(opt.master_of(mlp.up_proj.weight)[chan], torch.zeros(mlp.up_proj.weight.shape[1]))
+
     # A temporary edit undone bit-for-bit before the next step leaves the masters untouched.
     train(2)
     masters = {n: opt.master_of(p).clone() for n, p in named.items()}
@@ -728,19 +740,40 @@ def test_stochastic_checkpoint_loaded_with_nearest_rounding_detects_only_real_wr
     masters = sd["research_rl"]["precision"]["masters"]
     w_index = 0  # flat index of model[0].weight
     assert not torch.equal(model[0].weight.detach(), masters[w_index].bfloat16())  # not vacuous
-    resumed, opt2, _ = _mlp_master("nearest")
+
+    class Watch(
+        UpdateRule
+    ):  # tracks every parameter, changes nothing: served bits of unchanged masters are kept
+        name = "watch"
+
+        def tracks(self, name, param):
+            return True
+
+    resumed, _, _ = _mlp_master("nearest")
+    opt2 = HookedOptimizer(
+        torch.optim.AdamW(resumed.parameters(), lr=1e-4, weight_decay=0.0),
+        resumed.named_parameters(),
+        [Watch()],
+        master_weights=True,
+    )
     resumed.load_state_dict(weights)
     with pytest.warns(UserWarning, match="write_rounding"):
         opt2.load_state_dict(sd)
     w = resumed[0].weight
-    with torch.no_grad():
-        w[0, 0] = 7.0  # one real external write
-    with pytest.warns(UserWarning, match="1 elements"):
-        opt2.state_dict()
-    assert opt2.master_resyncs == 1
+    served = w.detach().clone()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        zero_update_step(resumed, opt2)  # masters unchanged -> the stochastic served bits are kept
+    assert torch.equal(w.detach(), served) and opt2.master_resyncs == 0
     expected = masters[w_index].clone()
-    expected[0, 0] = 7.0
-    assert torch.equal(opt2.master_of(w), expected)
+    for count, (i, j) in enumerate([(0, 0), (3, 5)], start=1):
+        with torch.no_grad():
+            w[i, j] = 7.0  # one real external write
+        with pytest.warns(UserWarning, match="1 elements"):
+            opt2.state_dict()
+        assert opt2.master_resyncs == count
+        expected[i, j] = 7.0
+        assert torch.equal(opt2.master_of(w), expected)
 
 
 def test_has_master_only_for_optimised_parameters():
