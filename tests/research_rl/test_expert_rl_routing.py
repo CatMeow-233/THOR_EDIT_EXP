@@ -604,6 +604,40 @@ def test_mixed_experts_with_gradient_checkpointing_route_the_recomputation(token
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_mixed_experts_with_num_iterations_and_evaluation(tokenizer, tmp_path, algorithm):
+    """Re-used generation batches (num_iterations=2) and the eval loop route every row as well."""
+    model, mgr = experts_model(tokenizer)
+    trainer = TRAINERS[algorithm](
+        model=model,
+        reward_funcs=digit_fraction,
+        args=rl_config(
+            algorithm,
+            tmp_path,
+            num_iterations=2,
+            eval_strategy="steps",
+            eval_steps=2,
+            per_device_eval_batch_size=4,
+        ),
+        train_dataset=mixed_dataset(),
+        eval_dataset=mixed_dataset(2),
+        processing_class=tokenizer,
+        expert_manager=mgr,
+    )
+    checker = RoutingChecker(model, mgr, tokenizer)
+    try:
+        trainer.train()
+        metrics = trainer.evaluate()
+    finally:
+        checker.close()
+    assert checker.errors == []
+    assert ("prefill", 4, False) in checker.events and ("logp", 4, False) in checker.events  # eval batches
+    assert "eval_rollout/expert_frac/code" in metrics
+    assert (mgr.active, mgr.routing) == ("math", None)
+    mgr.assert_backbone_unchanged()
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_rows_of_frozen_experts_only_leave_the_trainable_expert_unchanged(tokenizer, tmp_path, checkpointing):
     """No row reaches a trainable parameter: the loss has no graph, grads stay None, nothing moves."""
