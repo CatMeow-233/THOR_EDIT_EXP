@@ -65,7 +65,9 @@ It adds:
   optimizer window instead. The flags travel with the samples through TRL's shuffle and split.
   ``_prepare_inputs`` ORs them over the micro-batches of the current gradient-accumulation window,
   i.e. exactly the samples that reach ``compute_loss``. With an ``expert_manager``, only rows that
-  can reach a trainable parameter count: if no parameter of the shared backbone requires grad, a
+  can reach a trainable parameter count: if no parameter outside the experts requires grad (any
+  parameter of the trainer's model, including ones outside ``manager.model`` such as an untied
+  ``lm_head`` when the manager is attached to the inner decoder, or of the optimizer), a
   row whose expert has no trainable parameter (a frozen expert) is ignored, since its signal cannot
   move any parameter while the round-off advantages of the trainable expert's rows in the same
   window would (``rollout/window_has_signal`` and the window counters use the same rule; the
@@ -407,9 +409,11 @@ class RLRolloutMixin:
     generation batches kept in :attr:`trajectory_buffer`), ``advantage_shapers`` (a sequence of
     :class:`AdvantageShaper` objects or :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` names,
     applied in order), ``expert_manager`` (an attached
-    :class:`~research_rl.models.expert_manager.ExpertManager` of the model passed as ``model``;
-    ``None``, the default, changes nothing) and ``expert_column`` (the dataset column naming each
-    row's expert, default ``"expert"``). See the module docstring.
+    :class:`~research_rl.models.expert_manager.ExpertManager` of the model passed as ``model``,
+    or of a submodule of it; the manager's freezing then covers only ``manager.model``, so e.g. an
+    untied ``lm_head`` outside it stays trainable; ``None``, the default, changes nothing) and
+    ``expert_column`` (the dataset column naming each row's expert, default ``"expert"``). See the
+    module docstring.
     """
 
     # Accepted ``advantages.ndim`` of the trainer's loss (RLOO: per-sequence only; GRPO adds (B, T)).
@@ -1064,19 +1068,39 @@ class RLRolloutMixin:
     def _rr_trainable_experts(self) -> set[str] | None:
         """Experts whose rows reach a trainable parameter (``requires_grad``), read live.
 
-        ``None``: every row does (some parameter outside the experts, i.e. of the shared backbone,
-        is trainable). Otherwise the experts with at least one trainable parameter; rows of the
-        other experts pass through frozen parameters only and produce no gradient.
+        ``None``: every row does (some parameter outside the experts is trainable: of the trainer's
+        model, also outside ``manager.model`` when the manager is attached to a submodule, e.g. an
+        untied ``lm_head``, or held by the optimizer). Otherwise the experts with at least one
+        trainable parameter; rows of the other experts pass through frozen parameters only and
+        produce no gradient. Parameters are matched by identity, not by name.
         """
         manager = self.expert_manager
         assert manager is not None
-        params = dict(manager.model.named_parameters())
-        if any(params[n].requires_grad for n in manager.backbone_parameter_names()):
-            return None
+        ffns = list(manager.ffn_modules().values())
+        expert_roots = {id(expert) for ffn in ffns for expert in ffn.experts.values()}
+        # every parameter that belongs to a module outside the experts' subtrees (shared ones too)
+        stack: list[torch.nn.Module] = [self.model]
+        seen: set[int] = set()
+        while stack:
+            module = stack.pop()
+            if id(module) in seen or id(module) in expert_roots:
+                continue
+            seen.add(id(module))
+            if any(p.requires_grad for p in module.parameters(recurse=False)):
+                return None
+            stack.extend(module.children())
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:  # trainable parameters the optimizer steps outside the model
+            expert_ids = {id(p) for ffn in ffns for p in ffn.experts.parameters()}
+            for group in getattr(optimizer, "param_groups", ()):
+                if any(p.requires_grad and id(p) not in expert_ids for p in group.get("params", ())):
+                    return None
         return {
             name
             for name in manager.expert_names
-            if any(params[n].requires_grad for n in manager.expert_parameter_names(name))
+            if any(
+                p.requires_grad for ffn in ffns if name in ffn.experts for p in ffn.experts[name].parameters()
+            )
         }
 
     def _rr_reachable_flags(self, flags: torch.Tensor, expert_index: torch.Tensor) -> torch.Tensor:

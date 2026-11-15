@@ -204,7 +204,9 @@ class TrajectoryBuffer:
     """Bounded log of recent rollout batches plus running counters (the counters are checkpointed).
 
     Also counts optimizer *windows* (one gradient-accumulation window = one nominal optimizer step):
-    how many had no non-zero advantage in any micro-batch and how many of those were skipped.
+    how many had no learning signal in any micro-batch (the trainer's per-sample signal flags; with
+    an expert manager only rows that reach a trainable parameter count, see
+    :mod:`research_rl.trainers.rl_common`) and how many of those were skipped.
     """
 
     def __init__(self, capacity: int = 16) -> None:
@@ -214,7 +216,7 @@ class TrajectoryBuffer:
         self._batches: deque[RolloutBatch] = deque(maxlen=self.capacity)
         self.total_batches = 0
         self.total_samples = 0
-        self.zero_signal_batches = 0  # generation batches whose advantages were all zero
+        self.zero_signal_batches = 0  # generation batches without any sample with learning signal
         self.windows = 0
         self.zero_signal_windows = 0
         self.skipped_windows = 0

@@ -90,17 +90,20 @@ RL-specific bookkeeping (GRPO/RLOO):
 * **Policy version** = number of parameter updates actually applied; stamped on every rollout batch
   (`rollout/policy_version`, `rollout/policy_lag` in the logs).
 * **Zero-advantage windows**: with `optim.skip_zero_advantage_steps: true`, an optimizer step whose
-  whole gradient-accumulation window had only zero advantages is skipped exactly (no weight decay,
-  no Adam state change). `record.json` keeps `nominal_optimizer_steps`, `applied_updates` and
-  `skipped_steps` separately. A skip would also drop gradient that does not come from the
-  advantage, so the flag is refused (`ValueError`) with GRPO `beta != 0`, the GRPO entropy bonus,
-  the MoE router aux loss, or an `UpdateRule` with `needs_every_step = True` (checked at train
-  begin). RLOO `beta != 0` is allowed: TRL folds its KL penalty into the reward, i.e. into the advantage.
-  With an `expert_manager` and a frozen backbone, only rows of experts with trainable parameters
-  count: signal on rows of frozen experts does not keep a window from being skipped (it cannot move
-  a trainable parameter, while the trainable expert's round-off advantages would). The skip is
-  all-or-nothing per window: with a trainable backbone, a window with signal on some rows still
-  updates from the round-off advantages of the others (no per-parameter-group skip).
+  whole gradient-accumulation window had no learning signal (zero advantages; see the expert rule
+  below) is skipped exactly (no weight decay, no Adam state change). `record.json` keeps
+  `nominal_optimizer_steps`, `applied_updates` and `skipped_steps` separately. A skip would also
+  drop gradient that does not come from the advantage, so the flag is refused (`ValueError`) with
+  GRPO `beta != 0`, the GRPO entropy bonus, the MoE router aux loss, or an `UpdateRule` with
+  `needs_every_step = True` (checked at train begin). RLOO `beta != 0` is allowed: TRL folds its KL
+  penalty into the reward, i.e. into the advantage.
+  With an `expert_manager` and no trainable parameter outside the experts (anywhere in the
+  trainer's model, also outside `manager.model`, e.g. an untied `lm_head` when the manager is
+  attached to the inner decoder: the manager freezes only its own model), only rows of experts with
+  trainable parameters count: signal on rows of frozen experts does not keep a window from being
+  skipped (it cannot move a trainable parameter, while the trainable expert's round-off advantages
+  would). The skip is all-or-nothing per window: with a trainable backbone, a window with signal on
+  some rows still updates from the round-off advantages of the others (no per-parameter-group skip).
 * **Advantage shaping**: pass `advantage_shapers=[...]` to `build_run` (objects implementing
   `research_rl.trainers.rl_common.AdvantageShaper`, or names registered in
   `ADVANTAGE_SHAPERS`). They rewrite TRL's advantages (`(B,)`, or `(B, T)` for GRPO) before the

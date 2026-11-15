@@ -1104,7 +1104,9 @@ def _varied_reward(prompts, completion_ids, **kwargs):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("scenario", ["frozen_signal_only", "backbone_trainable", "math_signal"])
+@pytest.mark.parametrize(
+    "scenario", ["frozen_signal_only", "backbone_trainable", "manager_on_inner_model", "math_signal"]
+)
 def test_skip_decision_ignores_signal_of_rows_that_reach_no_trainable_parameter(
     tokenizer, tmp_path, scenario
 ):
@@ -1113,12 +1115,22 @@ def test_skip_decision_ignores_signal_of_rows_that_reach_no_trainable_parameter(
     "math" is the only trainable expert. Its rows have round-off advantages (no signal), the frozen
     "code" rows have real signal: every window must be skipped and "math" must stay bit-identical
     (Adam would otherwise turn the round-off into full learning-rate updates). Controls: with a
-    trainable backbone parameter the code rows reach it (windows are not skipped); with real signal
+    trainable backbone parameter the code rows reach it (windows with code signal are not skipped);
+    the same when the manager is attached to the inner decoder only and the trainer's untied
+    ``lm_head`` (outside ``manager.model``, so not frozen by it) stays trainable; with real signal
     on the math rows the math expert trains.
     """
-    model, mgr = experts_model(tokenizer)
+    if scenario == "manager_on_inner_model":
+        model = build_tiny_llama(len(tokenizer), seed=0)
+        mgr = attach_experts(model.model)
+        head = model.get_output_embeddings().weight
+        assert head is not model.get_input_embeddings().weight, "the setup needs an untied lm_head"
+        assert head.requires_grad and all(p is not head for p in mgr.model.parameters())
+    else:
+        model, mgr = experts_model(tokenizer)
     if scenario == "backbone_trainable":
         model.get_output_embeddings().weight.requires_grad_(True)
+    head_before = model.get_output_embeddings().weight.detach().clone()
     rows = []
     for i in range(6):
         rows.append({"prompt": f"a{i}+1=", "expert": "math"})
@@ -1173,10 +1185,11 @@ def test_skip_decision_ignores_signal_of_rows_that_reach_no_trainable_parameter(
         assert counters["skipped_windows"] == counters["windows"] == 6
         assert opt.applied_updates == 0 and opt.skipped_steps == 6
         assert math_unchanged
-    else:  # backbone_trainable: code rows reach the trainable lm_head, their windows are trained
+    else:  # backbone_trainable / manager_on_inner_model: code rows reach the trainable lm_head
         code_signal = [b for b in batches if any(n == "code" and s for n, s in zip(b[0], b[2]))]
         assert counters["skipped_windows"] == counters["windows"] - len(code_signal) < 6
         assert opt.applied_updates == len(code_signal)
+        assert not torch.equal(model.get_output_embeddings().weight, head_before)
 
 
 # ================================================================================== shapers + experts
