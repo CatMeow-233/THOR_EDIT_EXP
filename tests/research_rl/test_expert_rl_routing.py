@@ -503,15 +503,19 @@ args = GRPOConfig(
     gradient_accumulation_steps=2, steps_per_generation=4, max_completion_length=4, max_steps=4,
     save_strategy="no", report_to=[], use_cpu=True, bf16=False,
 )
+# One result file per rank: the ranks share stdout, where concurrent prints interleave.
+result = os.path.join(os.environ["RR_RESULTS"], "rank" + os.environ["RANK"] + ".txt")
 try:
     trainer = ResearchGRPOTrainer(
         model=model, reward_funcs=lambda completions, **kw: [0.0] * len(completions), args=args,
         train_dataset=Dataset.from_list(rows), processing_class=tok, expert_manager=mgr,
     )
     trainer.train()
-    print("RANK", os.environ["RANK"], "TRAINED", flush=True)
+    status = "TRAINED"
 except ExpertError as exc:
-    print("RANK", os.environ["RANK"], "REJECTED", exc, flush=True)
+    status = "REJECTED " + str(exc)
+with open(result, "w") as fh:
+    fh.write(status)
 """
 
 
@@ -531,6 +535,7 @@ def test_two_process_ddp_run_raises_instead_of_hanging(tmp_path):
         HF_HUB_OFFLINE="1",
         OMP_NUM_THREADS="1",
         RR_OUT=str(tmp_path / "out"),
+        RR_RESULTS=str(tmp_path),
     )
     proc = subprocess.Popen(
         [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", str(script)],
@@ -551,8 +556,10 @@ def test_two_process_ddp_run_raises_instead_of_hanging(tmp_path):
         pytest.fail("2-process run with experts hung (DDP all-reduce deadlock)")
     assert "Timeout (0:01:30)!" not in out, "a rank hung (DDP all-reduce deadlock):\n" + out[-4000:]
     for rank in (0, 1):
-        assert f"RANK {rank} REJECTED" in out and "not supported with 2 processes" in out, out[-4000:]
-    assert "TRAINED" not in out
+        result = tmp_path / f"rank{rank}.txt"
+        assert result.exists(), f"rank {rank} wrote no result:\n" + out[-4000:]
+        status = result.read_text()
+        assert status.startswith("REJECTED ") and "not supported with 2 processes" in status, status
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
