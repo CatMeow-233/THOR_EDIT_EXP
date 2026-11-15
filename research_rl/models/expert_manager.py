@@ -336,6 +336,29 @@ class ExpertManager:
         finally:
             self._restore_selection(saved)
 
+    @contextmanager
+    def rows(self, names: Sequence[str]) -> Iterator[None]:
+        """Temporarily select the experts of a batch whose row ``b`` belongs to expert ``names[b]``.
+
+        If every row has the same expert this is :meth:`using` (no batch-size constraint, so any
+        forward of these rows, e.g. a batched or flattened one, is consistent); otherwise it is
+        :meth:`routed` (the FFN input must then have exactly ``len(names)`` rows, in this order).
+        The previous selection is restored on exit, also on exceptions.
+        """
+        if isinstance(names, str) or len(names) == 0:
+            raise ExpertError("rows() needs a non-empty sequence of expert names")
+        first = names[0]
+        if all(n == first for n in names):
+            with self.using(first):
+                yield
+        else:
+            with self.routed(names):
+                yield
+
+    def ffn_modules(self) -> dict[int, ExpertFFN]:
+        """The attached :class:`ExpertFFN` modules by decoder-layer index (a new dict, same modules)."""
+        return dict(self._ffns)
+
     # ------------------------------------------------------------------ parameters / freezing
     def _expert_prefixes(self, name: str | None = None) -> list[str]:
         out = []
