@@ -324,6 +324,8 @@ def test_rollout_batch_expert_ids_and_buffer_counters_round_trip():
     buf.append(batch(["math", "code", "math"]))
     latest = buf.latest()
     assert latest is not None and latest.expert_ids == ("math", "code", "math")
+    assert [t.expert for t in latest.trajectories()] == ["math", "code", "math"]
+    assert [t.expert for t in batch(None).trajectories()] == [None, None]
     assert buf.counters()["expert_samples"] == {"math": 2, "code": 1}
     raw = io.BytesIO()
     torch.save(buf.state_dict(), raw)

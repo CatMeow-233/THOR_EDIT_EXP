@@ -42,6 +42,7 @@ class Trajectory:
     reward: float
     advantage: float
     policy_version: int
+    expert: str | None = None  # expert that produced the sample (None = no experts)
 
     @property
     def num_loss_tokens(self) -> int:
@@ -173,6 +174,7 @@ class RolloutBatch:
                     reward=float(self.rewards[i]),
                     advantage=float(a) if a.numel() == 1 else float(a.float().mean()),
                     policy_version=self.policy_version,
+                    expert=None if self.expert_ids is None else self.expert_ids[i],
                 )
             )
         return out
