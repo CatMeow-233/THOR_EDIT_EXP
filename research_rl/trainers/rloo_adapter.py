@@ -21,8 +21,11 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
   ``mask_truncated_completions`` zeroes rows whose last token is neither EOS nor pad. RLOO has no
   ``rollout_func`` in this TRL version.
 
-ResearchRL additions (policy-version stamps, trajectory log, zero-advantage skipping) are
-described in :mod:`research_rl.trainers.rl_common`.
+ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, zero-advantage
+skipping) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages must be
+``(B,)`` (the loss is per sequence). ``skip_zero_advantage_steps=True`` is compatible with
+``beta != 0``: the KL penalty is folded into the reward and hence into the advantage, so a window
+whose advantages are all zero has no KL gradient either. It is refused with the MoE aux loss.
 """
 
 from __future__ import annotations

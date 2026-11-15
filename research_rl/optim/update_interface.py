@@ -56,6 +56,12 @@ class UpdateRule:
     """Base class; override any subset of the hooks."""
 
     name: str = "update_rule"
+    #: ``True`` for a rule that must act on *every* nominal optimizer step, whatever the gradient
+    #: (e.g. a drift-budget pull towards a reference, a scheduled decay or projection). A skipped step
+    #: runs only :meth:`on_skip`, so such a rule cannot be combined with step skipping: the RL
+    #: trainers raise ``ValueError`` at ``on_train_begin`` when ``skip_zero_advantage_steps=True``
+    #: and any rule of the HookedOptimizer has this flag set.
+    needs_every_step: bool = False
 
     # Which parameters need a pre-step snapshot (only those reach transform_update/pre_write/post_step).
     def tracks(self, name: str, param: torch.nn.Parameter) -> bool:

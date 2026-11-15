@@ -22,8 +22,10 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
   :func:`research_rl.trainers.rl_common.eos_truncating_rollout`). ``mask_truncated_completions``
   zeroes rows whose last token is neither EOS nor pad.
 
-ResearchRL additions (policy-version stamps, trajectory log, zero-advantage skipping) are
-described in :mod:`research_rl.trainers.rl_common`.
+ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, zero-advantage
+skipping) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages may be
+``(B,)`` or per token ``(B, T)``. ``skip_zero_advantage_steps=True`` is refused with ``beta != 0``
+(the KL term is a separate loss term), with the entropy bonus and with the MoE aux loss.
 """
 
 from __future__ import annotations
@@ -42,6 +44,25 @@ class ResearchGRPOTrainer(RLRolloutMixin, ResearchTrainerMixin, GRPOTrainer):  #
     """``GRPOTrainer`` + HookedOptimizer + policy-version stamps, trajectory log, zero-advantage skip."""
 
     multi_objective_aggregation: str
+    beta: float
+    _rr_advantage_ndims: ClassVar[tuple[int, ...]] = (1, 2)  # TRL's GRPO loss accepts (B,) and (B, T)
+
+    def _rr_skip_conflicts(self) -> list[str]:
+        """TRL 1.18 GRPO terms that do not scale with the advantage, plus the MoE aux loss (base class).
+
+        * ``beta != 0``: ``per_token_loss + beta * per_token_kl`` is added to the per-token loss.
+        * entropy bonus (``_entropy_bonus_enabled``: ``entropy_coef != 0`` or ``use_adaptive_entropy``):
+          ``loss - coef * mean entropy``.
+        """
+        conflicts = super()._rr_skip_conflicts()
+        if self.beta != 0.0:
+            conflicts.append(f"GRPO beta={self.beta} adds a KL loss term (set beta=0)")
+        if getattr(self, "_entropy_bonus_enabled", False):
+            conflicts.append(
+                f"the GRPO entropy bonus is enabled (entropy_coef={getattr(self, 'entropy_coef', None)}, "
+                f"use_adaptive_entropy={getattr(self, 'use_adaptive_entropy', None)})"
+            )
+        return conflicts
 
     def _rr_reward_signal(self, mode: str, completion_mask: torch.Tensor) -> torch.Tensor | None:
         """Mathematically non-zero GRPO advantage, per sample (gathered).
