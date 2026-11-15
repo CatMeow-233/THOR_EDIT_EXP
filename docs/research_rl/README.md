@@ -90,9 +90,31 @@ RL-specific bookkeeping (GRPO/RLOO):
 * **Policy version** = number of parameter updates actually applied; stamped on every rollout batch
   (`rollout/policy_version`, `rollout/policy_lag` in the logs).
 * **Zero-advantage windows**: with `optim.skip_zero_advantage_steps: true`, an optimizer step whose
-  whole gradient-accumulation window had only zero advantages is skipped exactly (no weight decay,
-  no Adam state change). `record.json` keeps `nominal_optimizer_steps`, `applied_updates` and
-  `skipped_steps` separately.
+  whole gradient-accumulation window had no learning signal (zero advantages; see the expert rule
+  below) is skipped exactly (no weight decay, no Adam state change). `record.json` keeps
+  `nominal_optimizer_steps`, `applied_updates` and `skipped_steps` separately. A skip would also
+  drop gradient that does not come from the advantage, so the flag is refused (`ValueError`) with
+  GRPO `beta != 0`, the GRPO entropy bonus, the MoE router aux loss, or an `UpdateRule` with
+  `needs_every_step = True` (checked at train begin). RLOO `beta != 0` is allowed: TRL folds its KL
+  penalty into the reward, i.e. into the advantage.
+  With an `expert_manager` and no trainable parameter outside the experts (anywhere in the
+  trainer's model, also outside `manager.model`, e.g. an untied `lm_head` when the manager is
+  attached to the inner decoder: the manager freezes only its own model), only rows of experts with
+  trainable parameters count: signal on rows of frozen experts does not keep a window from being
+  skipped (it cannot move a trainable parameter, while the trainable expert's round-off advantages
+  would). The skip is all-or-nothing per window: with a trainable backbone, a window with signal on
+  some rows still updates from the round-off advantages of the others (no per-parameter-group skip).
+* **Advantage shaping**: pass `advantage_shapers=[...]` to `build_run` (objects implementing
+  `research_rl.trainers.rl_common.AdvantageShaper`, or names registered in
+  `ADVANTAGE_SHAPERS`). They rewrite TRL's advantages (`(B,)`, or `(B, T)` for GRPO) before the
+  signal flags and the trajectory log; the "no signal" decision then comes from the last shaper's
+  `signal`, or from "advantage exactly non-zero" if it returns none. Advantages edited later (e.g.
+  by a subclass) are detected per micro-batch and fall back to the exact non-zero test, with a warning.
+  With an `expert_manager`, shapers run under the batch's per-row routing and `output` carries the
+  per-row expert index (`rl_common.EXPERT_KEY`, names in `trainer.expert_vocab`).
+  TRL's completions table (`log_completions`) still shows TRL's unshaped advantages; the shaped ones
+  are in `trajectory_buffer` and the `rollout/*` metrics. Shapers with `state_dict`/`load_state_dict`
+  are checkpointed; other shapers restart from their constructor state on resume.
 * **TRL 1.18 facts found while testing**: a custom `rollout_func` is used verbatim (no cut at the
   first EOS) — wrap it with `research_rl.trainers.rl_common.eos_truncating_rollout`; GRPO's default
   `loss_type` is `dapo`; RLOO's default `beta=0.05` reloads the reference model from
@@ -134,6 +156,27 @@ Gradient clipping: HF clips *before* `optimizer.step()`. Rules that must see unc
 `optim.clip_in_wrapper: <norm>` (the TRL `max_grad_norm` is then forced to 0 and the wrapper clips
 after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
 
+Precision: a parameter *stored* in bf16 (model loaded with `dtype: bfloat16`, no fp32 master copy)
+silently loses every update below ≈ `|w|·2⁻⁸`, because AdamW writes it back with round-to-nearest
+(HF `bf16: true` autocast keeps fp32 parameters and is not affected). `HookedOptimizer` warns about
+this at construction (`optim.precision_check: warn | error | off`; with `optim.hooked: false` there is
+no check, so `warn` does nothing and `error` is refused). `optim.master_weights: true`
+keeps an fp32 master of every bf16/fp16 parameter: the inner optimizer (fp32 state) and the
+`transform_update`/`pre_write` rules run on the master, the model receives
+`round_to(master, dtype, optim.write_rounding)` (`nearest`, or unbiased `stochastic`, seeded from the
+experiment seed), `post_step` sees fp32 master displacements, and the masters are checkpointed in the
+optimizer state (exact HF resume). `P2PriorRule` refuses bf16 prior modules without masters
+(`allow_low_precision=True` to override). The record stores `precision` (trainable dtypes, options).
+Writes to the weights from outside the optimizer (`restore_frozen`, `rollback_channels`,
+`model.load_state_dict`, `p.copy_(...)` under `torch.no_grad()`, `p.data = ...`) reach the master
+for every element whose value changed; an element rewritten with its current bits keeps its master,
+so for an exact rollback call `optimizer.set_master(...)` or `resync_masters()`. In-place writes
+through `param.data` (`p.data.copy_(...)`, `p.data[...] = ...`, `p.data.<op>_()`) are **not**
+detected (they bypass the version counter the detection relies on): the next step silently
+overwrites them from the stale master. Use `p.copy_(...)` under `torch.no_grad()` or
+`optimizer.set_master(p, value)` instead.
+See `research_rl/optim/precision.py` and the `HookedOptimizer` docstring.
+
 ## Parameter-level research tools
 
 * **FFN channels** (`models/ffn_channels.py`): a SwiGLU channel *c* = row *c* of `gate_proj`, row *c*
@@ -146,6 +189,14 @@ after the `post_grad` hooks) or backward-time masks (`register_gradient_masks`).
   metadata), `export_merged` (vanilla HF checkpoint). Response-level expert selection — **not**
   token-level MoE. `find_swiglu_ffns(model, expert="name")` lets the channel tools operate inside one
   expert.
+  In GRPO/RLOO, pass `expert_manager=mgr` (and optionally `expert_column`, default `"expert"`) to the
+  trainer or `build_run`: each row's expert comes from that dataset column (missing → `mgr.active`), and
+  generation, TRL's chunked old-log-prob forwards and the loss forward/backward of each shuffled
+  micro-batch all run every row through its own expert. `RolloutBatch.expert_ids`, the trajectory
+  counters (`expert_samples`) and `rollout/expert_frac/<name>` record which expert produced each sample.
+  The KL reference (`beta > 0`) is the vanilla base FFN for every row; vLLM, PEFT, multi-process runs
+  (DDP would deadlock on ranks without rows of the trainable expert) and, for mixed-expert batches,
+  continuous batching / `rollout_func` / multimodal inputs are rejected with an error.
 * **Parameter priors** (`optim/parameter_prior.py`): `TaskVector`, `TaskVectorPrior`,
   `project_onto_span`, `PriorSubspaceRule`, and `P2PriorRule` — the two-channel update of P²-MOPD
   (arXiv 2611.03953): `W = B + Σ α_k τ_k` per module, coefficient gradient `⟨G, τ⟩` from the unclipped
@@ -169,15 +220,17 @@ evaluation outputs, environment (package versions, device). `hardware.gpu_metric
 | Contract | Module | Reference implementation |
 |---|---|---|
 | Parameter prior (P²-MOPD) | `optim/parameter_prior.py` | `TaskVectorPrior`, `PriorSubspaceRule`, `P2PriorRule` |
-| Recurrent state | `state/recurrent_interface.py` | `FastSlowMemory`, `StateStore` (no cross-sample sharing) |
+| Recurrent state | `state/recurrent_interface.py` | `FastSlowMemory`, `StateStore` (no cross-sample sharing). `FastSlowMemory` computes its updates in at least fp32 and stores the slow state in at least fp32 (`slow_dtype=torch.float32`, so a bf16 state reads out as fp32), because a low-rate EMA increment is otherwise rounded away in bf16; `slow_dtype=None` restores same-dtype storage and warns when a rate is below the dtype's precision (larger rates can still stall near their target in half precision) |
 | Compute controller | `state/compute_controller.py` | `FixedDepth`, `ThresholdHalting`, `run_looped`, `ComputeLedger`, `best_of_depth` |
 | Agent environment | `rollout/agent_env.py` | TRL `environment_factory`-compatible `ResearchEnvironment`, `CalculatorEnv`, `EpisodeLog` credit math. OpenEnv (`trl.experimental.async_grpo.openenv_harness`) needs the separate `openenv` package — not installed, not tested |
 | Multi-teacher distillation | `trainers/multi_teacher.py` | teacher aggregation (mixture / product, per-sample weights for routing), masked KLs, `TeacherEnsemble` usable as TRL `teacher_model` (global static weights only: TRL does not pass a per-prompt domain to the teacher). `AsyncDistillationTrainer` needs a vLLM server — not tested |
 | Code-execution reward | `rewards/code_sandbox.py` | disabled by default; refuses to run without an isolated backend that declares no-network + resource limits; no local executor ships |
 
 Plugins register themselves in `research_rl.core.registry` (`TRAINERS`, `UPDATE_RULES`, `VERIFIERS`,
-`RECURRENT_STATES`, `COMPUTE_CONTROLLERS`, `PARAMETER_PRIORS`, `ENVIRONMENTS`), so a paper's code can
-live in its own package and be selected by name from an experiment config.
+`RECURRENT_STATES`, `COMPUTE_CONTROLLERS`, `PARAMETER_PRIORS`, `ENVIRONMENTS`, `ADVANTAGE_SHAPERS`),
+so a paper's code can live in its own package and be selected by name from an experiment config
+(advantage shapers by name through `build_run(..., advantage_shapers=["name"])`, not through an
+`ExperimentConfig` field).
 
 ## Tests and CI
 

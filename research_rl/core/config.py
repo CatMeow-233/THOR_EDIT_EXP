@@ -77,6 +77,35 @@ class OptimSpec:
     # Skip the optimizer step entirely when every advantage in the accumulation window is zero
     # (RL trainers only). Counted separately from nominal steps.
     skip_zero_advantage_steps: bool = False
+    # Precision of low-precision (bf16/fp16) trainable parameters, see HookedOptimizer: keep fp32
+    # master weights, how the served weights are rounded ("nearest" | "stochastic"), and what to do
+    # when low-precision trainable parameters have no masters ("warn" | "error" | "off"; the check is
+    # done by HookedOptimizer, so with hooked=False "warn" does nothing and "error" is refused).
+    # Stochastic rounding is seeded from the experiment seed.
+    master_weights: bool = False
+    write_rounding: str = "nearest"
+    precision_check: str = "warn"
+
+    def __post_init__(self) -> None:
+        if self.write_rounding not in ("nearest", "stochastic"):
+            raise ConfigError(
+                f"optim.write_rounding must be 'nearest' or 'stochastic', got {self.write_rounding!r}"
+            )
+        if self.precision_check not in ("warn", "error", "off"):
+            raise ConfigError(
+                f"optim.precision_check must be 'warn', 'error' or 'off', got {self.precision_check!r}"
+            )
+        if not isinstance(self.master_weights, bool):
+            raise ConfigError(f"optim.master_weights must be a bool, got {self.master_weights!r}")
+        if self.write_rounding == "stochastic" and not self.hooked:
+            raise ConfigError("optim.write_rounding='stochastic' needs optim.hooked=True")
+        if self.master_weights and not self.hooked:
+            raise ConfigError("optim.master_weights=True needs optim.hooked=True")
+        if self.precision_check == "error" and not self.hooked:
+            raise ConfigError(
+                "optim.precision_check='error' needs optim.hooked=True: the check is done by HookedOptimizer "
+                "(without it, 'warn' and 'error' do nothing)"
+            )
 
 
 @dataclass

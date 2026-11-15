@@ -11,6 +11,12 @@
   ``torch.load(weights_only=True)``); the stored tensors are a diagnostic window and are *not*
   restored on resume.
 
+Experts (TLC, :mod:`research_rl.models.expert_manager`): when the RL trainer routes rows through
+response-level experts, :attr:`RolloutBatch.expert_ids` names the expert that produced each row,
+and the buffer counts samples per expert (``expert_samples``, a ``{name: int}`` dict, present in
+``counters()`` / ``state_dict()`` only once an expert-tagged batch was appended; checkpoints
+without it load as "no expert samples").
+
 Conventions (TRL GRPO/RLOO): prompts are left-padded (``prompt_mask`` marks real tokens),
 completions are right-padded, ``completion_mask`` is 1 on tokens that enter the loss.
 """
@@ -19,7 +25,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +42,7 @@ class Trajectory:
     reward: float
     advantage: float
     policy_version: int
+    expert: str | None = None  # expert that produced the sample (None = no experts)
 
     @property
     def num_loss_tokens(self) -> int:
@@ -44,6 +51,26 @@ class Trajectory:
 
 def _to_cpu(t: torch.Tensor) -> torch.Tensor:
     return t.detach().to("cpu").clone()
+
+
+def _expert_id_tuple(expert_ids: Any) -> tuple[str, ...]:
+    """``expert_ids`` as a tuple of names; a bare ``str`` or any non-``str`` entry is a ``TypeError``.
+
+    No coercion: ``"ab"`` would otherwise become ``("a", "b")`` and ``None`` / ints the names
+    ``"None"`` / ``"1"``, which the buffer's per-expert counters would then record and checkpoint.
+    """
+    if isinstance(expert_ids, (str, bytes)) or not isinstance(expert_ids, Sequence):
+        raise TypeError(
+            f"RolloutBatch.expert_ids must be a sequence of expert names (one per row), got "
+            f"{type(expert_ids).__name__} {expert_ids!r}"
+        )
+    bad = [(i, e) for i, e in enumerate(expert_ids) if not isinstance(e, str)]
+    if bad:
+        i, e = bad[0]
+        raise TypeError(
+            f"RolloutBatch.expert_ids[{i}] must be a str expert name, got {type(e).__name__} {e!r}"
+        )
+    return tuple(expert_ids)
 
 
 @dataclass
@@ -61,6 +88,7 @@ class RolloutBatch:
     mode: str = "train"
     extras: dict[str, Any] = field(default_factory=dict)
     signal: torch.Tensor | None = None  # (B,) bool: sample carries a learning signal (None = derive)
+    expert_ids: tuple[str, ...] | None = None  # expert that produced each row (None = no experts)
 
     def __post_init__(self) -> None:
         n = self.prompt_ids.shape[0]
@@ -72,6 +100,10 @@ class RolloutBatch:
             raise ValueError("completion_ids and completion_mask must have the same shape")
         if self.signal is not None and tuple(self.signal.shape) != (n,):
             raise ValueError(f"RolloutBatch.signal must have shape ({n},), got {tuple(self.signal.shape)}")
+        if self.expert_ids is not None:
+            self.expert_ids = _expert_id_tuple(self.expert_ids)
+            if len(self.expert_ids) != n:
+                raise ValueError(f"RolloutBatch.expert_ids has {len(self.expert_ids)} entries, expected {n}")
 
     @classmethod
     def from_tensors(
@@ -87,6 +119,7 @@ class RolloutBatch:
         global_step: int = 0,
         mode: str = "train",
         signal: torch.Tensor | None = None,
+        expert_ids: Sequence[str] | None = None,
     ) -> RolloutBatch:
         """Build a batch from (possibly GPU, possibly grad-carrying) tensors; stores detached CPU copies."""
         return cls(
@@ -100,6 +133,7 @@ class RolloutBatch:
             global_step=int(global_step),
             mode=mode,
             signal=None if signal is None else _to_cpu(signal).bool(),
+            expert_ids=None if expert_ids is None else _expert_id_tuple(expert_ids),
         )
 
     # ------------------------------------------------------------------ statistics
@@ -160,6 +194,7 @@ class RolloutBatch:
                     reward=float(self.rewards[i]),
                     advantage=float(a) if a.numel() == 1 else float(a.float().mean()),
                     policy_version=self.policy_version,
+                    expert=None if self.expert_ids is None else self.expert_ids[i],
                 )
             )
         return out
@@ -169,7 +204,9 @@ class TrajectoryBuffer:
     """Bounded log of recent rollout batches plus running counters (the counters are checkpointed).
 
     Also counts optimizer *windows* (one gradient-accumulation window = one nominal optimizer step):
-    how many had no non-zero advantage in any micro-batch and how many of those were skipped.
+    how many had no learning signal in any micro-batch (the trainer's per-sample signal flags; with
+    an expert manager only rows that reach a trainable parameter count, see
+    :mod:`research_rl.trainers.rl_common`) and how many of those were skipped.
     """
 
     def __init__(self, capacity: int = 16) -> None:
@@ -179,11 +216,12 @@ class TrajectoryBuffer:
         self._batches: deque[RolloutBatch] = deque(maxlen=self.capacity)
         self.total_batches = 0
         self.total_samples = 0
-        self.zero_signal_batches = 0  # generation batches whose advantages were all zero
+        self.zero_signal_batches = 0  # generation batches without any sample with learning signal
         self.windows = 0
         self.zero_signal_windows = 0
         self.skipped_windows = 0
         self.last_policy_version: int | None = None
+        self.expert_samples: dict[str, int] = {}  # samples per expert (expert-tagged batches only)
 
     # ------------------------------------------------------------------ batches
     def append(self, batch: RolloutBatch) -> None:
@@ -193,6 +231,9 @@ class TrajectoryBuffer:
         if not batch.has_nonzero_advantage:
             self.zero_signal_batches += 1
         self.last_policy_version = batch.policy_version
+        if batch.expert_ids is not None:
+            for name in batch.expert_ids:
+                self.expert_samples[name] = self.expert_samples.get(name, 0) + 1
 
     def __len__(self) -> int:
         return len(self._batches)
@@ -221,8 +262,12 @@ class TrajectoryBuffer:
             self.skipped_windows += 1
 
     # ------------------------------------------------------------------ persistence
-    def counters(self) -> dict[str, int | None]:
-        return {
+    def counters(self) -> dict[str, Any]:
+        """Running counters (JSON- and ``weights_only``-safe: ints, ``None`` and a ``{str: int}`` dict).
+
+        ``expert_samples`` is included only once an expert-tagged batch has been appended.
+        """
+        out: dict[str, Any] = {
             "total_batches": self.total_batches,
             "total_samples": self.total_samples,
             "zero_signal_batches": self.zero_signal_batches,
@@ -231,6 +276,9 @@ class TrajectoryBuffer:
             "skipped_windows": self.skipped_windows,
             "last_policy_version": self.last_policy_version,
         }
+        if self.expert_samples:
+            out["expert_samples"] = dict(self.expert_samples)
+        return out
 
     def state_dict(self) -> dict[str, Any]:
         return {"capacity": self.capacity, **self.counters()}
@@ -247,3 +295,5 @@ class TrajectoryBuffer:
             setattr(self, key, int(state.get(key, 0)))
         last = state.get("last_policy_version")
         self.last_policy_version = None if last is None else int(last)
+        # Older checkpoints have no per-expert counts.
+        self.expert_samples = {str(k): int(v) for k, v in (state.get("expert_samples") or {}).items()}

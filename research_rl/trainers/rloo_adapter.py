@@ -21,8 +21,12 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
   ``mask_truncated_completions`` zeroes rows whose last token is neither EOS nor pad. RLOO has no
   ``rollout_func`` in this TRL version.
 
-ResearchRL additions (policy-version stamps, trajectory log, zero-advantage skipping) are
-described in :mod:`research_rl.trainers.rl_common`.
+ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, zero-advantage
+skipping, per-row expert routing with ``expert_manager=``) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages must be
+``(B,)`` (the loss is per sequence). ``skip_zero_advantage_steps=True`` is compatible with
+``beta != 0``: the KL penalty is folded into the reward and hence into the advantage, so a window
+whose advantages are all zero has no KL gradient either. It is refused with the MoE aux loss and,
+at ``on_train_begin``, with any HookedOptimizer ``UpdateRule`` with ``needs_every_step=True``.
 """
 
 from __future__ import annotations
@@ -86,8 +90,8 @@ class ResearchRLOOTrainer(RLRolloutMixin, ResearchTrainerMixin, RLOOTrainer):  #
 class RLOOAdapter(RLTrainerAdapter):
     """``TRAINERS.build("rloo")``: maps an ``ExperimentConfig`` onto :class:`ResearchRLOOTrainer`.
 
-    Pass ``reward_funcs=...`` (and optionally ``peft_config``, ``trajectory_capacity``) to
-    ``build``. ``trainer.args`` go verbatim to ``trl.RLOOConfig``.
+    Pass ``reward_funcs=...`` (and optionally ``peft_config``, ``trajectory_capacity``,
+    ``expert_manager``, ``expert_column``) to ``build``. ``trainer.args`` go verbatim to ``trl.RLOOConfig``.
     """
 
     algorithm: ClassVar[str] = "rloo"
