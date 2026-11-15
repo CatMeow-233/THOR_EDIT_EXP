@@ -40,6 +40,19 @@ expert by default (or the expert named by ``expert=``), with the real parameter 
 ``...mlp.experts.<name>.*``. Calling such a tool (e.g. ``channel_mask``) *before*
 ``set_trainable``/``activate`` therefore targets ``"base"``; pass ``expert=`` to be explicit.
 
+RL routing path (GRPO / RLOO, :mod:`research_rl.trainers.rl_common`): pass the manager to the
+trainer (``expert_manager=mgr``, adapter ``algo_kwargs`` work too) and name each row's expert in a
+dataset column (``expert_column``, default ``"expert"``; missing / ``None`` means ``mgr.active``).
+The trainer then selects, with :meth:`ExpertManager.rows`, the experts of exactly the rows of every
+forward: generation (all decode steps), TRL's chunked old-log-prob forwards (each chunk with its own
+rows' routing), the loss forward of each shuffled micro-batch and its backward (gradient-checkpointing
+recomputation included). The previous selection is restored after each region, also on exceptions.
+Every sample's expert is recorded (``RolloutBatch.expert_ids``, per-expert counters of the trajectory
+buffer, ``rollout/expert_frac/<name>``). A batch whose rows share one expert behaves exactly like
+single-expert training with :meth:`ExpertManager.activate`. The KL reference model TRL loads for
+``beta > 0`` is the vanilla checkpoint, i.e. the ``"base"`` FFN for every row. vLLM generation and
+PEFT are rejected (vLLM would serve the vanilla weights only).
+
 Limitations: the routing assumes the FFN input has the sample on dim 0 (true for dense HF decoder
 models; beam search / ``num_return_sequences`` change the batch and are rejected).
 Parameters added by ``create_expert`` / ``set_trainable`` after an optimizer exists are unknown to

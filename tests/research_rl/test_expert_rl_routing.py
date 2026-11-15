@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 from functools import partial
+from typing import Any
 
 import pytest
 import torch
@@ -73,7 +74,7 @@ def experts_model(tokenizer):
 
 
 def mixed_dataset(n: int = 4) -> Dataset:
-    rows = []
+    rows: list[dict[str, Any]] = []
     for i in range(n):
         rows.append({"prompt": f"a{i}+1=", "expert": "math"})
         rows.append({"prompt": f"b{i}+2=", "expert": "code"})
@@ -91,7 +92,7 @@ def rl_config(algorithm: str, tmp_path, **overrides):
     ``steps_per_generation (4) > gradient_accumulation_steps (2)``: TRL computes the old log-probs
     at generation time (GRPO; RLOO always does), in chunks of ``per_device_train_batch_size`` rows.
     """
-    args = {
+    args: dict[str, Any] = {
         "output_dir": str(tmp_path / "out"),
         "per_device_train_batch_size": 2,
         "num_generations": 2,
@@ -117,17 +118,18 @@ class _Capture:
     """Records (micro-batch, loss-forward per-token logps) for micro-batches with policy lag 0."""
 
     lag0: list | None = None
-    _cap_inputs = None
+    _cap_inputs: Any = None
+    policy_version: int
 
     def compute_loss(self, model, inputs, *args, **kwargs):
         self._cap_inputs = inputs
         try:
-            return super().compute_loss(model, inputs, *args, **kwargs)
+            return super().compute_loss(model, inputs, *args, **kwargs)  # type: ignore[misc]
         finally:
             self._cap_inputs = None
 
     def _get_per_token_logps_and_entropies(self, model, *args, **kwargs):
-        out = super()._get_per_token_logps_and_entropies(model, *args, **kwargs)
+        out = super()._get_per_token_logps_and_entropies(model, *args, **kwargs)  # type: ignore[misc]
         inputs = self._cap_inputs
         if (
             self.lag0 is not None
@@ -139,11 +141,11 @@ class _Capture:
         return out
 
 
-class RecordingGRPO(_Capture, ResearchGRPOTrainer):
+class RecordingGRPO(_Capture, ResearchGRPOTrainer):  # type: ignore[misc]  # TRL attribute refinements
     pass
 
 
-class RecordingRLOO(_Capture, ResearchRLOOTrainer):
+class RecordingRLOO(_Capture, ResearchRLOOTrainer):  # type: ignore[misc]  # TRL attribute refinements
     pass
 
 
@@ -311,7 +313,8 @@ def test_rollout_batch_expert_ids_and_buffer_counters_round_trip():
     buf.append(batch(None))
     assert "expert_samples" not in buf.counters()  # no experts: counters unchanged
     buf.append(batch(["math", "code", "math"]))
-    assert buf.latest().expert_ids == ("math", "code", "math")
+    latest = buf.latest()
+    assert latest is not None and latest.expert_ids == ("math", "code", "math")
     assert buf.counters()["expert_samples"] == {"math": 2, "code": 1}
     raw = io.BytesIO()
     torch.save(buf.state_dict(), raw)
@@ -572,7 +575,7 @@ def test_mixed_experts_route_every_forward_record_and_train_only_their_expert(to
     batch["advantages"] = torch.linspace(-1.0, 1.0, n) + 0.05  # all non-zero
     g_full = trainable_grads(trainer, batch)
     assert all(g is not None for g in g_full.values())
-    assert max(float(g.abs().max()) for g in g_full.values()) > 0
+    assert max(float(g.abs().max()) for g in g_full.values() if g is not None) > 0
     only_math = dict(batch, advantages=torch.where(is_math, batch["advantages"], 0.0))
     for name, g in trainable_grads(trainer, only_math).items():
         torch.testing.assert_close(g, g_full[name], rtol=1e-5, atol=1e-8, msg=name)

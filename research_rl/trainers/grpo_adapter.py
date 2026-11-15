@@ -22,8 +22,8 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
   :func:`research_rl.trainers.rl_common.eos_truncating_rollout`). ``mask_truncated_completions``
   zeroes rows whose last token is neither EOS nor pad.
 
-ResearchRL additions (policy-version stamps, trajectory log, zero-advantage skipping) are
-described in :mod:`research_rl.trainers.rl_common`.
+ResearchRL additions (policy-version stamps, trajectory log, zero-advantage skipping, per-row
+expert routing with ``expert_manager=``) are described in :mod:`research_rl.trainers.rl_common`.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ class GRPOAdapter(RLTrainerAdapter):
     """``TRAINERS.build("grpo")``: maps an ``ExperimentConfig`` onto :class:`ResearchGRPOTrainer`.
 
     Pass ``reward_funcs=...`` (and optionally ``rollout_func``, ``peft_config``,
-    ``trajectory_capacity``) to ``build``. ``trainer.args`` go verbatim to ``trl.GRPOConfig``.
+    ``trajectory_capacity``, ``expert_manager``, ``expert_column``) to ``build``. ``trainer.args`` go verbatim to ``trl.GRPOConfig``.
     """
 
     algorithm: ClassVar[str] = "grpo"

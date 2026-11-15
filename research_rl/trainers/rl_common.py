@@ -63,7 +63,7 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
 
   - *generation* (TRL's ``_generate_single_turn``, transformers ``generate`` incl. its cached
     decode steps) under ``ExpertManager.rows(names)`` for the generation batch;
-  - the *old / PEFT-reference log-prob forwards* inside ``_generate_and_score_completions``:
+  - the *old log-prob forwards* of the policy inside ``_generate_and_score_completions``:
     TRL's ``_get_per_token_logps_and_entropies`` slices the batch into chunks of ``batch_size``
     rows; the override calls TRL once per chunk with exactly that chunk's routing;
   - the *loss forward* (``compute_loss``) and its backward (incl. gradient-checkpointing
@@ -75,7 +75,12 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
 
   A batch whose rows all share one expert uses ``ExpertManager.using`` (bit-identical to plain
   single-expert training with ``activate``); only mixed batches need row routing. The manager's
-  previous selection is restored after every routed region, also on exceptions.
+  previous selection is restored after every routed region, also on exceptions. A micro-batch
+  none of whose rows reaches a trainable parameter (only frozen experts) gets a graph-less loss;
+  it is made a grad-requiring leaf so ``backward`` is a no-op and the trainable expert keeps
+  ``grad=None`` (unchanged by the optimizer if its whole window has no rows of it). A manual
+  ``compute_loss(...).backward()`` outside ``training_step`` must run inside
+  ``trainer.expert_routing(batch)`` when gradient checkpointing (TRL's default) is on.
   :class:`~research_rl.rollout.trajectory.RolloutBatch` records ``expert_ids``, the trajectory
   buffer counts samples per expert and ``rollout/expert_frac/<name>`` is logged.
   Rejected with a clear error instead of mis-routing: ``use_vllm`` (the vLLM engine serves a
