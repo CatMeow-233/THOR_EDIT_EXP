@@ -105,7 +105,9 @@ class ResearchTrainerMixin:
     def create_optimizer(self, model: Any = None) -> Any:
         super().create_optimizer(model)  # type: ignore[misc]
         opt = self.optimizer  # type: ignore[has-type]
-        if self._rr_hooked and not isinstance(opt, HookedOptimizer):
+        # unwrap_hooked: a second train() hands back the AcceleratedOptimizer of the first one; wrapping it
+        # again would run every rule twice and (master_weights) discard the inner wrapper's fp32 masters.
+        if self._rr_hooked and unwrap_hooked(opt) is None:
             target = self.model if model is None else model  # type: ignore[attr-defined]
             hooked = HookedOptimizer(
                 opt,

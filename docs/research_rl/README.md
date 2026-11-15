@@ -144,6 +144,10 @@ keeps an fp32 master of every bf16/fp16 parameter: the inner optimizer (fp32 sta
 experiment seed), `post_step` sees fp32 master displacements, and the masters are checkpointed in the
 optimizer state (exact HF resume). `P2PriorRule` refuses bf16 prior modules without masters
 (`allow_low_precision=True` to override). The record stores `precision` (trainable dtypes, options).
+Writes to the weights from outside the optimizer (`restore_frozen`, `rollback_channels`,
+`model.load_state_dict`, ...) reach the master for every element whose value changed; an element
+rewritten with its current bits keeps its master, so for an exact rollback call
+`optimizer.set_master(...)` or `resync_masters()`.
 See `research_rl/optim/precision.py` and the `HookedOptimizer` docstring.
 
 ## Parameter-level research tools

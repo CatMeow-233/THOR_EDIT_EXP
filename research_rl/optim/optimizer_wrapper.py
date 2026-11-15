@@ -98,11 +98,25 @@ class HookedOptimizer(Optimizer):
 
         External writes: when a master parameter is modified outside the optimizer (detected
         through its storage pointer / version counter, i.e. ``param.copy_`` under ``no_grad``,
-        ``load_state_dict``, ``param.data = ...``; writes through ``param.data.<op>_`` are *not*
-        detected), the next step re-derives the master element-wise from the served value for
-        every element that is no longer one of the two bf16/fp16 neighbours of its master, warns
-        and counts it in ``master_resyncs``. Use :meth:`set_master` to write an exact fp32 value or
-        :meth:`resync_masters` to reset masters explicitly.
+        ``model.load_state_dict``, ``param.data = ...``, :meth:`ParameterMask.restore_frozen`,
+        ``rollback_channels`` / ``ablate_channels``, ``TaskVectorPrior.apply_to``; writes through
+        ``param.data.<op>_`` are *not* detected), the next step (or ``state_dict()``) compares the
+        parameter element-wise with the value the wrapper **last wrote** into it: with
+        ``"nearest"`` that is ``master.to(dtype)`` (no extra memory), with ``"stochastic"`` a copy
+        of the last served tensor kept for this purpose (2 bytes per element). Every element whose
+        value differs gets ``master = param.float()`` (counted in ``master_resyncs``, one
+        ``UserWarning`` per step); all other elements keep their master. NaNs compare equal to NaNs.
+
+        Limit: a write that leaves an element's bits unchanged cannot be told apart from no write,
+        so that element keeps its master (which may lie up to one ulp away from the written value).
+        This is what makes a temporary edit undone bit-for-bit before the next step (e.g.
+        ``ablate_channels`` then ``rollback_channels``) leave the masters untouched, but it also
+        means that rolling the served weights back to an earlier snapshot keeps the sub-ulp drift
+        of elements whose served bits did not change since (with ``"stochastic"`` such elements
+        may then be re-rounded to the other neighbour). For an exact rollback write the masters
+        explicitly: :meth:`set_master` (e.g. ``set_master(p, torch.where(mask, master_of(p),
+        ref.float()))`` for a partial restore) or :meth:`resync_masters` (reset every master to
+        the current served value).
 
     ``write_rounding`` (``"nearest"`` | ``"stochastic"``, default ``"nearest"``)
         How fp32 values are rounded when the wrapper writes a low-precision parameter.
@@ -132,7 +146,11 @@ class HookedOptimizer(Optimizer):
     device → load_state_dict at prepare time) and HF Trainer resume exact. A checkpoint without
     masters loaded into a ``master_weights`` optimizer re-initialises them from the current
     parameters (warning); masters in a checkpoint loaded without ``master_weights`` are dropped
-    (warning). Load the optimizer state *after* the model weights (as HF does).
+    (warning). Masters saved for parameters that are now full precision (e.g. a bf16 master run
+    resumed with an fp32 model) are never applied, because an optimizer load does not rewrite model
+    weights; a warning names them when they differ from the parameters (copy
+    ``state["research_rl"]["precision"]["masters"][i]`` into flat parameter ``i`` yourself to
+    resume exactly). Load the optimizer state *after* the model weights (as HF does).
     """
 
     def __init__(
@@ -192,6 +210,9 @@ class HookedOptimizer(Optimizer):
         self.master_resyncs = 0  # elements re-derived from externally written parameters
         self._masters: dict[int, torch.Tensor] = {}  # id(param) -> fp32 master
         self._fingerprints: dict[int, tuple[int, int, torch.dtype, torch.device]] = {}
+        # id(param) -> copy of the value the wrapper last wrote, kept where master.to(dtype) is not
+        # that value (always with stochastic rounding); used to detect external writes element-wise.
+        self._served: dict[int, torch.Tensor] = {}
         self._generators: dict[torch.device, torch.Generator] = {}
         self._check_precision()
         if self.master_weights:
@@ -314,10 +335,16 @@ class HookedOptimizer(Optimizer):
         warnings.warn(msg, UserWarning, stacklevel=3)
 
     def has_master(self, param: torch.Tensor) -> bool:
-        """True if ``param`` is (or, at the next step, will be) backed by an fp32 master copy."""
+        """True if ``param`` is backed by an fp32 master copy.
+
+        Also True for a bf16/fp16 parameter added with :meth:`add_param_group` whose master is
+        created at the next step. False for tensors the optimizer does not optimise.
+        """
         if not self.master_weights:
             return False
-        return id(param) in self._masters or is_low_precision(param.dtype)
+        if id(param) in self._masters:
+            return True
+        return is_low_precision(param.dtype) and any(q is param for q in self._flat_params())
 
     def master_of(self, param: torch.Tensor) -> torch.Tensor | None:
         """The fp32 master of ``param`` (the live tensor, do not modify), or ``None``."""
@@ -336,19 +363,46 @@ class HookedOptimizer(Optimizer):
                 st[k] = v.float()
 
     @staticmethod
-    def _neighbours(master: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two ``dtype`` values bracketing ``master`` (toward / away from zero)."""
-        if dtype == torch.bfloat16:
-            bits = master.contiguous().view(torch.int32) & -65536
-            lo = bits.view(torch.float32)
-            hi = (bits + 65536).view(torch.float32)
-            return lo.to(dtype), hi.to(dtype)
-        near = master.to(dtype)
-        return near, near
+    def _same(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Element-wise equality that treats NaN == NaN (so NaN elements are not 'externally written')."""
+        return (a == b) | (torch.isnan(a) & torch.isnan(b))
+
+    def _last_written(self, key: int, master: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """The value the wrapper last wrote into the parameter ``key`` (see ``_mark_written``)."""
+        served = self._served.get(key)
+        return served if served is not None else master.to(dtype)
+
+    def _mark_written(self, p: torch.Tensor, consistent: bool | None = None) -> None:
+        """Record that the wrapper's view of ``p`` is current: fingerprint + last-written reference.
+
+        ``consistent``: ``True`` if ``p == master.to(dtype)`` element-wise (then no copy is needed
+        with nearest rounding), ``False`` if not, ``None`` to keep the previous status.
+        """
+        key = id(p)
+        self._fingerprints[key] = self._fingerprint(p)
+        if consistent is None:
+            consistent = key not in self._served
+        if self.write_rounding == "stochastic" or not consistent:
+            buf = self._served.get(key)
+            if buf is not None and buf.shape == p.shape and buf.dtype == p.dtype and buf.device == p.device:
+                buf.copy_(p.detach())
+            else:
+                self._served[key] = p.detach().clone()
+        else:
+            self._served.pop(key, None)
+
+    def _forget(self, key: int) -> None:
+        self._masters.pop(key, None)
+        self._fingerprints.pop(key, None)
+        self._served.pop(key, None)
 
     @torch.no_grad()
     def _sync_masters(self, warn: bool = True) -> None:
-        """Create missing masters, drop stale ones, reconcile externally written parameters."""
+        """Create missing masters, drop stale ones, reconcile externally written parameters.
+
+        An element counts as externally written iff it differs from the value the wrapper last
+        wrote (``_last_written``); its master becomes ``param.float()``.
+        """
         live: set[int] = set()
         resynced = 0
         for p in self._flat_params():
@@ -358,30 +412,35 @@ class HookedOptimizer(Optimizer):
             live.add(key)
             master = self._masters.get(key)
             if master is None or master.shape != p.shape:
+                self._forget(key)
                 self._masters[key] = p.detach().to(torch.float32, copy=True)
                 self._upcast_inner_state(p)
+                self._mark_written(p, consistent=True)
             elif self._fingerprints.get(key) != self._fingerprint(p):
                 if master.device != p.device:
                     master = master.to(p.device)
                 served = p.detach()
-                lo, hi = self._neighbours(master, p.dtype)
-                ok = (served == lo) | (served == hi) | (served.float() == master)
+                reference = self._last_written(key, master, p.dtype)
+                if reference.device != served.device:
+                    reference = reference.to(served.device)
+                ok = self._same(served, reference)
                 n_bad = int((~ok).sum())
                 if n_bad:
                     master = torch.where(ok, master, served.float())
                     resynced += n_bad
                 self._masters[key] = master
-            self._fingerprints[key] = self._fingerprint(p)
+                # Rewritten elements now satisfy served == master.to(dtype); the others keep their status.
+                self._mark_written(p)
         for key in [k for k in self._masters if k not in live]:
-            del self._masters[key]
-            self._fingerprints.pop(key, None)
+            self._forget(key)
         if resynced:
             self.master_resyncs += resynced
             if warn:
                 warnings.warn(
                     f"HookedOptimizer: {resynced} elements of master-weight parameters were modified outside the "
-                    "optimizer; their fp32 masters were re-initialised from the (low-precision) parameters. Use "
-                    "HookedOptimizer.set_master() to write exact values.",
+                    "optimizer; their fp32 masters were set to the new (low-precision) values. Elements whose "
+                    "value did not change keep their masters (an external write of the same bits is invisible): "
+                    "for an exact rollback use HookedOptimizer.set_master() or resync_masters().",
                     UserWarning,
                     stacklevel=3,
                 )
@@ -398,7 +457,7 @@ class HookedOptimizer(Optimizer):
         master = value.detach().to(device=param.device, dtype=torch.float32).clone()
         self._masters[id(param)] = master
         param.data.copy_(round_to(master, param.dtype, "nearest"))
-        self._fingerprints[id(param)] = self._fingerprint(param)
+        self._mark_written(param, consistent=True)
 
     @torch.no_grad()
     def resync_masters(self) -> None:
@@ -407,6 +466,7 @@ class HookedOptimizer(Optimizer):
             return
         self._masters.clear()
         self._fingerprints.clear()
+        self._served.clear()
         self._sync_masters(warn=False)
 
     def _generator(self, device: torch.device, step: int, index: int) -> torch.Generator:
@@ -539,13 +599,15 @@ class HookedOptimizer(Optimizer):
         for index, p, low, grad in swapped:
             before = old_masters.get(id(p))
             if grad is None and before is None:
+                self._fingerprints[id(p)] = self._fingerprint(p)
                 continue  # the inner optimizer skipped it and no rule touched it
             master = self._masters[id(p)]
             rounded = self._round(master, low.dtype, ctx.nominal_step, index)
             if before is not None:
                 rounded = torch.where(master == before, low, rounded)
             low.copy_(rounded)
-            self._fingerprints[id(p)] = self._fingerprint(p)
+            # Without kept bits (before is None) the nearest write is exactly master.to(dtype).
+            self._mark_written(p, consistent=True if before is None else None)
 
     def _skip(self, ctx: StepContext) -> None:
         self._skip_next = False
@@ -582,18 +644,11 @@ class HookedOptimizer(Optimizer):
         state_dict = dict(state_dict)
         extra = state_dict.pop(_STATE_KEY, None)
         precision = extra.get("precision") if isinstance(extra, dict) else None
+        self._warn_unused_masters(precision)
         if self.master_weights:
             self._load_masters(precision)
             self._load_inner_on_masters(state_dict)
         else:
-            if precision and precision.get("masters"):
-                warnings.warn(
-                    "HookedOptimizer: the checkpoint holds fp32 master weights but this optimizer has "
-                    "master_weights=False; the masters are dropped and the optimizer state is cast to the "
-                    "parameter dtype.",
-                    UserWarning,
-                    stacklevel=2,
-                )
             self.inner.load_state_dict(state_dict)
         if extra is None:
             return
@@ -607,11 +662,56 @@ class HookedOptimizer(Optimizer):
                 rule.load_state_dict(saved[key])
 
     @torch.no_grad()
+    def _warn_unused_masters(self, precision: Any) -> None:
+        """Warn about checkpoint masters this optimizer does not install (they are never applied silently).
+
+        * low-precision parameters with ``master_weights=False``: the masters are dropped;
+        * full-precision (e.g. fp32) parameters: no master is kept for them, and the parameter is
+          **not** overwritten from an optimizer load; warned when the saved master differs from the
+          parameter (the sub-ulp progress of the bf16 run is then not in the weights).
+        """
+        saved = (precision or {}).get("masters") or {}
+        if not saved:
+            return
+        dropped: list[int] = []
+        differing: list[int] = []
+        for index, p in enumerate(self._flat_params()):
+            value = saved.get(index)
+            if value is None:
+                continue
+            if is_low_precision(p.dtype):
+                if not self.master_weights:
+                    dropped.append(index)
+            elif tuple(value.shape) == tuple(p.shape) and not torch.equal(
+                value.detach().to(device=p.device, dtype=p.dtype), p.detach()
+            ):
+                differing.append(index)
+        if dropped:
+            warnings.warn(
+                f"HookedOptimizer: the checkpoint holds fp32 master weights for {len(dropped)} low-precision "
+                "parameters but this optimizer has master_weights=False; the masters are dropped and the "
+                "optimizer state is cast to the parameter dtype.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if differing:
+            warnings.warn(
+                f"HookedOptimizer: the checkpoint holds fp32 master weights for {len(differing)} parameters that "
+                f"are now full precision (flat indices {differing[:5]}) and differ from them; masters are only kept "
+                "for bf16/fp16 parameters, so they are NOT applied (an optimizer load never rewrites model "
+                "weights). To resume a bf16 master-weight run in fp32 exactly, copy them into the parameters "
+                "first: state['research_rl']['precision']['masters'][i] is the fp32 value of flat parameter i.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @torch.no_grad()
     def _load_masters(self, precision: Any) -> None:
         # Fallback masters from the current params (the checkpoint's masters replace them below).
         previous = dict(self._masters)
         self._masters.clear()
         self._fingerprints.clear()
+        self._served.clear()
         self._sync_masters(warn=False)
         if precision:
             for opt in ("write_rounding", "rounding_seed"):
@@ -641,7 +741,10 @@ class HookedOptimizer(Optimizer):
                 self._masters[key] = previous[key]
             else:
                 self._masters[key] = value.detach().to(device=p.device, dtype=torch.float32, copy=True)
-            self._fingerprints[key] = self._fingerprint(p)
+            # The loaded weights are what the run that wrote the checkpoint last served; they equal
+            # master.to(dtype) unless it used another rounding mode (then a copy is kept for detection).
+            master = self._masters[key]
+            self._mark_written(p, consistent=bool(self._same(p.detach(), master.to(p.dtype)).all()))
         if missing:
             warnings.warn(
                 f"HookedOptimizer: the checkpoint has no fp32 master weights for {missing} low-precision "
@@ -665,7 +768,7 @@ class HookedOptimizer(Optimizer):
         finally:
             for p, low in swapped:
                 p.data = low
-                self._fingerprints[id(p)] = self._fingerprint(p)
+                self._fingerprints[id(p)] = self._fingerprint(p)  # the served reference is unchanged
 
 
 def unwrap_hooked(optimizer: Any) -> HookedOptimizer | None:

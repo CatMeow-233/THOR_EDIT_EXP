@@ -403,6 +403,110 @@ def test_frozen_parameter_without_grad_is_never_rewritten():
     assert torch.equal(model[2].weight, frozen)
 
 
+def test_parameter_frozen_after_stochastic_steps_stays_bit_exact():
+    """Frozen once its master is no longer representable: re-rounding it would jitter the served weight."""
+    model = make_model()
+    opt = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.0),
+        model.named_parameters(),
+        master_weights=True,
+        write_rounding="stochastic",
+    )
+    w = model[2].weight
+    run_steps(model, opt, range(3))
+    master = opt.master_of(w).clone()
+    assert not torch.equal(master, w.detach().float())  # not vacuous: re-rounding could change w
+    w.requires_grad_(False)
+    served = w.detach().clone()
+    for step in range(3, 8):
+        opt.zero_grad(set_to_none=True)
+        backward(model, step)
+        opt.step()
+    assert w.grad is None
+    assert torch.equal(w.detach(), served) and torch.equal(opt.master_of(w), master)
+    assert not torch.equal(opt.master_of(model[0].weight), model[0].weight.detach().float())
+
+
+def test_stochastic_noise_is_fresh_at_every_step():
+    """Time average of the served weight -> master (a step-constant draw would pin each element)."""
+    p = nn.Parameter(torch.ones(64, dtype=torch.bfloat16))
+    opt = HookedOptimizer(
+        torch.optim.SGD([p], lr=0.1), [("w", p)], master_weights=True, write_rounding="stochastic"
+    )
+    ulp = 2**-7
+    target = torch.full((64,), 1.0 + 2**-10)  # P[next bf16 up] = 1/8
+    opt.set_master(p, target)
+    total, flips, steps = torch.zeros(64, dtype=torch.float64), 0, 400
+    previous = p.detach().clone()
+    for _ in range(steps):
+        p.grad = torch.zeros_like(p)  # a zero update: the master stays put, the served value is re-drawn
+        opt.step()
+        total += p.detach().double()
+        flips += int((p.detach() != previous).sum())
+        previous = p.detach().clone()
+    assert torch.equal(opt.master_of(p), target)
+    sigma = math.sqrt(1 / 8 * 7 / 8 / steps)  # binomial std of the time-average, in ulps
+    assert float(((total / steps - target.double()) / ulp).abs().max()) < 5 * sigma
+    assert flips > 0
+
+
+def test_stochastic_noise_is_fresh_at_every_step_without_masters():
+    """Same for the wrapper's own cast old + Δ' (transform_update) on a plain bf16 parameter."""
+    target = 1.0 + 2**-10
+
+    class Pin(UpdateRule):
+        name = "pin"
+
+        def tracks(self, name, param):
+            return True
+
+        def transform_update(self, ctx, name, param, old, delta):
+            return torch.full_like(delta, target) - old.float()
+
+    p = nn.Parameter(torch.ones(64, dtype=torch.bfloat16))
+    opt = quiet_hooked(torch.optim.SGD([p], lr=0.0), [("w", p)], [Pin()], write_rounding="stochastic")
+    total, steps = torch.zeros(64, dtype=torch.float64), 400
+    for _ in range(steps):
+        p.grad = torch.zeros_like(p)
+        opt.step()
+        total += p.detach().double()
+    sigma = math.sqrt(1 / 8 * 7 / 8 / steps)
+    assert float(((total / steps - target) / 2**-7).abs().max()) < 5 * sigma
+
+
+def test_stochastic_noise_is_independent_across_parameters():
+    a = nn.Parameter(torch.ones(256, dtype=torch.bfloat16))
+    b = nn.Parameter(torch.ones(256, dtype=torch.bfloat16))
+    opt = HookedOptimizer(
+        torch.optim.SGD([a, b], lr=0.1),
+        [("a", a), ("b", b)],
+        master_weights=True,
+        write_rounding="stochastic",
+        rounding_seed=5,
+    )
+    master = torch.full((256,), 1.0 + 2**-8)  # exactly between two bf16 values: P = 1/2
+    for p in (a, b):
+        opt.set_master(p, master)
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    assert not torch.equal(a.detach(), b.detach())
+    for index, p in enumerate((a, b)):  # nominal step 1, flat parameter index
+        expected = stochastic_round(master, torch.bfloat16, rounding_generator(5, 1, index))
+        assert torch.equal(p.detach(), expected)
+
+
+def test_master_write_is_in_place_and_aliases_stay_valid():
+    model = make_model()
+    opt = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=1e-2), model.named_parameters(), master_weights=True
+    )
+    w = model[0].weight
+    alias, ptr, before = w.detach(), w.data_ptr(), w.detach().clone()
+    run_steps(model, opt, [0])
+    assert not torch.equal(w.detach(), before)
+    assert w.data_ptr() == ptr and alias.data_ptr() == ptr and torch.equal(alias, w.detach())
+
+
 def test_stochastic_rounding_is_reproducible_and_seed_dependent():
     def run(seed):
         model = make_model()
@@ -448,6 +552,214 @@ def test_external_write_resyncs_master_with_warning_and_set_master_is_exact():
     assert torch.equal(opt.master_of(w), w.detach().float())
 
 
+def _mlp_master(rounding: str, lr: float = 1e-4):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(32, 64), nn.Tanh(), nn.Linear(64, 8)).to(torch.bfloat16)
+    opt = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0),
+        model.named_parameters(),
+        master_weights=True,
+        write_rounding=rounding,
+    )
+    g = torch.Generator().manual_seed(1)
+
+    def step():
+        x = torch.randn(16, 32, generator=g).bfloat16()
+        opt.zero_grad()
+        model(x).float().pow(2).mean().backward()
+        opt.step()
+
+    return model, opt, step
+
+
+def zero_update_step(model: nn.Module, opt: HookedOptimizer) -> None:
+    """A step that writes every master parameter but changes no master (lr 0, zero gradients)."""
+    lrs = [g["lr"] for g in opt.param_groups]
+    for g in opt.param_groups:
+        g["lr"] = 0.0
+    for p in model.parameters():
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    for g, lr in zip(opt.param_groups, lrs):
+        g["lr"] = lr
+
+
+@pytest.mark.parametrize("rounding", ["nearest", "stochastic"])
+def test_rollback_to_an_earlier_snapshot_reaches_the_masters(rounding):
+    """model.load_state_dict(snapshot) after sub-ulp steps: every rewritten element's master follows."""
+    model, opt, step = _mlp_master(rounding)
+    for _ in range(3):
+        step()
+    snap = {k: v.clone() for k, v in model.state_dict().items()}
+    for _ in range(5):
+        step()
+    params = dict(model.named_parameters())
+    changed = {n: params[n].detach() != snap[n] for n in snap}
+    n_changed = sum(int(c.sum()) for c in changed.values())
+    assert n_changed > 100  # not vacuous: the 5 steps moved many served weights by an ulp
+    model.load_state_dict(snap)
+    with pytest.warns(UserWarning, match="modified outside the optimizer"):
+        opt.state_dict()  # reconciles like the next step would
+    assert opt.master_resyncs == n_changed
+    for n, p in params.items():
+        m = opt.master_of(p)
+        assert torch.equal(m[changed[n]], snap[n].float()[changed[n]]), n
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        zero_update_step(model, opt)
+    if rounding == "nearest":
+        # served == master.to(bf16) == the snapshot everywhere, also for elements that did not move
+        assert all(torch.equal(p.detach(), snap[n]) for n, p in params.items())
+    else:
+        assert all(torch.equal(p.detach()[changed[n]], snap[n][changed[n]]) for n, p in params.items())
+    model.load_state_dict(snap)
+    opt.resync_masters()  # the documented exact rollback: masters = the restored served values
+    zero_update_step(model, opt)
+    for n, p in params.items():
+        assert torch.equal(p.detach(), snap[n]) and torch.equal(opt.master_of(p), snap[n].float()), n
+
+
+def test_rollback_after_a_sub_ulp_step_is_not_undone_by_the_next_write():
+    w0 = (1 + torch.rand(4096, generator=torch.Generator().manual_seed(0))).to(torch.bfloat16)
+    p = nn.Parameter(w0.clone())
+    opt = HookedOptimizer(torch.optim.SGD([p], lr=1.0), [("w", p)], master_weights=True)
+    ulp = 2**-7
+    p.grad = torch.full_like(p, -0.7 * ulp)  # every master moves by 0.7 ulp; served rounds up one ulp
+    opt.step()
+    moved = p.detach() != w0
+    assert int(moved.sum()) > 4000
+    with torch.no_grad():
+        p.copy_(w0)  # how restore_frozen / rollback_channels write
+    p.grad = torch.zeros_like(p)
+    with pytest.warns(UserWarning, match="modified outside the optimizer"):
+        opt.step()
+    assert opt.master_resyncs == int(moved.sum())
+    assert torch.equal(p.detach(), w0)
+    assert torch.equal(opt.master_of(p)[moved], w0.float()[moved])
+
+
+def test_repo_write_tools_reach_the_masters_and_temporary_edits_keep_them(tokenizer):
+    from research_rl.models.ffn_channels import (
+        ChannelSelection,
+        ablate_channels,
+        channel_state,
+        rollback_channels,
+    )
+    from research_rl.models.model_interface import snapshot
+    from research_rl.models.tiny import build_tiny_llama
+    from research_rl.optim import TaskVectorPrior
+
+    model = build_tiny_llama(len(tokenizer), seed=0).to(torch.bfloat16)
+    named = dict(model.named_parameters())
+    reference = {k: v.clone() for k, v in snapshot(model).items()}
+    channels_ref = channel_state(model)
+    opt = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.0),
+        model.named_parameters(),
+        master_weights=True,
+    )
+    ids = torch.randint(3, len(tokenizer), (4, 16), generator=torch.Generator().manual_seed(0))
+
+    def train(steps):
+        for _ in range(steps):
+            opt.zero_grad()
+            model(input_ids=ids, labels=ids).loss.backward()
+            opt.step()
+
+    def served_equal_reference(names) -> bool:
+        return all(torch.equal(named[n].detach(), reference[n]) for n in names)
+
+    def check_restored(write, names):
+        train(3)
+        assert not served_equal_reference(names)
+        write()
+        assert served_equal_reference(names)
+        with pytest.warns(UserWarning, match="modified outside the optimizer"):
+            zero_update_step(model, opt)  # the next write must not undo the restore
+        assert served_equal_reference(names)
+
+    everything = list(named)
+    frozen_all = ParameterMask({n: torch.zeros(p.shape, dtype=torch.bool) for n, p in named.items()})
+    check_restored(lambda: frozen_all.restore_frozen(model, reference), everything)
+    ffn = [n for n in named if ".mlp." in n]
+    check_restored(lambda: rollback_channels(model, channels_ref), ffn)
+    prior = TaskVectorPrior(reference)
+    prior.register("t", TaskVector({n: torch.zeros(reference[n].shape) for n in ffn}))
+    check_restored(lambda: prior.apply_to(model, [0.0]), everything)
+
+    # A temporary edit undone bit-for-bit before the next step leaves the masters untouched.
+    train(2)
+    masters = {n: opt.master_of(p).clone() for n, p in named.items()}
+    assert any(not torch.equal(masters[n], p.detach().float()) for n, p in named.items())
+    resyncs = opt.master_resyncs
+    previous = ablate_channels(model, ChannelSelection({0: [1, 4], 1: [0, 7]}))
+    rollback_channels(model, previous)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        opt.state_dict()
+        zero_update_step(model, opt)
+    assert opt.master_resyncs == resyncs
+    assert all(torch.equal(opt.master_of(p), masters[n]) for n, p in named.items())
+
+
+def test_external_write_detection_treats_nan_as_unchanged():
+    model = make_model()
+    opt = HookedOptimizer(
+        torch.optim.SGD(model.parameters(), lr=0.0), model.named_parameters(), master_weights=True
+    )
+    w = model[0].weight
+    with torch.no_grad():
+        w[0, 0] = float("nan")
+    opt.state_dict()
+    assert opt.master_resyncs == 1 and torch.isnan(opt.master_of(w)[0, 0])
+    with torch.no_grad():
+        w[1, 1] = 3.0
+    with pytest.warns(UserWarning, match="1 elements"):
+        opt.state_dict()  # only the new write is counted, the NaN is not re-detected
+    assert opt.master_resyncs == 2
+
+
+def test_stochastic_checkpoint_loaded_with_nearest_rounding_detects_only_real_writes():
+    """The loaded weights are stochastic roundings (!= master.to(bf16)): they must not count as external writes."""
+    model, opt, step = _mlp_master("stochastic")
+    for _ in range(4):
+        step()
+    sd, weights = copy.deepcopy(opt.state_dict()), copy.deepcopy(model.state_dict())
+    masters = sd["research_rl"]["precision"]["masters"]
+    w_index = 0  # flat index of model[0].weight
+    assert not torch.equal(model[0].weight.detach(), masters[w_index].bfloat16())  # not vacuous
+    resumed, opt2, _ = _mlp_master("nearest")
+    resumed.load_state_dict(weights)
+    with pytest.warns(UserWarning, match="write_rounding"):
+        opt2.load_state_dict(sd)
+    w = resumed[0].weight
+    with torch.no_grad():
+        w[0, 0] = 7.0  # one real external write
+    with pytest.warns(UserWarning, match="1 elements"):
+        opt2.state_dict()
+    assert opt2.master_resyncs == 1
+    expected = masters[w_index].clone()
+    expected[0, 0] = 7.0
+    assert torch.equal(opt2.master_of(w), expected)
+
+
+def test_has_master_only_for_optimised_parameters():
+    model = make_model()
+    extra = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt = HookedOptimizer(
+        torch.optim.SGD(model.parameters(), lr=0.1), model.named_parameters(), master_weights=True
+    )
+    assert opt.has_master(model[0].weight)
+    assert not opt.has_master(extra)
+    opt.set_master(extra, torch.full((4,), 1.0 + 2**-10))  # not optimised: a plain copy, no master kept
+    assert opt.master_of(extra) is None and torch.equal(extra.detach(), torch.ones(4, dtype=torch.bfloat16))
+    opt.add_param_group({"params": [extra]})
+    assert opt.has_master(extra) and opt.master_of(extra) is None  # created at the next step
+    extra.grad = torch.zeros_like(extra)
+    opt.step()
+    assert opt.master_of(extra) is not None
+
+
 def test_closure_is_refused_in_master_mode():
     model = make_model()
     opt = HookedOptimizer(
@@ -478,6 +790,13 @@ def test_precision_check_warn_error_off():
         fp32 = make_model(dtype=torch.float32)
         HookedOptimizer(
             torch.optim.AdamW(fp32.parameters()), fp32.named_parameters(), precision_check="error"
+        )
+        # A frozen (requires_grad=False) bf16 tensor in the optimizer is not a trainable parameter.
+        frozen_bf16 = nn.Parameter(torch.ones(3, dtype=torch.bfloat16), requires_grad=False)
+        HookedOptimizer(
+            torch.optim.AdamW([*fp32.parameters(), frozen_bf16]),
+            [*fp32.named_parameters(), ("frozen", frozen_bf16)],
+            precision_check="error",
         )
     with pytest.raises(ValueError, match="precision_check"):
         HookedOptimizer(
@@ -700,6 +1019,55 @@ def test_loading_without_masters_reinitialises_and_masters_into_plain_optimizer_
     )
     with pytest.warns(UserWarning, match="write_rounding"):
         other.load_state_dict(target.state_dict())
+    reseeded = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        model.named_parameters(),
+        master_weights=True,
+        rounding_seed=1,
+    )
+    with pytest.warns(UserWarning, match="rounding_seed=0") as rec:
+        reseeded.load_state_dict(target.state_dict())
+    assert not any("write_rounding" in str(r.message) for r in rec)
+
+
+@pytest.mark.parametrize("master", [True, False])
+def test_masters_saved_for_parameters_that_are_now_fp32_warn_and_are_never_applied(master):
+    model = make_model()
+    opt = HookedOptimizer(
+        torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.0),
+        model.named_parameters(),
+        master_weights=True,
+    )
+    run_steps(model, opt, range(2))
+    buf = io.BytesIO()
+    torch.save(opt.state_dict(), buf)
+    buf.seek(0)
+    sd = torch.load(buf, weights_only=True)
+    masters = sd["research_rl"]["precision"]["masters"]
+    fp32 = copy.deepcopy(model).float()  # the served bf16 weights, upcast: the sub-ulp progress is missing
+    before = [p.detach().clone() for p in fp32.parameters()]
+    resumed = HookedOptimizer(
+        torch.optim.AdamW(fp32.parameters(), lr=1e-4, weight_decay=0.0),
+        fp32.named_parameters(),
+        master_weights=master,
+    )
+    with pytest.warns(UserWarning, match="now full precision") as rec:
+        resumed.load_state_dict(copy.deepcopy(sd))
+    assert "4 parameters" in str(next(r.message for r in rec if "now full precision" in str(r.message)))
+    assert all(
+        torch.equal(p, q) for p, q in zip(fp32.parameters(), before)
+    )  # an optimizer load never writes weights
+    # The documented remedy: copy the masters in first; then nothing is lost and nothing warns.
+    with torch.no_grad():
+        for i, p in enumerate(fp32.parameters()):
+            p.copy_(masters[i])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        HookedOptimizer(
+            torch.optim.AdamW(fp32.parameters(), lr=1e-4, weight_decay=0.0),
+            fp32.named_parameters(),
+            master_weights=master,
+        ).load_state_dict(copy.deepcopy(sd))
 
 
 def test_existing_low_precision_inner_state_is_upcast():
@@ -735,10 +1103,14 @@ def test_optim_spec_precision_fields_and_back_compat():
         OptimSpec(precision_check="never")
     with pytest.raises(ConfigError, match="hooked"):
         OptimSpec(hooked=False, master_weights=True)
+    with pytest.raises(ConfigError, match="hooked"):
+        OptimSpec(hooked=False, write_rounding="stochastic")
+    with pytest.raises(ConfigError, match="master_weights must be a bool"):
+        OptimSpec(master_weights="yes")  # type: ignore[arg-type]
 
 
 # ------------------------------------------------------------------------------- TRL / HF Trainer
-def _sft_trainer(tokenizer, out_dir, *, max_steps, rounding, save_steps=None, model_seed=0):
+def _sft_trainer(tokenizer, out_dir, *, max_steps, rounding, save_steps=None, model_seed=0, **precision):
     from datasets import Dataset
     from trl import SFTConfig, SFTTrainer
 
@@ -771,9 +1143,7 @@ def _sft_trainer(tokenizer, out_dir, *, max_steps, rounding, save_steps=None, mo
         train_dataset=Dataset.from_list(rows),
         processing_class=tokenizer,
         callbacks=[callback],
-        master_weights=True,
-        write_rounding=rounding,
-        precision_check="error",
+        **{"master_weights": True, "write_rounding": rounding, "precision_check": "error", **precision},
     )
     callback.bind(trainer)
     return trainer
@@ -819,6 +1189,63 @@ def test_trl_sft_bf16_master_weights_resume_is_bit_identical(tokenizer, tmp_path
             a, b = opt_full.inner.state[named_full[name]][k], opt_res.inner.state[named_res[name]][k]
             assert a.dtype == torch.float32 and torch.equal(a, b), (name, k)
     assert not_vacuous  # the masters carry information the bf16 weights do not
+
+
+@pytest.mark.integration
+def test_second_train_call_reuses_the_hooked_optimizer_and_its_masters(tokenizer, tmp_path):
+    from accelerate.optimizer import AcceleratedOptimizer
+
+    from research_rl.optim import unwrap_hooked
+
+    trainer = _sft_trainer(tokenizer, tmp_path / "twice", max_steps=2, rounding="nearest")
+    trainer.train()
+    hooked = trainer.hooked_optimizer
+    assert hooked is not None and hooked.applied_updates == 2
+    named = dict(trainer.model.named_parameters())
+    masters = {n: hooked.master_of(p) for n, p in named.items()}
+    assert all(m is not None for m in masters.values())
+    assert any(not torch.equal(m, named[n].detach().float()) for n, m in masters.items())  # sub-ulp progress
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trainer.train()
+    assert not [w for w in caught if "HookedOptimizer" in str(w.message)]
+    assert unwrap_hooked(trainer.optimizer) is hooked and hooked.applied_updates == 4
+    assert isinstance(trainer.optimizer, AcceleratedOptimizer) and trainer.optimizer.optimizer is hooked
+    assert not isinstance(hooked.inner, HookedOptimizer)  # wrapped once, not twice
+    assert hooked.master_resyncs == 0 and all(hooked.master_of(p) is not None for p in named.values())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "precision",
+    [
+        {"master_weights": True},
+        {"master_weights": False, "write_rounding": "stochastic", "precision_check": "off"},
+    ],
+    ids=["master_weights", "stochastic"],
+)
+def test_precision_options_imply_the_hooked_optimizer(tokenizer, tmp_path, precision):
+    trainer = _sft_trainer(
+        tokenizer, tmp_path / "implied", max_steps=1, rounding="nearest", hooked_optimizer=False, **precision
+    )
+    trainer.create_optimizer()
+    hooked = trainer.hooked_optimizer
+    assert hooked is not None
+    assert hooked.master_weights == precision["master_weights"]
+    assert hooked.write_rounding == precision.get("write_rounding", "nearest")
+
+
+def test_precision_info_counts_trainable_parameters_only():
+    from research_rl.trainers.base import precision_info
+
+    model = make_model()
+    model[2].float()
+    model[2].bias.requires_grad_(False)
+    assert precision_info(model, OptimSpec(master_weights=True)) == {
+        "param_dtypes": {"bfloat16": 2, "float32": 1},
+        "master_weights": True,
+        "write_rounding": "nearest",
+    }
 
 
 @pytest.mark.integration
