@@ -230,6 +230,41 @@ def test_small_updates_vanish_without_masters_and_accumulate_with_them(rounding)
     assert o_master.master_resyncs == 0
 
 
+def test_tiny_llama_bf16_dead_zone_and_master_accumulation(tokenizer):
+    """The real model: with lr*update << 2**-8*|w| plain bf16 AdamW cannot move large weights; masters do."""
+    from research_rl.models.tiny import build_tiny_llama
+
+    def make(master: bool):
+        model = build_tiny_llama(len(tokenizer), seed=0).to(torch.bfloat16)
+        opt = HookedOptimizer(
+            torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.0),
+            model.named_parameters(),
+            master_weights=master,
+            precision_check="off",
+        )
+        return model, opt
+
+    plain, o_plain = make(False)
+    model, opt = make(True)
+    w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+    ids = torch.tensor([[1, 5, 6, 7, 8, 9, 10, 2]])
+    for _ in range(10):
+        for net, o in ((plain, o_plain), (model, opt)):
+            o.zero_grad()
+            net(input_ids=ids, labels=ids).loss.backward()
+            o.step()
+    big_total, master_moved = 0, 0
+    for (n, p), (_, q) in zip(plain.named_parameters(), model.named_parameters()):
+        big = w0[n].float().abs() >= 2**-6  # half an ulp >= 2**-14 ≈ 6.1e-5 >> one Adam step (~lr = 1e-5)
+        assert torch.equal(p.detach()[big], w0[n][big]), n  # every update rounded away
+        m = opt.master_of(q)
+        assert m is not None
+        master_moved += int((m[big] != w0[n].float()[big]).sum())
+        big_total += int(big.sum())
+    assert big_total > 1000 and master_moved > 0.5 * big_total  # most large weights moved in the master
+    assert opt.master_resyncs == 0
+
+
 # ------------------------------------------------------------------------- bit-exact reference
 @pytest.mark.parametrize("clip", [None, 0.05])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

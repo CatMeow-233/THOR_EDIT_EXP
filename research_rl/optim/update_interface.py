@@ -17,6 +17,11 @@ An optimizer step is decomposed into four observable/controllable stages::
 * ``post_step``      – receives the *actual* displacement θ_final − θ_old for every tracked
   parameter, after everything else. Use it for statistics, ledgers, protection state.
 
+With ``HookedOptimizer(master_weights=True)`` the stages after ``post_grad`` run on the fp32 master
+of every bf16/fp16 parameter: ``param``, ``old`` and ``new`` are fp32 there, ``pre_write`` should
+return fp32 for them, and ``post_step`` receives fp32 *master* displacements (the served
+low-precision weight is ``round_to(master)``, see :mod:`research_rl.optim.precision`).
+
 Rules are applied in registration order at every stage. A rule only pays for snapshots of the
 parameters it declares via :meth:`UpdateRule.tracks`. All per-rule state that must survive a
 checkpoint goes through :meth:`state_dict` / :meth:`load_state_dict`; it is stored inside the
