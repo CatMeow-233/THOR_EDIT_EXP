@@ -51,6 +51,8 @@ class RecurrentState(ABC):
     """Abstract per-sample recurrent state (see module docstring for the contract)."""
 
     name: str = "recurrent_state"
+    # True while :meth:`reset` calls :meth:`init`, so implementations can skip init-time warnings
+    _reinitialising: bool = False
 
     @abstractmethod
     def init(
@@ -66,13 +68,20 @@ class RecurrentState(ABC):
     def reset(self, state: State, row_mask: torch.Tensor) -> State:
         """Re-initialise rows where ``row_mask`` is True; other rows are returned unchanged.
 
-        Every key keeps its incoming dtype (fresh values are cast to it), so mixed per-key dtypes survive.
+        Fresh rows come from :meth:`init` (so a subclass's ``init`` override is honoured); while it runs,
+        ``self._reinitialising`` is True so init-time warnings can be skipped. Every key keeps its
+        incoming dtype (fresh values are cast to it), so mixed per-key dtypes survive.
         """
         b = batch_size_of(state)
         if row_mask.shape != (b,):
             raise ValueError(f"row_mask must have shape ({b},), got {tuple(row_mask.shape)}")
         any_t = next(iter(state.values()))
-        fresh = self._fresh(b, any_t.device, self.state_dtype(state))
+        previous = self._reinitialising
+        self._reinitialising = True
+        try:
+            fresh = self.init(b, any_t.device, self.state_dtype(state))
+        finally:
+            self._reinitialising = previous
         return {k: torch.where(_expand_mask(row_mask, v), fresh[k].to(v.dtype), v) for k, v in state.items()}
 
     def state_dtype(self, state: State) -> torch.dtype:
@@ -82,10 +91,6 @@ class RecurrentState(ABC):
         different precisions override this.
         """
         return _float_dtype(state)
-
-    def _fresh(self, batch_size: int, device: torch.device | str | None, dtype: torch.dtype) -> State:
-        """Fresh state for internal use (:meth:`reset`); implementations may skip init-time warnings here."""
-        return self.init(batch_size, device, dtype)
 
     def state_dict(self) -> dict[str, Any]:
         return {}
@@ -126,20 +131,24 @@ class FastSlowMemory(RecurrentState):
       (default ``slow_dtype=torch.float32``: at least fp32, i.e. fp32 for bf16/fp16/fp32 and float64
       for float64); ``slow_dtype=None`` stores ``slow`` in ``dtype`` (the pre-fix behaviour);
       ``steps`` is ``torch.long``.
-    * :meth:`update` computes both EMAs in ``promote_types(promote_types(fast, slow), float32)``
-      (inputs are cast straight to that dtype) and feeds the *unrounded* ``f_t`` into the slow EMA;
-      it then rounds ``f_t`` to the fast dtype and ``s_t`` to ``promote_types(incoming slow dtype,
-      slow storage dtype for the fast dtype)``, so a hand-built or pre-fix all-bf16 state gets fp32
-      slow storage on its first update. For an fp32 state all casts are no-ops and the results are
-      bit-identical to the original fp32 implementation.
+    * :meth:`update` computes the fast EMA in ``promote_types(fast dtype, float32)`` (inputs are cast
+      straight to that dtype). ``s_t`` is stored in ``promote_types(incoming slow dtype, slow storage
+      dtype for the fast dtype)`` (never lower than the incoming slow dtype, so a hand-built or pre-fix
+      all-bf16 state gets fp32 slow storage on its first update) and the slow EMA is computed in
+      ``promote_types(that dtype, float32)``, fed with the *unrounded* ``f_t``; finally ``f_t`` is
+      rounded to the fast dtype. For an fp32 state ``fast`` is always bit-identical to the original
+      fp32 implementation, and ``slow`` too whenever it is stored in fp32 (default or ``None``).
     * :meth:`read` returns ``promote_types(fast dtype, slow dtype)`` (fp32 for a bf16 state with the
       default ``slow_dtype``; ``dtype`` itself whenever both keys share it).
     * With half-precision slow storage (``slow_dtype=None`` and a bf16/fp16 state), :meth:`init` emits
       a ``UserWarning`` when ``slow_rate`` or ``fast_rate`` is positive but below that dtype's relative
-      precision ``finfo(dtype).eps / 2`` (2**-8 for bf16, 2**-11 for fp16): the EMA increment is then
-      below half an ulp of the state and is rounded away, so the state never moves. The fast state is
-      always stored in ``dtype``, so a ``fast_rate`` that small also stalls ``fast`` under the default
-      ``slow_dtype`` (not warned about: fast rates are large by design).
+      precision ``finfo(dtype).eps / 2`` (2**-8 for bf16, 2**-11 for fp16). The warning only marks
+      the extreme case: in half precision an increment is rounded away whenever
+      ``|rate · (target − s)| < ulp(s) / 2``, so an EMA stalls at a biased value once it is within
+      ``ulp(s) / (2 · rate)`` of its target, at any rate (e.g. bf16, ``slow_rate=2**-7``, s=1, target
+      0.8 never moves); use the default ``slow_dtype``. The fast state is always stored in ``dtype``,
+      so it is subject to the same stall under the default ``slow_dtype`` (not warned about: fast
+      rates are large by design).
     """
 
     name = "fast_slow_memory"
@@ -168,19 +177,21 @@ class FastSlowMemory(RecurrentState):
         """Dtype in which the slow state is stored for a requested state ``dtype``."""
         return dtype if self.slow_dtype is None else torch.promote_types(dtype, self.slow_dtype)
 
-    def _fresh(self, batch_size: int, device: torch.device | str | None, dtype: torch.dtype) -> State:
-        return {
-            "fast": torch.zeros(batch_size, self.dim, device=device, dtype=dtype),
-            "slow": torch.zeros(batch_size, self.dim, device=device, dtype=self.slow_storage_dtype(dtype)),
-            "steps": torch.zeros(batch_size, dtype=torch.long, device=device),
-        }
-
     def init(
         self, batch_size: int, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
     ) -> State:
-        """Fresh state: ``fast`` in ``dtype``, ``slow`` in :meth:`slow_storage_dtype`, ``steps`` long."""
-        self._warn_if_rounded_away(self.slow_storage_dtype(dtype))
-        return self._fresh(batch_size, device, dtype)
+        """Fresh state: ``fast`` in ``dtype``, ``slow`` in :meth:`slow_storage_dtype`, ``steps`` long.
+
+        Warns (see the class docs) unless called from :meth:`reset`.
+        """
+        slow = self.slow_storage_dtype(dtype)
+        if not self._reinitialising:
+            self._warn_if_rounded_away(slow)
+        return {
+            "fast": torch.zeros(batch_size, self.dim, device=device, dtype=dtype),
+            "slow": torch.zeros(batch_size, self.dim, device=device, dtype=slow),
+            "steps": torch.zeros(batch_size, dtype=torch.long, device=device),
+        }
 
     def _warn_if_rounded_away(self, slow_storage: torch.dtype) -> None:
         if slow_storage not in (torch.bfloat16, torch.float16):
@@ -194,9 +205,10 @@ class FastSlowMemory(RecurrentState):
         if small:
             warnings.warn(
                 f"FastSlowMemory stores its slow state in {slow_storage} and {', '.join(small)} is below "
-                f"that dtype's relative precision ({precision:g}): the EMA increment rate * (target - state) "
-                "is smaller than half an ulp of the state and is rounded away, so the state stops moving. "
-                "Use slow_dtype=torch.float32 (the default) or a larger rate.",
+                f"that dtype's relative precision ({precision:g}): EMA increments rate * (target - state) "
+                "are rounded away, so the state stalls at a biased value. In half precision an EMA stalls "
+                "whenever |rate * (target - state)| < ulp(state) / 2, at any rate, so a larger rate does "
+                "not fix this; use slow_dtype=torch.float32 (the default).",
                 UserWarning,
                 stacklevel=3,
             )
@@ -214,13 +226,16 @@ class FastSlowMemory(RecurrentState):
         f, s, n = state["fast"], state["slow"], state["steps"]
         if inputs.shape != f.shape:
             raise ValueError(f"inputs must have shape {tuple(f.shape)}, got {tuple(inputs.shape)}")
-        compute = torch.promote_types(torch.promote_types(f.dtype, s.dtype), torch.float32)
-        slow_out = torch.promote_types(s.dtype, self.slow_storage_dtype(f.dtype))
-        fc, sc, x = f.to(compute), s.to(compute), inputs.to(compute)
-        f_new = (1.0 - self.fast_rate) * fc + self.fast_rate * x
+        fast_compute = torch.promote_types(f.dtype, torch.float32)
+        slow_out = torch.promote_types(s.dtype, self.slow_storage_dtype(f.dtype))  # >= f.dtype
+        slow_compute = torch.promote_types(slow_out, torch.float32)  # >= fast_compute: casts only widen
+        f_new = (1.0 - self.fast_rate) * f.to(fast_compute) + self.fast_rate * inputs.to(fast_compute)
         n_new = n + 1
         consolidate = (n_new % self.consolidate_every == 0).unsqueeze(-1)
-        s_new = torch.where(consolidate, (1.0 - self.slow_rate) * sc + self.slow_rate * f_new, sc)
+        sc = s.to(slow_compute)
+        s_new = torch.where(
+            consolidate, (1.0 - self.slow_rate) * sc + self.slow_rate * f_new.to(slow_compute), sc
+        )
         new = {"fast": f_new.to(f.dtype), "slow": s_new.to(slow_out), "steps": n_new}
         if active is not None:
             new = {k: torch.where(_expand_mask(active, v), v, state[k].to(v.dtype)) for k, v in new.items()}
@@ -245,12 +260,17 @@ class FastSlowMemory(RecurrentState):
             self.slow_dtype = _resolve_dtype(state["slow_dtype"])
 
 
+_SLOW_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+
 def _resolve_dtype(dtype: torch.dtype | str | None) -> torch.dtype | None:
     if dtype is None:
         return None
     resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
-    if not isinstance(resolved, torch.dtype) or not resolved.is_floating_point:
-        raise ValueError(f"slow_dtype must be None or a floating-point torch dtype, got {dtype!r}")
+    if resolved not in _SLOW_DTYPES:  # float8 etc. cannot be type-promoted
+        raise ValueError(
+            f"slow_dtype must be None or one of float16, bfloat16, float32, float64, got {dtype!r}"
+        )
     return resolved
 
 

@@ -361,3 +361,149 @@ def test_half_precision_slow_storage_warns_when_rate_is_rounded_away(dtype, slow
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         FastSlowMemory(D, fast_rate, slow_rate, consolidate_every=1).init(2, dtype=dtype)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "slow_rate", "warns"),
+    [
+        (torch.bfloat16, 2**-8, False),  # exactly at the threshold: strict '<'
+        (torch.bfloat16, 2**-8 * (1 - 2**-10), True),  # just below
+        (torch.bfloat16, 5e-3, False),  # in [2**-8, 2**-7): pins the threshold at eps/2, not eps
+        (torch.float16, 2**-11, False),
+        (torch.float16, 2**-11 * (1 - 2**-10), True),
+        (torch.float16, 7e-4, False),  # in [2**-11, 2**-10)
+    ],
+)
+def test_rounding_warning_threshold_is_half_eps_and_strict(dtype, slow_rate, warns):
+    mem = FastSlowMemory(D, 0.5, slow_rate, consolidate_every=1, slow_dtype=None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mem.init(1, dtype=dtype)
+    assert len([w for w in caught if issubclass(w.category, UserWarning)]) == (1 if warns else 0)
+
+
+def test_bf16_state_feeds_unrounded_fp32_input_and_fast_into_slow_ema():
+    """Pins "compute in fp32" on the input path: x = 1 + 2**-10 is not representable in bf16.
+
+    Arithmetic: fast (bf16) converges to exactly 1.0 (f_new = 0.5 * 1 + 0.5 * x = 1 + 2**-11 is below
+    half a bf16 ulp above 1, so it rounds back to 1.0), while the slow EMA (fp32) is fed the unrounded
+    f_new = 1 + 2**-11 every step and converges to it. Rounding x (or f_new) to bf16 first gives 1.0.
+    """
+    x_val = 1.0 + 2**-10
+    mem = FastSlowMemory(D, fast_rate=0.5, slow_rate=1e-2, consolidate_every=1)
+    state = mem.init(1, dtype=torch.bfloat16)
+    x = torch.full((1, D), x_val, dtype=torch.float32)
+    for _ in range(2000):
+        state = mem.update(state, x)
+    assert bool((state["fast"] == 1.0).all())
+    # Tolerance 2**-14: an fp32 EMA at rate 1e-2 stalls once rate * gap < ulp(1)/2 = 2**-24, i.e.
+    # up to ~6e-6 short of the target, while the rounded-input bug misses it by 2**-11 ≈ 4.9e-4.
+    target = 1.0 + 2**-11
+    assert float((state["slow"].double() - target).abs().max()) < 2**-14
+    assert float(state["slow"].min()) > 1.0 + 2**-12
+
+
+def test_fp32_state_with_float64_slow_storage_keeps_fast_bit_identical():
+    """slow_dtype=float64 must not change how the fp32 fast EMA is computed (spec: fp32 compute)."""
+    mem = FastSlowMemory(D, 0.3, 0.07, 1, slow_dtype=torch.float64)
+    b, steps = 4, 50
+    xs = inputs(b, steps, 11).float()
+    new = mem.init(b)
+    assert (new["fast"].dtype, new["slow"].dtype) == (torch.float32, torch.float64)
+    old = {k: v.clone() for k, v in mem.init(b).items()}
+    old["slow"] = old["slow"].float()
+    s64 = torch.zeros(b, D, dtype=torch.float64)
+    for t in range(steps):
+        new = mem.update(new, xs[t])
+        old = old_update(mem, old, xs[t])
+        assert torch.equal(new["fast"], old["fast"]), t
+        # the slow EMA runs in float64 on the fp32-computed fast value (fast is fp32: no rounding)
+        s64 = (1.0 - mem.slow_rate) * s64 + mem.slow_rate * new["fast"].double()
+    assert new["slow"].dtype == torch.float64
+    torch.testing.assert_close(new["slow"], s64, rtol=0, atol=1e-12)
+
+
+class _PrimedMemory(FastSlowMemory):
+    """A subclass whose fresh state starts the slow memory from a prior value."""
+
+    def init(self, batch_size, device=None, dtype=torch.float32):
+        state = super().init(batch_size, device, dtype)
+        state["slow"] = torch.full_like(state["slow"], 0.5)
+        return state
+
+
+class _GatedMemory(FastSlowMemory):
+    """A subclass that adds its own key to the state."""
+
+    def init(self, batch_size, device=None, dtype=torch.float32):
+        state = super().init(batch_size, device, dtype)
+        state["gate"] = torch.ones(batch_size, self.dim, device=device, dtype=dtype)
+        return state
+
+    def update(self, state, inputs, active=None):
+        new = super().update({k: v for k, v in state.items() if k != "gate"}, inputs, active)
+        new["gate"] = state["gate"] * 0.5
+        return new
+
+
+def test_reset_goes_through_a_subclass_init():
+    primed = _PrimedMemory(2, 0.5, 0.5, 1)
+    st = primed.init(2)
+    for _ in range(3):
+        st = primed.update(st, torch.ones(2, 2))
+    r = primed.reset(st, torch.tensor([True, False]))
+    assert torch.equal(r["slow"][0], torch.full((2,), 0.5)) and torch.equal(r["slow"][1], st["slow"][1])
+    gated = _GatedMemory(2, 0.5, 0.5, 1)
+    st = gated.init(2, dtype=torch.bfloat16)
+    st = gated.update(st, torch.ones(2, 2))
+    r = gated.reset(st, torch.tensor([True, False]))
+    assert torch.equal(r["gate"][0], torch.ones(2, dtype=torch.bfloat16))
+    assert torch.equal(r["gate"][1], st["gate"][1])
+    assert {k: v.dtype for k, v in r.items()} == {k: v.dtype for k, v in st.items()}
+
+
+def test_reset_keeps_each_incoming_key_dtype():
+    mem = FastSlowMemory(D, ETA_F, ETA_S, 1)
+    mask = torch.tensor([True, False])
+    hand = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in mem.init(2).items()}
+    hand = {k: v + 1 for k, v in hand.items()}
+    r = mem.reset(hand, mask)
+    assert {k: v.dtype for k, v in r.items()} == {k: v.dtype for k, v in hand.items()}
+    assert (
+        r["slow"].dtype == torch.bfloat16
+        and not r["slow"][0].any()
+        and torch.equal(r["slow"][1], hand["slow"][1])
+    )
+    wide = mem.init(2, dtype=torch.bfloat16)
+    wide["slow"] = wide["slow"].double() + 1
+    r = mem.reset(wide, mask)
+    assert (r["fast"].dtype, r["slow"].dtype) == (torch.bfloat16, torch.float64)
+    assert not r["slow"][0].any() and torch.equal(r["slow"][1], wide["slow"][1])
+
+
+def test_update_never_lowers_a_wider_slow_row():
+    mem = FastSlowMemory(D, ETA_F, ETA_S, 1)
+    store = StateStore(mem, dtype=torch.bfloat16)
+    st = store.gather(["w"])
+    store.scatter(["w"], {k: v.double() if k == "slow" else v for k, v in st.items()})
+    store.step(["w", "fresh"], inputs(2, 1, 12)[0])
+    for sid in ("w", "fresh"):
+        row = store.get(sid)
+        assert (row["fast"].dtype, row["slow"].dtype) == (torch.bfloat16, torch.float64), sid
+
+
+def test_slow_dtype_rejects_unusable_float_dtypes_and_legacy_load_keeps_default():
+    for bad in ("float8_e4m3fn", "float8_e5m2"):
+        with pytest.raises(ValueError, match="slow_dtype"):
+            FastSlowMemory(D, slow_dtype=bad)
+        sd = FastSlowMemory(D).state_dict()
+        sd["slow_dtype"] = bad
+        with pytest.raises(ValueError, match="slow_dtype"):
+            FastSlowMemory(D).load_state_dict(sd)
+    for ok in ("float16", "bfloat16", "float32", "float64"):
+        assert FastSlowMemory(D, slow_dtype=ok).slow_dtype == getattr(torch, ok)
+    # a pre-fix checkpoint (no slow_dtype key) loaded into a default module keeps fp32 slow storage
+    legacy = {k: v for k, v in FastSlowMemory(D, slow_dtype=None).state_dict().items() if k != "slow_dtype"}
+    mem = FastSlowMemory(D)
+    mem.load_state_dict(legacy)
+    assert mem.slow_dtype == torch.float32
