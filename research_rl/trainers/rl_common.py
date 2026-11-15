@@ -86,7 +86,8 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   Rejected with a clear error instead of mis-routing: ``use_vllm`` (the vLLM engine serves a
   vanilla model and weight sync would push the renamed ``mlp.experts.<name>.*`` keys), PEFT
   (adapters would wrap the expert FFNs independently of the manager's freezing),
-  ``remove_unused_columns=True`` (drops the expert column), ``num_beams`` /
+  ``remove_unused_columns=True`` (drops the expert column), ``sync_ref_model`` (mixes policy
+  parameters into the reference by position), ``num_beams`` /
   ``num_return_sequences`` > 1 (expand the FFN batch), a model that does not contain the
   manager's FFNs, and for *mixed* batches: continuous-batching generation, a GRPO
   ``rollout_func``, tool-call re-generation of a subset of rows, multimodal inputs.
@@ -329,6 +330,12 @@ class RLRolloutMixin:
                     "use_vllm=True is not supported with an ExpertManager: the vLLM engine serves a vanilla "
                     "model (no per-row experts), and its weight sync would push the renamed "
                     "mlp.experts.<name>.* keys. Use transformers generation (use_vllm=False)."
+                )
+            if getattr(training_args, "sync_ref_model", False):
+                raise ExpertError(
+                    "sync_ref_model=True is not supported with an ExpertManager: TRL mixes the policy's "
+                    "parameters into the vanilla reference model position by position, which does not line "
+                    "up once expert FFNs are attached (and the reference would stop being the base model)"
                 )
             if getattr(training_args, "remove_unused_columns", False):
                 raise ExpertError(

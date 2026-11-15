@@ -22,19 +22,24 @@ from typing import Any
 
 import pytest
 import torch
+import trl.trainer.grpo_trainer as grpo_trainer_module
+import trl.trainer.rloo_trainer as rloo_trainer_module
 from datasets import Dataset
 from transformers import AutoModelForCausalLM
 from trl import GRPOConfig, GRPOTrainer, RLOOConfig, RLOOTrainer
 
+from research_rl.core.checkpoint import COMPONENTS_FILE
 from research_rl.core.config import DataSpec, ExperimentConfig, ModelSpec, OptimSpec, TrainerSpec
 from research_rl.models.expert_manager import ExpertError, ExpertFFN, ExpertManager
 from research_rl.models.model_interface import snapshot
+from research_rl.models.parameter_mask import ParameterMask
 from research_rl.models.tiny import build_tiny_llama
+from research_rl.optim.update_interface import MaskRule
 from research_rl.rollout.policy_version import read_policy_version
 from research_rl.rollout.trajectory import RolloutBatch, TrajectoryBuffer
 from research_rl.trainers import build_run
 from research_rl.trainers.grpo_adapter import ResearchGRPOTrainer
-from research_rl.trainers.rl_common import EXPERT_KEY
+from research_rl.trainers.rl_common import EXPERT_KEY, ROLLOUT_COMPONENT
 from research_rl.trainers.rloo_adapter import ResearchRLOOTrainer
 
 # expert of a prompt, by its first character ("c" rows have no expert -> the active expert "math")
@@ -152,7 +157,7 @@ class RecordingRLOO(_Capture, ResearchRLOOTrainer):  # type: ignore[misc]  # TRL
 TRAINERS = {"grpo": RecordingGRPO, "rloo": RecordingRLOO}
 
 
-def make_trainer(algorithm, tokenizer, tmp_path, model, mgr, dataset=None, **overrides):
+def make_trainer(algorithm, tokenizer, tmp_path, model, mgr, dataset=None, trainer_kwargs=None, **overrides):
     return TRAINERS[algorithm](
         model=model,
         reward_funcs=digit_fraction,
@@ -160,6 +165,7 @@ def make_trainer(algorithm, tokenizer, tmp_path, model, mgr, dataset=None, **ove
         train_dataset=mixed_dataset() if dataset is None else dataset,
         processing_class=tokenizer,
         expert_manager=mgr,
+        **(trainer_kwargs or {}),
     )
 
 
@@ -172,6 +178,7 @@ class RoutingChecker:
         self.errors: list[str] = []
         self.events: list[tuple[str, int, bool]] = []  # (kind, rows, grad enabled)
         self.rows_by_kind: dict[tuple[str, str], int] = {}  # (kind, expert) -> rows processed
+        self.mixed_kinds: set[str] = set()  # kinds of forwards whose rows belong to several experts
         self.kind = ""
         self._x: dict[int, torch.Tensor] = {}
         self._seen: dict[int, int] = {}
@@ -205,6 +212,8 @@ class RoutingChecker:
             if self.rows is None or len(self.rows) != input_ids.shape[0]:
                 self.errors.append(f"decode step of {input_ids.shape[0]} rows without a matching prefill")
         self.events.append((self.kind, int(input_ids.shape[0]), grad))
+        if self.rows is not None and len(set(self.rows)) > 1:
+            self.mixed_kinds.add(self.kind)
 
     def _ffn_pre(self, module, args):
         self._x[id(module)] = args[0].detach()
@@ -382,6 +391,8 @@ def test_use_vllm_with_experts_raises_through_the_adapter(tokenizer, tmp_path):
 
 def test_invalid_expert_setups_raise(tokenizer, tmp_path):
     model, mgr = experts_model(tokenizer)
+    with pytest.raises(ExpertError, match="sync_ref_model"):
+        make_trainer("grpo", tokenizer, tmp_path, model, mgr, beta=0.1, sync_ref_model=True)
     with pytest.raises(ExpertError, match="remove_unused_columns"):
         make_trainer("grpo", tokenizer, tmp_path, model, mgr, remove_unused_columns=True)
     with pytest.raises(ExpertError, match="num_return_sequences"):
@@ -551,11 +562,13 @@ def test_mixed_experts_route_every_forward_record_and_train_only_their_expert(to
     assert len(trainer.lag0) == 4  # 2 lag-0 micro-batches per generation
     for inputs, logps in trainer.lag0:
         mask = inputs["completion_mask"].bool()
+        # shuffled micro-batches differ in composition from the chunks: allow float32 round-off
+        # (bit-exact equality with an identity shuffle: test_log_prob_chunks_and_micro_batches_...)
         if algorithm == "grpo":
-            old = inputs["old_per_token_logps"]
-            assert torch.equal(logps[mask], old[mask])
+            new, old = logps[mask], inputs["old_per_token_logps"][mask]
         else:
-            assert torch.equal((logps * inputs["completion_mask"]).sum(1), inputs["old_logps"])
+            new, old = (logps * inputs["completion_mask"]).sum(1), inputs["old_logps"]
+        torch.testing.assert_close(new, old, rtol=0, atol=1e-4)
 
     # ---- integrity: backbone, base and the frozen expert bit-unchanged; the trainable one trained
     mgr.assert_backbone_unchanged()
@@ -644,10 +657,21 @@ def test_rows_of_frozen_experts_only_leave_the_trainable_expert_unchanged(tokeni
     model, mgr = experts_model(tokenizer)
     before = snapshot(model)
     data = Dataset.from_list([{"prompt": f"b{i}+1=", "expert": "code"} for i in range(4)])
+    # a HookedOptimizer rule on the trainable expert must cope with its grad=None
+    rule = MaskRule(ParameterMask.all_trainable(model, mgr.expert_parameter_names("math")))
     trainer = make_trainer(
-        "grpo", tokenizer, tmp_path, model, mgr, dataset=data, activation_checkpointing=checkpointing
+        "grpo",
+        tokenizer,
+        tmp_path,
+        model,
+        mgr,
+        dataset=data,
+        trainer_kwargs={"update_rules": [rule]},
+        activation_checkpointing=checkpointing,
     )
     trainer.train()
+    opt = trainer.hooked_optimizer
+    assert opt is not None and opt.nominal_steps == 4
     after = snapshot(model)
     for name, value in before.items():
         assert torch.equal(after[name], value), name
@@ -743,3 +767,112 @@ def test_kl_reference_is_the_base_model_for_every_row(tokenizer, tiny_model_dir,
         torch.testing.assert_close(ref_logps[mask], base[mask], rtol=0, atol=1e-6)
         assert (ref_logps[mask] - code[mask]).abs().max() > 1e-3
     mgr.assert_backbone_unchanged()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("shuffle", ["identity", "random"])
+@pytest.mark.parametrize("algorithm", ["grpo", "rloo"])
+def test_log_prob_chunks_and_micro_batches_mixing_experts(
+    tokenizer, tmp_path, monkeypatch, algorithm, shuffle
+):
+    """Chunks / micro-batches of 4 rows span two prompts, so single chunks mix experts.
+
+    With TRL's shuffle replaced by the identity, micro-batch ``i`` holds exactly the rows of
+    old-log-prob chunk ``i`` (same rows, same order, same routing groups): the two forwards must be
+    bit-identical (ratio exactly 1). With the real shuffle, the batch composition differs and the
+    expert sub-batches differ in size, which moves float32 results by a few ulp (observed <= 4e-6
+    for RLOO's summed log-probs over 20 seeds); a misrouted chunk moves them by ~0.1-1.
+    """
+    if shuffle == "identity":
+        monkeypatch.setattr(grpo_trainer_module, "shuffle_sequence_dict", lambda batch: batch)
+        monkeypatch.setattr(rloo_trainer_module, "shuffle_sequence_dict", lambda batch: batch)
+    model, mgr = experts_model(tokenizer)
+    trainer = make_trainer(
+        algorithm,
+        tokenizer,
+        tmp_path,
+        model,
+        mgr,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=1,
+        steps_per_generation=2,  # > gradient_accumulation_steps: GRPO computes old log-probs
+        max_steps=6,
+    )
+    trainer.lag0 = []
+    checker = RoutingChecker(model, mgr, tokenizer)
+    try:
+        trainer.train()
+    finally:
+        checker.close()
+    assert checker.errors == []
+    assert {"prefill", "decode", "logp", "loss"} <= checker.mixed_kinds
+    assert ("logp", 4, False) in checker.events and ("loss", 4, True) in checker.events
+    assert len(trainer.lag0) == 3  # the first micro-batch of each of the 3 generations
+    mixed = 0
+    for inputs, logps in trainer.lag0:
+        mixed += len(set(inputs[EXPERT_KEY].tolist())) > 1
+        mask = inputs["completion_mask"].bool()
+        if algorithm == "grpo":
+            new, old = logps[mask], inputs["old_per_token_logps"][mask]
+        else:
+            new, old = (logps * inputs["completion_mask"]).sum(1), inputs["old_logps"]
+        if shuffle == "identity":
+            assert torch.equal(new, old)
+        else:
+            torch.testing.assert_close(new, old, rtol=0, atol=1e-4)
+    assert mixed > 0
+    mgr.assert_backbone_unchanged()
+
+
+@pytest.mark.integration
+def test_expert_counters_survive_checkpoint_resume(tokenizer, tmp_path):
+    def run(name):
+        model, mgr = experts_model(tokenizer)
+        exp = ExperimentConfig(
+            study_id="experts",
+            model=ModelSpec(name_or_path="tiny"),
+            data=DataSpec(name="synthetic"),
+            trainer=TrainerSpec(
+                algorithm="grpo",
+                args={
+                    "per_device_train_batch_size": 2,
+                    "num_generations": 2,
+                    "gradient_accumulation_steps": 2,
+                    "steps_per_generation": 4,
+                    "max_completion_length": 6,
+                    "max_steps": 4,
+                    "save_strategy": "steps",
+                    "save_steps": 2,  # a generation boundary
+                },
+            ),
+            seed=0,
+            output_dir=str(tmp_path),
+            run_name=name,
+            optim=OptimSpec(hooked=True),
+        )
+        return build_run(
+            exp,
+            train_dataset=mixed_dataset(),
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=digit_fraction,
+            expert_manager=mgr,
+            record=False,
+        )
+
+    first = run("a")
+    first.train()
+    ckpt = first.config.run_dir / "trainer" / "checkpoint-2"
+    saved = torch.load(ckpt / COMPONENTS_FILE, weights_only=True)[ROLLOUT_COMPONENT]
+    at_ckpt = first.trainer.trajectory_buffer  # first generation batch only at step 2
+    assert sum(saved["expert_samples"].values()) == 8 == saved["total_samples"]
+    resumed = run("a")
+    resumed.train(resume_from_checkpoint=str(ckpt))
+    buf = resumed.trainer.trajectory_buffer
+    assert buf.total_samples == 16 == at_ckpt.total_samples
+    latest = buf.latest()
+    assert latest is not None and latest.expert_ids is not None
+    expected = dict(saved["expert_samples"])
+    for name in latest.expert_ids:
+        expected[name] = expected.get(name, 0) + 1
+    assert buf.expert_samples == expected
