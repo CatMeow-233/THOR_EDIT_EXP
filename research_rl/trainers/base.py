@@ -30,7 +30,7 @@ from research_rl.core.checkpoint import (
     save_components,
     save_research_state,
 )
-from research_rl.core.config import ExperimentConfig, ModelSpec
+from research_rl.core.config import ExperimentConfig, ModelSpec, OptimSpec
 from research_rl.core.experiment import ExperimentRecorder
 from research_rl.optim.optimizer_wrapper import HookedOptimizer, unwrap_hooked
 from research_rl.optim.update_interface import UpdateRule
@@ -58,7 +58,12 @@ def load_tokenizer(spec: ModelSpec) -> Any:
 
 
 class ResearchTrainerMixin:
-    """Mix *before* a TRL trainer class: ``class X(ResearchTrainerMixin, GRPOTrainer)``."""
+    """Mix *before* a TRL trainer class: ``class X(ResearchTrainerMixin, GRPOTrainer)``.
+
+    ``master_weights``, ``write_rounding`` and ``precision_check`` are forwarded to
+    :class:`HookedOptimizer` (see its docstring; ``rounding_seed`` is ``TrainingArguments.seed``).
+    Setting ``master_weights=True`` or stochastic rounding implies the hooked optimizer.
+    """
 
     def __init__(
         self,
@@ -67,11 +72,26 @@ class ResearchTrainerMixin:
         clip_in_wrapper: float | None = None,
         hooked_optimizer: bool = True,
         components: Mapping[str, StatefulComponent] | None = None,
+        master_weights: bool = False,
+        write_rounding: str = "nearest",
+        precision_check: str = "warn",
         **kwargs: Any,
     ) -> None:
         self._rr_rules = list(update_rules)
         self._rr_clip = clip_in_wrapper
-        self._rr_hooked = hooked_optimizer or bool(update_rules) or clip_in_wrapper is not None
+        # Precision options of HookedOptimizer; stochastic rounding is seeded from TrainingArguments.seed.
+        self._rr_precision: dict[str, Any] = {
+            "master_weights": bool(master_weights),
+            "write_rounding": write_rounding,
+            "precision_check": precision_check,
+        }
+        self._rr_hooked = (
+            hooked_optimizer
+            or bool(update_rules)
+            or clip_in_wrapper is not None
+            or bool(master_weights)
+            or write_rounding != "nearest"
+        )
         self.research_components: dict[str, StatefulComponent] = dict(components or {})
         if clip_in_wrapper is not None:
             training_args = kwargs.get("args")
@@ -87,7 +107,14 @@ class ResearchTrainerMixin:
         opt = self.optimizer  # type: ignore[has-type]
         if self._rr_hooked and not isinstance(opt, HookedOptimizer):
             target = self.model if model is None else model  # type: ignore[attr-defined]
-            hooked = HookedOptimizer(opt, target.named_parameters(), self._rr_rules, clip_norm=self._rr_clip)
+            hooked = HookedOptimizer(
+                opt,
+                target.named_parameters(),
+                self._rr_rules,
+                clip_norm=self._rr_clip,
+                rounding_seed=int(self.args.seed),  # type: ignore[attr-defined]
+                **self._rr_precision,
+            )
             # HF clips *before* optimizer.step(); rules that need unclipped gradients check this flag.
             hooked.step_extras["hf_max_grad_norm"] = float(self.args.max_grad_norm or 0.0)  # type: ignore[attr-defined]
             self.optimizer = hooked
@@ -106,6 +133,20 @@ class ResearchTrainerMixin:
             load_research_state(resume_from_checkpoint)  # validates config_version
             load_components(resume_from_checkpoint, self.research_components)
         return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)  # type: ignore[misc]
+
+
+def precision_info(model: torch.nn.Module, optim: OptimSpec) -> dict[str, Any]:
+    """``{"param_dtypes": {dtype: #trainable tensors}, "master_weights", "write_rounding"}`` for the record."""
+    dtypes: dict[str, int] = {}
+    for p in model.parameters():
+        if p.requires_grad:
+            key = str(p.dtype).removeprefix("torch.")
+            dtypes[key] = dtypes.get(key, 0) + 1
+    return {
+        "param_dtypes": dict(sorted(dtypes.items())),
+        "master_weights": bool(optim.master_weights),
+        "write_rounding": optim.write_rounding,
+    }
 
 
 _CLASS_CACHE: dict[type, type] = {}
@@ -285,10 +326,14 @@ class TrainerAdapter:
             clip_in_wrapper=exp.optim.clip_in_wrapper,
             hooked_optimizer=exp.optim.hooked,
             components=components,
+            master_weights=exp.optim.master_weights,
+            write_rounding=exp.optim.write_rounding,
+            precision_check=exp.optim.precision_check,
             **self.trainer_kwargs(exp, **algo_kwargs),
         )
         callback.bind(trainer)
         if recorder is not None:
             recorder.set_model(trainer.model, spec.revision)
             recorder.set_dataset(train_dataset, exp.data.name)
+            recorder.set_extra("precision", precision_info(trainer.model, exp.optim))
         return ResearchRun(config=exp, trainer=trainer, recorder=recorder, callback=callback)

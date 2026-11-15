@@ -9,6 +9,13 @@ from research_rl.optim.parameter_prior import (
     TaskVectorPrior,
     project_onto_span,
 )
+from research_rl.optim.precision import (
+    is_low_precision,
+    low_precision_trainable,
+    round_to,
+    rounding_generator,
+    stochastic_round,
+)
 from research_rl.optim.update_interface import DisplacementLedger, MaskRule, StepContext, UpdateRule
 
 __all__ = [
@@ -21,8 +28,13 @@ __all__ = [
     "TaskVector",
     "TaskVectorPrior",
     "UpdateRule",
+    "is_low_precision",
+    "low_precision_trainable",
     "project_onto_span",
     "register_gradient_masks",
     "register_gradient_transform",
+    "round_to",
+    "rounding_generator",
+    "stochastic_round",
     "unwrap_hooked",
 ]
