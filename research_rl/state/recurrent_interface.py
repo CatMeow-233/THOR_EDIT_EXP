@@ -4,8 +4,10 @@ Contract (:class:`RecurrentState`): a state is a ``dict[str, Tensor]`` whose ten
 batch dimension first. Implementations must be **row-wise**: row i of ``update(state, inputs)``
 depends only on row i of ``state`` and ``inputs`` (no batch statistics, no cross-row mixing).
 
-* ``init(batch_size, device, dtype)`` – fresh state,
-* ``read(state)`` – the readout tensor ``[B, ...]``,
+* ``init(batch_size, device, dtype)`` – fresh state; ``dtype`` is the *requested* state dtype, an
+  implementation may store individual keys at a different (e.g. higher) precision, so the tensors of
+  one state can have different dtypes per key,
+* ``read(state)`` – the readout tensor ``[B, ...]`` (one dtype),
 * ``update(state, inputs, active=None)`` – functional update (rows with ``active=False`` keep
   their state),
 * ``reset(state, row_mask)`` – re-initialise only the rows where ``row_mask`` is True,
@@ -16,6 +18,12 @@ state across batches: unknown ids get a fresh state, batches are gathered/scatte
 scatter must use exactly the ids of the preceding gather (otherwise it raises), and a single
 row is never broadcast to several ids. It implements the checkpoint ``StatefulComponent``
 protocol (:mod:`research_rl.core.checkpoint`) so it can be passed as a trainer component.
+Stored rows and checkpoints keep each key's own dtype (mixed per-key dtypes round-trip through
+``torch.save`` / ``torch.load(weights_only=True)`` unchanged).
+
+Precision: :class:`FastSlowMemory` computes every update in at least fp32 and by default stores its
+slow (low-rate) state in at least fp32 even for a bf16/fp16 state, because a slow EMA increment
+``η_s · (f − s)`` is easily below half an ulp of a half-precision ``s`` and would be rounded away.
 
 Reference implementation: :class:`FastSlowMemory`. What is NOT provided: any learned memory
 architecture or integration into a model's forward pass; those are research code on top.
@@ -23,6 +31,7 @@ architecture or integration into a model's forward pass; those are research code
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Mapping, Sequence
 from typing import Any
@@ -42,6 +51,8 @@ class RecurrentState(ABC):
     """Abstract per-sample recurrent state (see module docstring for the contract)."""
 
     name: str = "recurrent_state"
+    # True while :meth:`reset` calls :meth:`init`, so implementations can skip init-time warnings
+    _reinitialising: bool = False
 
     @abstractmethod
     def init(
@@ -55,13 +66,31 @@ class RecurrentState(ABC):
     def update(self, state: State, inputs: torch.Tensor, active: torch.Tensor | None = None) -> State: ...
 
     def reset(self, state: State, row_mask: torch.Tensor) -> State:
-        """Re-initialise rows where ``row_mask`` is True; other rows are returned unchanged."""
+        """Re-initialise rows where ``row_mask`` is True; other rows are returned unchanged.
+
+        Fresh rows come from :meth:`init` (so a subclass's ``init`` override is honoured); while it runs,
+        ``self._reinitialising`` is True so init-time warnings can be skipped. Every key keeps its
+        incoming dtype (fresh values are cast to it), so mixed per-key dtypes survive.
+        """
         b = batch_size_of(state)
         if row_mask.shape != (b,):
             raise ValueError(f"row_mask must have shape ({b},), got {tuple(row_mask.shape)}")
         any_t = next(iter(state.values()))
-        fresh = self.init(b, any_t.device, _float_dtype(state))
+        previous = self._reinitialising
+        self._reinitialising = True
+        try:
+            fresh = self.init(b, any_t.device, self.state_dtype(state))
+        finally:
+            self._reinitialising = previous
         return {k: torch.where(_expand_mask(row_mask, v), fresh[k].to(v.dtype), v) for k, v in state.items()}
+
+    def state_dtype(self, state: State) -> torch.dtype:
+        """The dtype that was requested from :meth:`init` for ``state`` (used by :meth:`reset`).
+
+        Default: the dtype of the first floating-point tensor. Implementations that store keys at
+        different precisions override this.
+        """
+        return _float_dtype(state)
 
     def state_dict(self) -> dict[str, Any]:
         return {}
@@ -95,13 +124,45 @@ class FastSlowMemory(RecurrentState):
 
     ``read(state) = concat(f, s)`` of shape ``[B, 2d]``. Initial state: f = s = 0, n = 0. Step counters
     are per row, so rows reset at different times keep independent consolidation schedules.
+
+    Precision (``init(..., dtype)`` is the *requested* state dtype):
+
+    * ``fast`` is stored in ``dtype``; ``slow`` is stored in ``promote_types(dtype, slow_dtype)``
+      (default ``slow_dtype=torch.float32``: at least fp32, i.e. fp32 for bf16/fp16/fp32 and float64
+      for float64); ``slow_dtype=None`` stores ``slow`` in ``dtype`` (the pre-fix behaviour);
+      ``steps`` is ``torch.long``.
+    * :meth:`update` computes the fast EMA in ``promote_types(fast dtype, float32)`` (inputs are cast
+      straight to that dtype). ``s_t`` is stored in ``promote_types(incoming slow dtype, slow storage
+      dtype for the fast dtype)`` (never lower than the incoming slow dtype, so a hand-built or pre-fix
+      all-bf16 state gets fp32 slow storage on its first update) and the slow EMA is computed in
+      ``promote_types(that dtype, float32)``, fed with the *unrounded* ``f_t``; finally ``f_t`` is
+      rounded to the fast dtype. For an fp32 state ``fast`` is always bit-identical to the original
+      fp32 implementation, and ``slow`` too whenever it is stored in fp32 (default or ``None``).
+    * :meth:`read` returns ``promote_types(fast dtype, slow dtype)`` (fp32 for a bf16 state with the
+      default ``slow_dtype``; ``dtype`` itself whenever both keys share it).
+    * With half-precision slow storage (``slow_dtype=None`` and a bf16/fp16 state), :meth:`init` emits
+      a ``UserWarning`` when ``slow_rate`` or ``fast_rate`` is positive but below that dtype's relative
+      precision ``finfo(dtype).eps / 2`` (2**-8 for bf16, 2**-11 for fp16). The warning only marks
+      the extreme case: in half precision an increment is rounded away whenever
+      ``|rate · (target − s)| < ulp(s) / 2``, so an EMA stalls at a biased value once it is within
+      ``ulp(s) / (2 · rate)`` of its target, at any rate (e.g. bf16, ``slow_rate=2**-7``, s=1, target
+      0.8 never moves); use the default ``slow_dtype``. The fast state is always stored in ``dtype``,
+      so it is subject to the same stall under the default ``slow_dtype`` (not warned about: fast
+      rates are large by design).
     """
 
     name = "fast_slow_memory"
 
     def __init__(
-        self, dim: int, fast_rate: float = 0.5, slow_rate: float = 0.05, consolidate_every: int = 4
+        self,
+        dim: int,
+        fast_rate: float = 0.5,
+        slow_rate: float = 0.05,
+        consolidate_every: int = 4,
+        slow_dtype: torch.dtype | str | None = torch.float32,
     ) -> None:
+        """``slow_dtype``: minimum storage precision of the slow state, a floating ``torch.dtype`` or its
+        name (e.g. ``"float32"``); ``None`` stores it in the requested state dtype. See the class docs."""
         if not (0.0 < fast_rate <= 1.0 and 0.0 <= slow_rate <= 1.0):
             raise ValueError("rates must lie in (0, 1] (fast) and [0, 1] (slow)")
         if consolidate_every < 1:
@@ -110,31 +171,74 @@ class FastSlowMemory(RecurrentState):
         self.fast_rate = float(fast_rate)
         self.slow_rate = float(slow_rate)
         self.consolidate_every = int(consolidate_every)
+        self.slow_dtype = _resolve_dtype(slow_dtype)
+
+    def slow_storage_dtype(self, dtype: torch.dtype) -> torch.dtype:
+        """Dtype in which the slow state is stored for a requested state ``dtype``."""
+        return dtype if self.slow_dtype is None else torch.promote_types(dtype, self.slow_dtype)
 
     def init(
         self, batch_size: int, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
     ) -> State:
+        """Fresh state: ``fast`` in ``dtype``, ``slow`` in :meth:`slow_storage_dtype`, ``steps`` long.
+
+        Warns (see the class docs) unless called from :meth:`reset`.
+        """
+        slow = self.slow_storage_dtype(dtype)
+        if not self._reinitialising:
+            self._warn_if_rounded_away(slow)
         return {
             "fast": torch.zeros(batch_size, self.dim, device=device, dtype=dtype),
-            "slow": torch.zeros(batch_size, self.dim, device=device, dtype=dtype),
+            "slow": torch.zeros(batch_size, self.dim, device=device, dtype=slow),
             "steps": torch.zeros(batch_size, dtype=torch.long, device=device),
         }
 
+    def _warn_if_rounded_away(self, slow_storage: torch.dtype) -> None:
+        if slow_storage not in (torch.bfloat16, torch.float16):
+            return
+        precision = torch.finfo(slow_storage).eps / 2  # unit roundoff: 2**-8 (bf16), 2**-11 (fp16)
+        small = [
+            f"{name}={rate:g}"
+            for name, rate in (("slow_rate", self.slow_rate), ("fast_rate", self.fast_rate))
+            if 0.0 < rate < precision
+        ]
+        if small:
+            warnings.warn(
+                f"FastSlowMemory stores its slow state in {slow_storage} and {', '.join(small)} is below "
+                f"that dtype's relative precision ({precision:g}): EMA increments rate * (target - state) "
+                "are rounded away, so the state stalls at a biased value. In half precision an EMA stalls "
+                "whenever |rate * (target - state)| < ulp(state) / 2, at any rate, so a larger rate does "
+                "not fix this; use slow_dtype=torch.float32 (the default).",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    def state_dtype(self, state: State) -> torch.dtype:
+        return state["fast"].dtype
+
     def read(self, state: State) -> torch.Tensor:
-        return torch.cat([state["fast"], state["slow"]], dim=-1)
+        """``concat(fast, slow)`` in ``promote_types(fast dtype, slow dtype)``."""
+        f, s = state["fast"], state["slow"]
+        out = torch.promote_types(f.dtype, s.dtype)
+        return torch.cat([f.to(out), s.to(out)], dim=-1)
 
     def update(self, state: State, inputs: torch.Tensor, active: torch.Tensor | None = None) -> State:
         f, s, n = state["fast"], state["slow"], state["steps"]
         if inputs.shape != f.shape:
             raise ValueError(f"inputs must have shape {tuple(f.shape)}, got {tuple(inputs.shape)}")
-        x = inputs.to(f.dtype)
-        f_new = (1.0 - self.fast_rate) * f + self.fast_rate * x
+        fast_compute = torch.promote_types(f.dtype, torch.float32)
+        slow_out = torch.promote_types(s.dtype, self.slow_storage_dtype(f.dtype))  # >= f.dtype
+        slow_compute = torch.promote_types(slow_out, torch.float32)  # >= fast_compute: casts only widen
+        f_new = (1.0 - self.fast_rate) * f.to(fast_compute) + self.fast_rate * inputs.to(fast_compute)
         n_new = n + 1
         consolidate = (n_new % self.consolidate_every == 0).unsqueeze(-1)
-        s_new = torch.where(consolidate, (1.0 - self.slow_rate) * s + self.slow_rate * f_new, s)
-        new = {"fast": f_new, "slow": s_new, "steps": n_new}
+        sc = s.to(slow_compute)
+        s_new = torch.where(
+            consolidate, (1.0 - self.slow_rate) * sc + self.slow_rate * f_new.to(slow_compute), sc
+        )
+        new = {"fast": f_new.to(f.dtype), "slow": s_new.to(slow_out), "steps": n_new}
         if active is not None:
-            new = {k: torch.where(_expand_mask(active, v), v, state[k]) for k, v in new.items()}
+            new = {k: torch.where(_expand_mask(active, v), v, state[k].to(v.dtype)) for k, v in new.items()}
         return new
 
     def state_dict(self) -> dict[str, Any]:
@@ -143,6 +247,7 @@ class FastSlowMemory(RecurrentState):
             "fast_rate": self.fast_rate,
             "slow_rate": self.slow_rate,
             "consolidate_every": self.consolidate_every,
+            "slow_dtype": None if self.slow_dtype is None else str(self.slow_dtype).removeprefix("torch."),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -151,6 +256,22 @@ class FastSlowMemory(RecurrentState):
         self.fast_rate = float(state.get("fast_rate", self.fast_rate))
         self.slow_rate = float(state.get("slow_rate", self.slow_rate))
         self.consolidate_every = int(state.get("consolidate_every", self.consolidate_every))
+        if "slow_dtype" in state:  # absent in older checkpoints: keep the constructor's value
+            self.slow_dtype = _resolve_dtype(state["slow_dtype"])
+
+
+_SLOW_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+
+def _resolve_dtype(dtype: torch.dtype | str | None) -> torch.dtype | None:
+    if dtype is None:
+        return None
+    resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
+    if resolved not in _SLOW_DTYPES:  # float8 etc. cannot be type-promoted
+        raise ValueError(
+            f"slow_dtype must be None or one of float16, bfloat16, float32, float64, got {dtype!r}"
+        )
+    return resolved
 
 
 def _encode_id(sample_id: Hashable) -> str:
@@ -169,6 +290,11 @@ class StateStore:
 
     Usage per batch: ``state = store.gather(ids)`` → model code updates ``state`` →
     ``store.scatter(ids, state)``; or simply ``store.step(ids, inputs)``.
+
+    ``dtype`` is the requested state dtype passed to ``module.init``; the module may store keys at other
+    precisions (e.g. :class:`FastSlowMemory` keeps ``slow`` in fp32 for a bf16 store). ``gather``
+    concatenates each key with type promotion (it never lowers a stored row's precision); ``scatter``,
+    ``state_dict`` and ``load_state_dict`` keep each stored key's dtype unchanged.
     """
 
     def __init__(
@@ -217,6 +343,8 @@ class StateStore:
             for k in keys
         ]
         self._checked_out = keys
+        # torch.cat type-promotes per key, so rows of different precision (e.g. an all-bf16 row from an
+        # older checkpoint next to a fresh fp32-slow row) are batched without lowering any row's precision
         return {name: torch.cat([r[name] for r in rows], dim=0) for name in rows[0]}
 
     def scatter(self, ids: Sequence[Hashable], state: State) -> None:
