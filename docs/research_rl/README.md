@@ -169,7 +169,7 @@ evaluation outputs, environment (package versions, device). `hardware.gpu_metric
 | Contract | Module | Reference implementation |
 |---|---|---|
 | Parameter prior (P²-MOPD) | `optim/parameter_prior.py` | `TaskVectorPrior`, `PriorSubspaceRule`, `P2PriorRule` |
-| Recurrent state | `state/recurrent_interface.py` | `FastSlowMemory`, `StateStore` (no cross-sample sharing) |
+| Recurrent state | `state/recurrent_interface.py` | `FastSlowMemory`, `StateStore` (no cross-sample sharing). `FastSlowMemory` computes its updates in at least fp32 and stores the slow state in at least fp32 (`slow_dtype=torch.float32`, so a bf16 state reads out as fp32), because a low-rate EMA increment is otherwise rounded away in bf16; `slow_dtype=None` restores same-dtype storage and warns when a rate is below the dtype's precision |
 | Compute controller | `state/compute_controller.py` | `FixedDepth`, `ThresholdHalting`, `run_looped`, `ComputeLedger`, `best_of_depth` |
 | Agent environment | `rollout/agent_env.py` | TRL `environment_factory`-compatible `ResearchEnvironment`, `CalculatorEnv`, `EpisodeLog` credit math. OpenEnv (`trl.experimental.async_grpo.openenv_harness`) needs the separate `openenv` package — not installed, not tested |
 | Multi-teacher distillation | `trainers/multi_teacher.py` | teacher aggregation (mixture / product, per-sample weights for routing), masked KLs, `TeacherEnsemble` usable as TRL `teacher_model` (global static weights only: TRL does not pass a per-prompt domain to the teacher). `AsyncDistillationTrainer` needs a vLLM server — not tested |
