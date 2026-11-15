@@ -23,7 +23,7 @@ Semantics of the installed TRL (1.18), checked numerically in ``tests/research_r
   zeroes rows whose last token is neither EOS nor pad.
 
 ResearchRL additions (policy-version stamps, trajectory log, advantage shaping, zero-advantage
-skipping) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages may be
+skipping, per-row expert routing with ``expert_manager=``) are described in :mod:`research_rl.trainers.rl_common`. Shaped advantages may be
 ``(B,)`` or per token ``(B, T)``. ``skip_zero_advantage_steps=True`` is refused with ``beta != 0``
 (the KL term is a separate loss term), with the entropy bonus and with the MoE aux loss.
 """
@@ -100,7 +100,7 @@ class GRPOAdapter(RLTrainerAdapter):
     """``TRAINERS.build("grpo")``: maps an ``ExperimentConfig`` onto :class:`ResearchGRPOTrainer`.
 
     Pass ``reward_funcs=...`` (and optionally ``rollout_func``, ``peft_config``,
-    ``trajectory_capacity``) to ``build``. ``trainer.args`` go verbatim to ``trl.GRPOConfig``.
+    ``trajectory_capacity``, ``expert_manager``, ``expert_column``) to ``build``. ``trainer.args`` go verbatim to ``trl.GRPOConfig``.
     """
 
     algorithm: ClassVar[str] = "grpo"

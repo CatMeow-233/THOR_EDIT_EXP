@@ -93,16 +93,68 @@ It changes nothing in how TRL generates, scores or optimises. It adds:
   The mask is then the usual "1 up to and including the first EOS" mask, and
   ``mask_truncated_completions`` behaves as documented.
 
-Not tested here (NOT_TESTED): multi-process / DeepSpeed / FSDP runs. The skip decision is
-all-gathered across processes, but HookedOptimizer itself is not DeepSpeed-aware. vLLM
+* **Response-level experts** (TLC, ``expert_manager=ExpertManager(...)``, ``expert_column``). Each
+  input row names its expert in ``inputs[i][expert_column]`` (missing / ``None``: the manager's
+  ``active`` expert; unknown names raise :class:`~research_rl.models.expert_manager.ExpertError`).
+  Every forward of a row then runs through that row's expert:
+
+  - *generation* (TRL's ``_generate_single_turn``, transformers ``generate`` incl. its cached
+    decode steps) under ``ExpertManager.rows(names)`` for the generation batch;
+  - the *old log-prob forwards* of the policy inside ``_generate_and_score_completions``:
+    TRL's ``_get_per_token_logps_and_entropies`` slices the batch into chunks of ``batch_size``
+    rows; the override calls TRL once per chunk with exactly that chunk's routing;
+  - the *loss forward* (``compute_loss``) and its backward (incl. gradient-checkpointing
+    recomputation): each generation batch carries a per-row ``(B,)`` ``long`` tensor under
+    :data:`EXPERT_KEY` (indices into ``trainer.expert_vocab``) that TRL's
+    ``shuffle_sequence_dict`` permutes and ``split_tensor_dict`` slices together with the other
+    rows. ``training_step`` keeps the micro-batch's routing selected from ``_prepare_inputs`` until
+    the backward has finished.
+
+  A batch whose rows all share one expert uses ``ExpertManager.using`` (bit-identical to plain
+  single-expert training with ``activate``); only mixed batches need row routing. The manager's
+  previous selection is restored after every routed region, also on exceptions. A micro-batch
+  none of whose rows reaches a trainable parameter (only frozen experts) contributes no gradient
+  to the trainable expert, which keeps ``grad=None`` (unchanged by the optimizer if its whole
+  window has no rows of it). With gradient checkpointing on (TRL's default) HF's input-require-grads
+  hook still attaches such a loss to an autograd graph (through frozen parameters only); with it
+  off the loss may have no graph at all and is then made a grad-requiring leaf, so ``backward`` is
+  a no-op instead of an error. A manual
+  ``compute_loss(...).backward()`` outside ``training_step`` must run inside
+  ``trainer.expert_routing(batch)`` when gradient checkpointing (TRL's default) is on.
+  :class:`~research_rl.rollout.trajectory.RolloutBatch` records ``expert_ids``, the trajectory
+  buffer counts samples per expert and ``rollout/expert_frac/<name>`` is logged.
+  Rejected with a clear error instead of mis-routing: ``use_vllm`` (the vLLM engine serves a
+  vanilla model and weight sync would push the renamed ``mlp.experts.<name>.*`` keys), PEFT
+  (adapters would wrap the expert FFNs independently of the manager's freezing),
+  ``remove_unused_columns=True`` (drops the expert column), ``sync_ref_model`` (mixes policy
+  parameters into the reference by position), ``num_beams`` /
+  ``num_return_sequences`` > 1 (expand the FFN batch), a model that does not contain the
+  manager's FFNs, and for *mixed* batches: continuous-batching generation, a GRPO
+  ``rollout_func``, tool-call re-generation of a subset of rows, multimodal inputs.
+  Reference model (``beta != 0``, no PEFT): TRL loads a fresh vanilla copy from
+  ``model.config._name_or_path``; it has no expert FFNs, so the KL reference is the original FFN
+  (the ``"base"`` expert) *for every row*. The constructor checks that the reference's FFN weights
+  equal the base expert's (a checkpoint saved with experts attached would have re-initialised
+  FFNs) and rejects a reference that shares the policy's ExpertFFN modules.
+
+Multi-process runs with an ``expert_manager`` (DDP / DeepSpeed / FSDP, ``num_processes > 1``) are
+rejected at construction: ranks train on different rows, a rank whose micro-batch has no row of
+the trainable expert produces no gradient for it, and DDP's gradient all-reduce on the other ranks
+then waits forever (verified with a 2-process gloo run, see the tests). Multi-process training of a
+*single* expert works without the trainer integration: ``activate`` / ``set_trainable`` the expert
+and do not pass ``expert_manager``.
+
+Not tested here (NOT_TESTED): multi-process / DeepSpeed / FSDP runs without experts. The skip
+decision is all-gathered across processes, but HookedOptimizer itself is not DeepSpeed-aware. vLLM
 generation is also not tested.
 """
 
 from __future__ import annotations
 
 import abc
+import contextlib
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -113,6 +165,8 @@ from research_rl.core.checkpoint import StatefulComponent
 from research_rl.core.config import ExperimentConfig
 from research_rl.core.experiment import ExperimentRecorder
 from research_rl.core.registry import ADVANTAGE_SHAPERS
+from research_rl.models.expert_manager import BASE_EXPERT, ExpertError, ExpertFFN, ExpertManager
+from research_rl.models.model_interface import get_decoder_layers
 from research_rl.rollout.policy_version import policy_lag, policy_version_of, stamp_policy_version
 from research_rl.rollout.trajectory import RolloutBatch, TrajectoryBuffer
 from research_rl.trainers.base import ResearchRun, TrainerAdapter
@@ -124,6 +178,14 @@ ADVANTAGE_SHAPER_COMPONENT = "advantage_shaper"
 SIGNAL_KEY = "rr_signal"
 # Detached copy of the advantages SIGNAL_KEY was computed from, (B,) or (B, T): detects later edits.
 ADVANTAGES_STAMP_KEY = "rr_signal_advantages"
+# Per-sample long (B,) stamped on generation batches when experts are routed: index of the row's
+# expert in ``trainer.expert_vocab``.
+EXPERT_KEY = "rr_expert"
+# Keyword inputs of TRL's ``_get_per_token_logps_and_entropies`` that a per-chunk routed call slices
+# by row (``_ROW_KWARGS``) or passes through (``_FLAG_KWARGS``). Any other non-None input (images,
+# tiles, ...) is rejected for mixed-expert batches.
+_ROW_KWARGS = frozenset({"token_type_ids", "mm_token_type_ids", "sampling_mask"})
+_FLAG_KWARGS = frozenset({"compute_entropy", "compute_aux_loss"})
 # Per-token fields a GRPO rollout_func may return next to ``completion_ids``.
 PER_TOKEN_ROLLOUT_KEYS = ("logprobs", "logprob_token_ids", "env_mask")
 
@@ -170,6 +232,27 @@ class AdvantageShaper(abc.ABC):
     @abc.abstractmethod
     def __call__(self, output: Mapping[str, Any], trainer: Any) -> ShapedAdvantages:
         """Return the new advantages (and optionally per-sample signal flags)."""
+
+
+# ---------------------------------------------------------------------------------- experts
+def _world_size(training_args: Any) -> int:
+    """``training_args.world_size`` (1 if it cannot be determined yet)."""
+    try:
+        return int(training_args.world_size)
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
+def _reject_multi_process(num_processes: int) -> None:
+    """Expert routing is single-process only: under DDP it would deadlock instead of failing."""
+    if num_processes > 1:
+        raise ExpertError(
+            f"an ExpertManager is not supported with {num_processes} processes (DDP / DeepSpeed / FSDP): "
+            "ranks train on different rows, and a rank whose micro-batch has no row of the trainable expert "
+            "produces no gradient for it, so the gradient all-reduce of the other ranks never completes "
+            "(a hang, not an error). For multi-process training of a single expert, select it with "
+            "ExpertManager.activate()/set_trainable() and do not pass expert_manager to the trainer."
+        )
 
 
 # ---------------------------------------------------------------------------------- EOS handling
@@ -296,14 +379,17 @@ class _WindowCallback(TrainerCallback):
 
 
 class RLRolloutMixin:
-    """Policy-version stamps, trajectory log, advantage shaping and zero-advantage skipping for TRL
-    GRPO/RLOO trainers.
+    """Policy-version stamps, trajectory log, advantage shaping, zero-advantage skipping and expert
+    routing for TRL GRPO/RLOO trainers.
 
     Extra constructor keywords: ``skip_zero_advantage_steps`` (requires the hooked optimizer and
     no advantage-independent loss term, see the module docstring), ``trajectory_capacity`` (max
-    generation batches kept in :attr:`trajectory_buffer`) and ``advantage_shapers`` (a sequence of
+    generation batches kept in :attr:`trajectory_buffer`), ``advantage_shapers`` (a sequence of
     :class:`AdvantageShaper` objects or :data:`~research_rl.core.registry.ADVANTAGE_SHAPERS` names,
-    applied in order).
+    applied in order), ``expert_manager`` (an attached
+    :class:`~research_rl.models.expert_manager.ExpertManager` of the model passed as ``model``;
+    ``None``, the default, changes nothing) and ``expert_column`` (the dataset column naming each
+    row's expert, default ``"expert"``). See the module docstring.
     """
 
     # Accepted ``advantages.ndim`` of the trainer's loss (RLOO: per-sequence only; GRPO adds (B, T)).
@@ -326,6 +412,8 @@ class RLRolloutMixin:
         skip_zero_advantage_steps: bool = False,
         trajectory_capacity: int = 16,
         advantage_shapers: Sequence[AdvantageShaper | str] = (),
+        expert_manager: ExpertManager | None = None,
+        expert_column: str = "expert",
         **kwargs: Any,
     ) -> None:
         self.skip_zero_advantage_steps = bool(skip_zero_advantage_steps)
@@ -338,6 +426,13 @@ class RLRolloutMixin:
         self._rr_window_microbatches = 0
         self._rr_rewards_per_func: torch.Tensor | None = None
         self._rr_warned_modified = False
+        self.expert_manager = expert_manager
+        self.expert_column = str(expert_column)
+        self.expert_vocab: list[str] = []  # index -> name for EXPERT_KEY (grows, never reordered)
+        self._rr_rows: tuple[str, ...] | None = None  # experts of the rows currently being processed
+        self._rr_step_stack: contextlib.ExitStack | None = None
+        if expert_manager is not None:
+            self._rr_check_experts_before_init(args, kwargs)
         super().__init__(*args, **kwargs)
         if self.skip_zero_advantage_steps and not self._rr_hooked:
             raise ValueError(
@@ -351,12 +446,163 @@ class RLRolloutMixin:
                     "skip_zero_advantage_steps would silently drop gradient that does not come from the "
                     "advantage: " + "; ".join(conflicts) + ". Disable these terms or the step skipping."
                 )
+        if expert_manager is not None:
+            self._rr_check_experts_after_init()
         self.research_components.setdefault(ROLLOUT_COMPONENT, self.trajectory_buffer)
         for index, shaper in enumerate(self.advantage_shapers):
             if isinstance(shaper, StatefulComponent):  # its state travels with checkpoints
                 key = f"{ADVANTAGE_SHAPER_COMPONENT}/{index}/{self._rr_shaper_name(shaper)}"
                 self.research_components.setdefault(key, shaper)
         self.add_callback(_WindowCallback(self))  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------ experts: validation
+    def _rr_check_experts_before_init(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Checks that must run before TRL's constructor (which e.g. imports vLLM)."""
+        manager = self.expert_manager
+        if not isinstance(manager, ExpertManager):
+            raise TypeError(f"expert_manager must be an ExpertManager, got {type(manager).__name__}")
+        if not manager.attached:
+            raise ExpertError("expert_manager has no experts attached: call attach(layers) first")
+        model = kwargs.get("model", args[0] if args else None)
+        if model is None or isinstance(model, str):
+            raise ExpertError(
+                "expert_manager needs the model instance it is attached to as `model` (got a path / None: "
+                "the trainer would load a different model whose FFNs the manager does not control)"
+            )
+        training_args = kwargs.get("args", args[2] if len(args) > 2 else None)
+        if training_args is not None:
+            _reject_multi_process(_world_size(training_args))
+            if getattr(training_args, "use_vllm", False):
+                raise ExpertError(
+                    "use_vllm=True is not supported with an ExpertManager: the vLLM engine serves a vanilla "
+                    "model (no per-row experts), and its weight sync would push the renamed "
+                    "mlp.experts.<name>.* keys. Use transformers generation (use_vllm=False)."
+                )
+            if getattr(training_args, "sync_ref_model", False):
+                raise ExpertError(
+                    "sync_ref_model=True is not supported with an ExpertManager: TRL mixes the policy's "
+                    "parameters into the vanilla reference model position by position, which does not line "
+                    "up once expert FFNs are attached (and the reference would stop being the base model)"
+                )
+            if getattr(training_args, "remove_unused_columns", False):
+                raise ExpertError(
+                    f"remove_unused_columns=True drops the {self.expert_column!r} column before generation, "
+                    "so every row would silently use the active expert; set remove_unused_columns=False"
+                )
+        if kwargs.get("peft_config") is not None:
+            raise ExpertError(
+                "PEFT is not supported with an ExpertManager: adapters would wrap the expert FFNs (including "
+                "the frozen base expert) independently of the manager's freezing"
+            )
+
+    def _rr_check_experts_after_init(self) -> None:
+        manager = self.expert_manager
+        assert manager is not None
+        _reject_multi_process(int(self.accelerator.num_processes))
+        from accelerate.utils import is_peft_model
+
+        if is_peft_model(self.model):
+            raise ExpertError(
+                "PEFT is not supported with an ExpertManager (see the rl_common module docstring)"
+            )
+        own = {id(m) for m in self.model.modules()}
+        if any(id(f) not in own for f in manager.ffn_modules().values()):
+            raise ExpertError("the expert_manager is attached to a different model than the trainer's policy")
+        gen = getattr(self, "generation_config", None)
+        for attr in ("num_beams", "num_return_sequences"):
+            value = getattr(gen, attr, None)
+            if value is not None and int(value) > 1:
+                raise ExpertError(
+                    f"generation {attr}={value} expands the batch inside generate; per-row expert routing "
+                    "cannot follow it"
+                )
+        ref = getattr(self, "ref_model", None)
+        if ref is not None:
+            self._rr_check_reference(ref)
+
+    def _rr_check_reference(self, ref: Any) -> None:
+        """The KL reference must be the vanilla base model: no ExpertFFN, FFN weights == base expert."""
+        manager = self.expert_manager
+        assert manager is not None
+        policy_ffns = {id(f) for f in manager.ffn_modules().values()}
+        for module in ref.modules():
+            if isinstance(module, ExpertFFN):
+                shared = "shares the policy's" if id(module) in policy_ffns else "has its own"
+                raise ExpertError(
+                    f"the reference model {shared} ExpertFFN modules; per-row routing of the reference "
+                    "forward is not supported (the reference must be the vanilla base model)"
+                )
+        _, blocks = get_decoder_layers(self.accelerator.unwrap_model(ref))
+        for i, ffn in manager.ffn_modules().items():
+            ref_mlp: Any = blocks[i].mlp
+            ref_sd = ref_mlp.state_dict()
+            base_sd = ffn.experts[BASE_EXPERT].state_dict()
+            same = set(ref_sd) == set(base_sd) and all(
+                ref_sd[k].shape == base_sd[k].shape
+                and torch.equal(ref_sd[k].detach().cpu(), base_sd[k].detach().cpu().to(ref_sd[k].dtype))
+                for k in base_sd
+            )
+            if not same:
+                raise ExpertError(
+                    f"the reference model TRL loaded from model.config._name_or_path has a different FFN in "
+                    f"layer {i} than the base expert (a checkpoint saved with experts attached has "
+                    "re-initialised FFNs); the KL reference would not be the base model"
+                )
+
+    # ------------------------------------------------------------------ experts: row bookkeeping
+    def _rr_expert_names(self, inputs: Sequence[Any]) -> tuple[str, ...]:
+        """Expert of every input row (missing / ``None`` -> the manager's active expert), validated."""
+        manager = self.expert_manager
+        assert manager is not None
+        default = manager.active
+        known = set(manager.expert_names)
+        names: list[str] = []
+        for i, row in enumerate(inputs):
+            value = row.get(self.expert_column) if isinstance(row, Mapping) else None
+            name = default if value is None else value
+            if not isinstance(name, str) or name not in known:
+                raise ExpertError(
+                    f"row {i}: {self.expert_column}={value!r} is not an expert of the manager; known: "
+                    f"{manager.expert_names}"
+                )
+            names.append(name)
+        if not names:
+            raise ExpertError("empty generation batch")
+        return tuple(names)
+
+    def _rr_expert_index(self, names: Sequence[str], device: torch.device) -> torch.Tensor:
+        for n in names:
+            if n not in self.expert_vocab:
+                self.expert_vocab.append(n)
+        lookup = {n: i for i, n in enumerate(self.expert_vocab)}
+        return torch.tensor([lookup[n] for n in names], dtype=torch.long, device=device)
+
+    def _rr_names_from_batch(self, batch: Mapping[str, Any]) -> tuple[str, ...]:
+        index = batch.get(EXPERT_KEY)
+        if index is None:
+            raise ExpertError(
+                f"batch has no {EXPERT_KEY!r} expert index (not produced by this trainer's generation?); "
+                "cannot route its rows"
+            )
+        return tuple(self.expert_vocab[int(i)] for i in index.reshape(-1).tolist())
+
+    @contextlib.contextmanager
+    def _rr_rows_scope(self, rows: tuple[str, ...] | None) -> Iterator[None]:
+        """Set :attr:`_rr_rows` (rows being processed) and select their experts; restore both on exit."""
+        saved = self._rr_rows
+        self._rr_rows = rows
+        try:
+            if rows is None or self.expert_manager is None:
+                yield
+            else:
+                with self.expert_manager.rows(rows):
+                    yield
+        finally:
+            self._rr_rows = saved
+
+    def _rr_is_mixed(self) -> bool:
+        rows = self._rr_rows
+        return rows is not None and any(r != rows[0] for r in rows)
 
     # ------------------------------------------------------------------ helpers
     @classmethod
@@ -547,8 +793,17 @@ class RLRolloutMixin:
     def _generate_and_score_completions(self, inputs: list[dict[str, Any]]) -> dict[str, Any]:
         version = self.policy_version
         self._rr_rewards_per_func = None
+        rows: tuple[str, ...] | None = None
+        if self.expert_manager is not None:
+            rows = self._rr_expert_names(inputs)
+            if any(r != rows[0] for r in rows) and getattr(self, "rollout_func", None) is not None:
+                raise ExpertError(
+                    "a rollout_func generates outside the trainer; per-row routing of a mixed-expert batch "
+                    "cannot be applied to it (use one expert per generation batch)"
+                )
         self._rr_begin_generation()
-        output: dict[str, Any] = super()._generate_and_score_completions(inputs)  # type: ignore[misc]
+        with self._rr_rows_scope(rows):
+            output: dict[str, Any] = super()._generate_and_score_completions(inputs)  # type: ignore[misc]
         mode = "train" if self.model.training else "eval"
         completion_mask = output["completion_mask"]
         # Always evaluated, also with shapers: it consumes per-generation captures (RLOO log-probs).
@@ -576,15 +831,22 @@ class RLRolloutMixin:
             global_step=int(self.state.global_step),
             mode=mode,
             signal=signal,
+            expert_ids=rows,
         )
         if mode == "train":
             self.trajectory_buffer.append(batch)
         self._rr_log(mode, "rollout/policy_version", version)
         self._rr_log(mode, "rollout/frac_zero_advantage", batch.frac_zero_advantage)
         self._rr_log(mode, "rollout/has_nonzero_advantage", float(batch.has_nonzero_advantage))
+        if rows is not None and self.expert_manager is not None:
+            for name in self.expert_manager.expert_names:
+                self._rr_log(mode, f"rollout/expert_frac/{name}", sum(r == name for r in rows) / len(rows))
         # Appended last: TRL sizes a batch dict from its first value.
         output[SIGNAL_KEY] = signal
         output[ADVANTAGES_STAMP_KEY] = advantages.detach().clone()
+        if rows is not None:
+            # (B,) like SIGNAL_KEY: permuted by TRL's shuffle_sequence_dict, sliced by split_tensor_dict.
+            output[EXPERT_KEY] = self._rr_expert_index(rows, signal.device)
         stamp_policy_version(output, version)
         return output
 
@@ -618,8 +880,150 @@ class RLRolloutMixin:
             )
         return self._rr_exact_signal(advantages, inputs["completion_mask"])
 
+    # ------------------------------------------------------------------ experts: routed forwards
+    def _generate_single_turn(self, prompt_ids: Any, *args: Any, **kwargs: Any) -> Any:
+        """TRL's generation of ``prompt_ids`` (one entry per row), routed per row for mixed batches.
+
+        A uniform batch is already under ``ExpertManager.using`` (see
+        ``_generate_and_score_completions``). For a mixed batch the rows must be exactly the
+        generation batch, in order: TRL's tool loop re-generates an order-preserving subset, so an
+        equal length means the same rows. Continuous batching regroups rows and is rejected.
+        """
+        manager = self.expert_manager
+        rows = self._rr_rows
+        if manager is None or rows is None or not self._rr_is_mixed():
+            return super()._generate_single_turn(prompt_ids, *args, **kwargs)  # type: ignore[misc]
+        if getattr(self, "use_transformers_continuous_batching", False):
+            raise ExpertError(
+                "continuous-batching generation (use_transformers_continuous_batching) regroups rows; per-row "
+                "expert routing of a mixed-expert batch is not supported with it"
+            )
+        if len(prompt_ids) != len(rows):
+            raise ExpertError(
+                f"generation of {len(prompt_ids)} rows inside a mixed-expert batch of {len(rows)} rows (e.g. "
+                "tool-call re-generation of a subset): which expert each row belongs to is unknown"
+            )
+        with manager.routed(rows):
+            return super()._generate_single_turn(prompt_ids, *args, **kwargs)  # type: ignore[misc]
+
+    def _get_per_token_logps_and_entropies(
+        self,
+        model: Any,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        batch_size: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """TRL's chunked log-prob forward with each chunk routed through the experts of its rows.
+
+        TRL loops over chunks of ``batch_size`` rows. For a mixed-expert batch the override calls
+        TRL once per chunk (``batch_size`` = chunk size, i.e. exactly one inner chunk) under that
+        chunk's routing and concatenates the results as TRL does (aux loss: mean of the per-chunk
+        values). The separately loaded reference model (``self.ref_model``) is never routed.
+        """
+        parent = super()._get_per_token_logps_and_entropies  # type: ignore[misc]
+        manager = self.expert_manager
+        rows = self._rr_rows
+        ref = getattr(self, "ref_model", None)
+        if manager is None or rows is None or (ref is not None and model is ref):
+            return parent(model, input_ids, attention_mask, logits_to_keep, batch_size, **kwargs)
+        n = int(input_ids.size(0))
+        if len(rows) != n:
+            raise ExpertError(f"log-prob forward of {n} rows, but {len(rows)} rows have routed experts")
+        if not self._rr_is_mixed():
+            with manager.using(rows[0]):
+                return parent(model, input_ids, attention_mask, logits_to_keep, batch_size, **kwargs)
+        unsupported = sorted(
+            k for k, v in kwargs.items() if v is not None and k not in _ROW_KWARGS and k not in _FLAG_KWARGS
+        )
+        if unsupported:
+            raise ExpertError(
+                f"per-row expert routing does not support the forward inputs {unsupported} (multimodal)"
+            )
+        step = int(batch_size or n)
+        logps: list[torch.Tensor] = []
+        entropies: list[torch.Tensor | None] = []
+        aux: list[torch.Tensor | None] = []
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            chunk_kwargs = {
+                k: (v[start:end] if k in _ROW_KWARGS and v is not None else v) for k, v in kwargs.items()
+            }
+            with manager.rows(rows[start:end]):
+                lp, ent, al = parent(
+                    model,
+                    input_ids[start:end],
+                    attention_mask[start:end],
+                    logits_to_keep,
+                    end - start,
+                    **chunk_kwargs,
+                )
+            logps.append(lp)
+            entropies.append(ent)
+            aux.append(al)
+        out_entropies = None if entropies[0] is None else torch.cat(entropies, dim=0)  # type: ignore[arg-type]
+        out_aux = None if aux[0] is None else torch.stack(aux).mean()  # type: ignore[arg-type]
+        return torch.cat(logps, dim=0), out_entropies, out_aux
+
+    def compute_loss(self, model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        """TRL's loss with the micro-batch's rows routed through their experts (from :data:`EXPERT_KEY`).
+
+        The routing ends when this returns. With gradient checkpointing (TRL's default), a manual
+        ``compute_loss(...).backward()`` must run inside :meth:`expert_routing` so that the
+        recomputation in backward sees the same experts (``training_step`` does this itself).
+
+        If no row of the micro-batch reaches a trainable parameter (all its rows belong to frozen
+        experts), the trainable parameters receive no gradient and keep ``grad=None`` (PyTorch
+        optimizers skip such parameters: a window without rows of the trainable expert leaves it
+        unchanged). The loss itself may still have an autograd graph through frozen parameters
+        (gradient checkpointing on: HF's input-require-grads hook); when it has none (checkpointing
+        off) it is returned as a detached leaf that requires grad, so ``backward`` is a no-op.
+        """
+        if self.expert_manager is None or not isinstance(inputs, Mapping):
+            return super().compute_loss(model, inputs, *args, **kwargs)  # type: ignore[misc]
+        with self._rr_rows_scope(self._rr_names_from_batch(inputs)):
+            loss = super().compute_loss(model, inputs, *args, **kwargs)  # type: ignore[misc]
+        if torch.is_grad_enabled() and isinstance(loss, torch.Tensor) and not loss.requires_grad:
+            loss = loss.detach().requires_grad_()
+        return loss
+
+    @contextlib.contextmanager
+    def expert_routing(self, batch: Mapping[str, Any]) -> Iterator[None]:
+        """Select the experts of ``batch``'s rows (a generation batch or micro-batch of this trainer).
+
+        For forwards / backwards outside ``training_step``, e.g. a manual ``compute_loss`` followed
+        by ``backward``. The previous selection is restored on exit. No-op without a manager.
+        """
+        if self.expert_manager is None:
+            yield
+            return
+        with self._rr_rows_scope(self._rr_names_from_batch(batch)):
+            yield
+
+    def training_step(self, model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        """Keeps the micro-batch's expert selection active through ``compute_loss`` *and* backward.
+
+        HF's ``training_step`` calls ``_prepare_inputs`` (which yields the micro-batch), then
+        ``compute_loss``, then ``backward``. Gradient checkpointing re-runs the FFNs during backward,
+        so the selection must outlive ``compute_loss``: ``_prepare_inputs`` enters it on this stack.
+        """
+        if self.expert_manager is None:
+            return super().training_step(model, inputs, *args, **kwargs)  # type: ignore[misc]
+        saved = self._rr_step_stack
+        try:
+            with contextlib.ExitStack() as stack:
+                self._rr_step_stack = stack
+                return super().training_step(model, inputs, *args, **kwargs)  # type: ignore[misc]
+        finally:
+            self._rr_step_stack = saved
+
     def _prepare_inputs(self, generation_batch: Any) -> Any:
         inputs = super()._prepare_inputs(generation_batch)  # type: ignore[misc]
+        stack = self._rr_step_stack
+        if stack is not None and self.expert_manager is not None and isinstance(inputs, Mapping):
+            self._rr_step_stack = None  # once per training_step: the micro-batch it trains on
+            stack.enter_context(self._rr_rows_scope(self._rr_names_from_batch(inputs)))
         if self.model.training and isinstance(inputs, Mapping) and "advantages" in inputs:
             self._rr_window_microbatches += 1
             flags = self._rr_microbatch_flags(inputs)
