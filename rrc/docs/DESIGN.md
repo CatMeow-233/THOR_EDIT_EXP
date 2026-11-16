@@ -521,7 +521,8 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
 Code: `include/rrc/{data,train}.h`, `src/{data,train}.c`, `src/rrc_train.c`, `src/rrc_data.c`,
 `tools/prepare_sft.py`, `tools/torch_reference.py`, `tests/c/test_{data,train}.c`,
 `tests/test_train_vs_torch.py`. Status: **TESTED (CPU)** against torch + transformers + PEFT on tiny
-models; nothing has run on a GPU; the trainer has no CUDA path yet; no performance figure exists
+models; nothing has run on a GPU; the trainer had no CUDA path in this step (added at the
+integration, §12, COMPILED-ONLY); no performance figure exists
 (NOT_TESTED). No change to the op table or its wrappers was needed (the optimizer uses
 `sum_squares` and `adamw_step` with `grad_scale` as frozen).
 
