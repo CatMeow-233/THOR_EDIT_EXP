@@ -4,6 +4,7 @@
 #   make test                build and run the C unit tests (+ nvcc header check if CUDA is set)
 #   make cuda CUDA_HOME=...  compile cuda/*.cu with nvcc (CUDA_ARCH, default sm_120)
 #   make asan                C tests under AddressSanitizer + UBSan (build/asan)
+#   make tsan                data + train C tests (prefetch thread) under ThreadSanitizer (build/tsan)
 #   make clean
 #
 # Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH,
@@ -55,7 +56,7 @@ NVCCFLAGS += -std=c++17 -ccbin $(CC) -arch=$(CUDA_ARCH) -gencode arch=$(CUDA_COM
 CUDA_SRCS := $(wildcard $(RRC_DIR)/cuda/*.cu)
 CUDA_OBJS := $(patsubst $(RRC_DIR)/cuda/%.cu,$(BUILD)/obj/cuda/%.o,$(CUDA_SRCS))
 
-.PHONY: all cpu test cuda clean nvcc-check asan
+.PHONY: all cpu test cuda clean nvcc-check asan tsan
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -121,6 +122,18 @@ asan:
 	@mkdir -p $(BUILD)/asan/test_tmp
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} \
 	  RRC_TEST_TMPDIR=$(BUILD)/asan/test_tmp $(BUILD)/asan/rrc_tests
+
+# The data / train suites (the prefetch thread next to the training loop) under ThreadSanitizer.
+# OMP_NUM_THREADS=1: libgomp is not TSan-instrumented, so OpenMP regions would report false races.
+# setarch -R disables ASLR, which some kernels need for TSan's memory layout.
+TSAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+tsan:
+	@$(MAKE) --no-print-directory BUILD=$(BUILD)/tsan RRC_SAN_FLAGS="$(TSAN_FLAGS)" $(BUILD)/tsan/rrc_tests
+	@mkdir -p $(BUILD)/tsan/test_tmp
+	for s in data train; do \
+	  RRC_TEST_TMPDIR=$(BUILD)/tsan/test_tmp OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 \
+	    setarch $$(uname -m) -R $(BUILD)/tsan/rrc_tests $$s || exit 1; \
+	done
 
 clean:
 	rm -rf $(BUILD)

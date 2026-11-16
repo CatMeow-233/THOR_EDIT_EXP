@@ -388,9 +388,13 @@ rrc_status rrc_loader_create(const rrc_dataset *d, const rrc_loader_opts *o, con
         goto fail;
     }
     if (start) {
-        RRC_REQUIRE(start->index <= l->n_usable, RRC_ERR_INVALID_ARG,
-                    "data cursor index %lld exceeds the %lld usable documents (different data or truncation policy?)",
-                    (long long)start->index, (long long)l->n_usable);
+        if (start->index > l->n_usable) {
+            st = RRC_ERROR(RRC_ERR_INVALID_ARG,
+                           "data cursor index %lld exceeds the %lld usable documents (different data or truncation "
+                           "policy?)",
+                           (long long)start->index, (long long)l->n_usable);
+            goto fail;
+        }
         l->cur = *start;
     }
     normalize_cursor(l, &l->cur);
