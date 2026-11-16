@@ -31,11 +31,13 @@ env:
   TORCH_VERSION: "2.15.0"
   HF_HUB_OFFLINE: "1"          # guarantee: no model downloads in CI
   TOKENIZERS_PARALLELISM: "false"
+  OMP_NUM_THREADS: "2"         # GitHub runners have 2-4 cores; avoid OpenMP oversubscription
 
 jobs:
   cpu:
     name: CPU build, C tests, sanitizers, pytest (TESTED on CPU)
-    runs-on: ubuntu-latest
+    # fixed image so the -Werror build does not change under a new rolling gcc
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -105,3 +107,5 @@ jobs:
       # no torch in this job: the two torch-interop C sub-tests report SKIP here (the cpu job runs them)
       - name: make test with CUDA_HOME (nvcc header check + HOST-ONLY cuda-host-test on the fake runtime)
         run: make -C rrc test CUDA_HOME="$CUDA_DEST/tk"
+      - name: make asan with CUDA_HOME (HOST-ONLY cuda-host-test under ASan + UBSan)
+        run: make -C rrc asan CUDA_HOME="$CUDA_DEST/tk"
