@@ -141,11 +141,72 @@ RT_TEST(tree_order_fixed) {
               (double)r.s);
 }
 
+/* NaN logits: the device cross entropy must give NaN loss and gradients like the CPU reference
+ * (and torch) even when the NaN's lane holds no other finite logit. Regression: a NaN pushed into
+ * an empty lane state gave (m = -inf, s = NaN), which the tree's -inf shortcut then discarded. */
+RT_TEST(emu_xent_nan_propagates) {
+    const rrc_backend *emu = NULL, *cpu = rrc_backend_cpu_f32acc();
+    RT_OK(rrc_emu_backend_create(NULL, &emu));
+    /* {vocab, NaN position, lane-mates of the NaN are -inf} */
+    static const int64_t cases[][3] = {{4, 1, 0}, {300, 100, 0}, {1024, 5, 1}, {300, 10, 0}, {1024, 5, 0}};
+    for (int ci = 0; ci < 5; ci++) {
+        const int64_t V = cases[ci][0], at = cases[ci][1];
+        for (int zdt = 0; zdt < 2; zdt++) {
+            const rrc_dtype dt = zdt ? RRC_BF16 : RRC_F32;
+            float *z = (float *)malloc((size_t)V * sizeof(float));
+            RT_ASSERT(z, "alloc");
+            rt_rng rng = {(uint64_t)(31 + ci)};
+            rt_fill(&rng, z, V, 3.0f);
+            if (cases[ci][2])
+                for (int64_t j = at % RRC_KC_LANES; j < V; j += RRC_KC_LANES) z[j] = -INFINITY;
+            z[at] = NAN;
+            const int32_t label = (int32_t)(at == 0 ? 1 : 0);
+            float *res[2][2]; /* [backend][loss, grad] */
+            const rrc_backend *bes[2] = {cpu, emu};
+            for (int b = 0; b < 2; b++) {
+                rrc_buf zb = rt_upload(bes[b], dt, z, V), lb = rt_upload_i32(bes[b], &label, 1);
+                float zero = 0.0f;
+                rrc_buf loss = rt_upload(bes[b], RRC_F32, &zero, 1);
+                RT_OK(rrc_cross_entropy_fwd_bwd(bes[b], 1, V, zb, V, lb, loss, 1.0f, rrc_buf_none(), 1));
+                res[b][0] = rt_download(loss, 1);
+                res[b][1] = rt_download(zb, V);
+                rrc_buf_free(&zb);
+                rrc_buf_free(&lb);
+                rrc_buf_free(&loss);
+            }
+            RT_EXPECT(isnan(res[0][0][0]), "case %d: the CPU reference gives NaN", ci);
+            RT_EXPECT(isnan(res[1][0][0]), "case %d (%s, vocab %lld, NaN at %lld%s): emu loss %g, cpu %g", ci,
+                      rrc_dtype_name(dt), (long long)V, (long long)at, cases[ci][2] ? ", lane-mates -inf" : "",
+                      (double)res[1][0][0], (double)res[0][0][0]);
+            RT_EXPECT(isnan(res[1][1][label]) == isnan(res[0][1][label]), "case %d: grad[label] emu %g cpu %g", ci,
+                      (double)res[1][1][label], (double)res[0][1][label]);
+            for (int b = 0; b < 2; b++) {
+                free(res[b][0]);
+                free(res[b][1]);
+            }
+            free(z);
+        }
+    }
+    /* the state algebra itself: NaN wins over -inf, empty and finite states in either order */
+    rrc_kc_lse nan_s = rrc_kc_lse_push(rrc_kc_lse_init(), NAN), fin = rrc_kc_lse_push(rrc_kc_lse_init(), 2.0f);
+    rrc_kc_lse empty = rrc_kc_lse_init(), ninf = rrc_kc_lse_push(rrc_kc_lse_init(), -INFINITY);
+    const rrc_kc_lse others[3] = {fin, empty, ninf};
+    for (int i = 0; i < 3; i++) {
+        rrc_kc_lse a = rrc_kc_lse_merge(nan_s, others[i]), b = rrc_kc_lse_merge(others[i], nan_s);
+        RT_EXPECT(isnan(a.m) && isnan(a.s) && isnan(b.m) && isnan(b.s), "merge with NaN state (%d): (%g, %g) (%g, %g)", i,
+                  (double)a.m, (double)a.s, (double)b.m, (double)b.s);
+    }
+    rrc_kc_lse after = rrc_kc_lse_push(rrc_kc_lse_push(fin, NAN), 5.0f);
+    RT_EXPECT(isnan(after.m) && isnan(after.s), "NaN stays after later pushes");
+    rrc_emu_backend_destroy(emu);
+}
+
 const rt_case rt_suite_kc_items[] = {
     RT_CASE(emu_vs_cpu_all_ops),
     RT_CASE(emu_deferred_errors_and_forced_paths),
     RT_CASE(cpu_double_passes_harness_tolerances),
     RT_CASE(emu_range_items_write_nothing),
     RT_CASE(tree_order_fixed),
+    RT_CASE(emu_xent_nan_propagates),
 };
 const size_t rt_suite_kc_items_n = sizeof rt_suite_kc_items / sizeof rt_suite_kc_items[0];
