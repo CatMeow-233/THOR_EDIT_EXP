@@ -118,6 +118,12 @@ $(BUILD)/obj/cuda_host/selftest_host.o: $(RRC_DIR)/cuda/selftest.c
 $(SELFTEST_HOST): $(BUILD)/obj/cuda_host/selftest_host.o $(CUDA_HOST_OBJS) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
+# expect_fail(command, log, what): the selftest must report FAIL itself (exit status 1 and a last log
+# line 'rrc_selftest: FAIL'), not crash, abort under a sanitizer or reject its arguments.
+expect_fail = st=0; $(1) > $(2) 2>&1 || st=$$?; \
+	if [ $$st -ne 1 ] || [ "$$(tail -n 1 $(2))" != "rrc_selftest: FAIL" ]; then \
+	  echo "expected 'rrc_selftest: FAIL' with exit 1 for: $(3) (exit $$st, log $(2))"; tail -n 5 $(2); exit 1; fi
+
 # The C tests use python3 (if present) to produce a safetensors file with the reference package;
 # that sub-test is skipped with a message when python3 / safetensors / torch are unavailable.
 test: cpu $(TEST_BIN) $(SELFTEST_HOST)
@@ -127,10 +133,8 @@ test: cpu $(TEST_BIN) $(SELFTEST_HOST)
 	@tail -n 1 $(BUILD)/test_tmp/selftest_host.log
 	@# negative checks of the program's exit status: no cuBLASLt (simulated: every triple refused) and
 	@# an --only filter matching nothing must both fail
-	@if $(SELFTEST_HOST) --quick --only gemm --reject-mask 0xFF > $(BUILD)/test_tmp/selftest_reject.log; then \
-	  echo "rrc_selftest_host: PASS with every GEMM on the kernel fallback (must FAIL)"; exit 1; fi
-	@if $(SELFTEST_HOST) --only nonexistent_op > $(BUILD)/test_tmp/selftest_nomatch.log; then \
-	  echo "rrc_selftest_host: PASS with no check run (must FAIL)"; exit 1; fi
+	@$(call expect_fail,$(SELFTEST_HOST) --quick --only gemm --reject-mask 0xFF,$(BUILD)/test_tmp/selftest_reject.log,every GEMM on the kernel fallback)
+	@$(call expect_fail,$(SELFTEST_HOST) --only nonexistent_op,$(BUILD)/test_tmp/selftest_nomatch.log,no check run)
 	@echo "rrc_selftest_host negative checks: OK (kernel-only GEMM and an empty --only run both fail)"
 ifneq ($(strip $(NVCC)),)
 	@$(MAKE) --no-print-directory nvcc-check
@@ -217,10 +221,8 @@ cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST),cuda-host-mis
 	@# the program's CUDA main (pass logic, options) on one cheap op; test_cuda_host ran every op already
 	$(SHIM_SELFTEST) --quick --only convert > $(BUILD)/test_tmp/selftest_shim.log || { cat $(BUILD)/test_tmp/selftest_shim.log; exit 1; }
 	@grep -E "^(capped|grid) pass" $(BUILD)/test_tmp/selftest_shim.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim.log
-	@if RRC_FAKE_LT=reject $(SHIM_SELFTEST) --quick --only gemm > $(BUILD)/test_tmp/selftest_shim_reject.log; then \
-	  echo "rrc_selftest (fake runtime): PASS with cuBLASLt refusing everything (must FAIL)"; exit 1; fi
-	@if $(SHIM_SELFTEST) --only nonexistent_op > $(BUILD)/test_tmp/selftest_shim_nomatch.log; then \
-	  echo "rrc_selftest (fake runtime): PASS with no check run (must FAIL)"; exit 1; fi
+	@$(call expect_fail,RRC_FAKE_LT=reject $(SHIM_SELFTEST) --quick --only gemm,$(BUILD)/test_tmp/selftest_shim_reject.log,cuBLASLt refusing everything)
+	@$(call expect_fail,$(SHIM_SELFTEST) --only nonexistent_op,$(BUILD)/test_tmp/selftest_shim_nomatch.log,no check run)
 	@echo "cuda-host-test: OK (HOST-ONLY: real cuda/*.cu sources on a fake runtime and host threads; no GPU)"
 
 cuda-host-missing:

@@ -665,9 +665,13 @@ of §7 (they need the model/trainer of the other stage-B line).
 * sum_squares partials: `grow()` is called on the backend members themselves (`ss_part`,
   `ss_part_bytes`), as for the GEMM scratch. Before, a failed growth left the freed pointer and its
   old capacity in the backend (use-after-free by the next call's kernel, second `cudaFree` at
-  destroy). Regression: `cuda_host.sum_squares_grow_failure` (fails on the old code with a
-  `cudaFree` of a dead pointer; ASan reports the use-after-free).
-* Error flag: the index is lowered only by items of the recorded op (`cuda_host.error_flag_op_and_index`).
+  destroy). Regression: `cuda_host.sum_squares_grow_failure`. With only the fix reverted (in the
+  tree that has the host build), it fails without ASan (`cudaFree` of a dead pointer, then
+  `RRC_ERR_BACKEND`) and, in the ASan build, ASan reports a heap-use-after-free WRITE in
+  `k_ss_chunks` of memory freed by the failed growth.
+* Error flag: the index is lowered only by items of the recorded op
+  (`cuda_host.error_flag_op_and_index`; with only the fix reverted it reports
+  `embedding_fwd` without its offending token 5).
 * NaN logits in cross entropy: `rrc_kc_lse_push` poisons the state with a NaN input and
   `rrc_kc_lse_merge` returns a NaN state before its -inf shortcuts, so the device tree keeps a NaN
   that the CPU's serial reduction (and torch) propagate; non-NaN inputs take the same branches as
