@@ -1104,11 +1104,12 @@ fp32 error bound of a different summation order; deterministic so the det checks
 PASS; at the full GPU sizes its largest f32 errors were 1.9e-5 (logits), 1.1e-6 (loss), 7.7e-5
 (grad), 1.6e-4 (params), each at most 1/3 of the floor. `fault` adds a relative error of 1e-3 to
 `attn_softmax_bwd` (a subtly wrong backward) and must FAIL (`expect_fail` in the Makefile): its f32
-grad errors are about 1.4e-3, ≈ 5× the floor (10 failing checks at the quick size); forward checks
+grad errors are about 1.4e-3, ≈ 5× the floor (10 failing checks at the quick size, 12 at the full
+size: grads 1.2e-3–1.4e-3, grad norms 2.7e-4, params 8.3e-4–1.1e-3 against 8e-4); forward checks
 pass (the fault is backward-only), and in bf16 the fault is below the bf16 noise, so the f32 checks
 are the ones that catch it. On kc-emu (CPU arithmetic, tree reductions, shuffled item order) the
 whole set passes with dev_err ≈ ref_err. HOST-ONLY: the tiny qwen3 f32 + bf16 set passes through
-the real backend on the fake runtime (`make test` with `CUDA_HOME`; about 30 s). TF32 (`--tf32`)
+the real backend on the fake runtime (`make test` with `CUDA_HOME`). TF32 (`--tf32`)
 replaces the f32 floors by the bf16 ones / 8. The work directory (`--e2e-dir`, default `$TMPDIR`)
 is removed unless `--e2e-keep`.
 
@@ -1133,8 +1134,11 @@ and ladder level, kernel-fallback examples, failing cases), and `e2e` (every ite
 calls and computed FLOPs per dtype combination and ladder level during the end-to-end runs, with
 the kernel-fallback FLOP share printed loudly, the h2d and stream-synchronize counts, and
 `model_gemm_census`: every distinct GEMM geometry of the model with its path). The file is
-rewritten atomically after every stage with `complete: false`, and on the fatal path (e.g. the
-backend cannot be created), so a crash or hang leaves the finished stages on disk. The last stdout
+rewritten atomically after every stage and after every end-to-end family × dtype case (with
+`complete: false`, and `e2e.result` INCOMPLETE while that stage runs), and on the fatal path (e.g.
+the backend cannot be created), so a crash or hang leaves the finished stages on disk; stdout is
+line-buffered, so a log piped through `tee` keeps every finished line too. The HOST-ONLY run
+checks the CUDA-only sections (build, device, tally, census; `tests/cuda_host/check_reports.py`). The last stdout
 line stays exactly `rrc_selftest: PASS|FAIL` (the Makefile's checks depend on it).
 
 ### 15.3 Pinned staging for memcpy_h2d (no signature change)
@@ -1151,8 +1155,10 @@ with every other op by the stream. Large copies (model weights) stream through t
 the host memcpy of one slot overlapping the DMA of the previous ones. With `sync_each_op` the call
 also synchronizes. A failed pinned allocation at creation disables the ring with a warning;
 `destroy` frees the ring and events after its stream synchronize. Counted on the fake runtime
-(code-derived counts, not timings): one optimizer step of `rrc_bench` with 2 micro-batches issues
-12 uploads and 6 full stream synchronizes; before the ring each upload added one synchronize.
+(code-derived counts, not timings) for one configuration, `rrc_bench --synthetic-model qwen3`
+with 1 row × 8 tokens and grad accumulation 2: one optimizer step issues 12 uploads and 6 full
+stream synchronizes; before the ring each upload added one synchronize. The ring is on by default
+for every user of the backend, `rrc_train_cuda` included.
 
 Tests (HOST-ONLY, `cuda_host.h2d_staging_ring`): the fake runtime's host → device copies are lazy
 (queued; the source is read only when the queue is flushed by a later stream operation, a stream

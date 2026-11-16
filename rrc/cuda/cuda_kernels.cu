@@ -285,6 +285,7 @@ cudaError_t rrc_cu_kernel_versions(int *binary_version, int *ptx_version) {
     cudaFuncAttributes a;
     memset(&a, 0, sizeof a);
     cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void *>(&k_add));
+    if (e != cudaSuccess) (void)cudaGetLastError(); // informational: never surface as a later launch error
     *binary_version = a.binaryVersion;
     *ptx_version = a.ptxVersion;
     return e;

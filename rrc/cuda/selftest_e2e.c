@@ -461,7 +461,7 @@ typedef struct run_shape {
     int64_t attn_chunk, ce_chunk;
 } run_shape;
 
-/* load (model, adapter) on be; logits; forward + backward. `twice`: also the recompute "none" grads. */
+/* load (model, adapter) on be; logits; forward + backward. `with_none`: also the recompute "none" grads. */
 static rrc_status fb_run(const rrc_backend *be, const char *model_dir, const char *adapter, rrc_dtype dt,
                          const run_shape *rs, const mb *b, int with_none, fb_out *out) {
     memset(out, 0, sizeof *out);
@@ -718,8 +718,6 @@ static void run_case(ctx *c, const char *work, int fam, rrc_dtype dt) {
                 char w1[160], w2[160];
                 const double ga = grad_err(layout, fr.grads, fc.grads, NULL, 0);
                 cmp_item(c, fd, Q_GRAD, bf, grad_err(layout, fd1.grads, fr.grads, w1, sizeof w1), ga, w1);
-                rrc_e2e_item *it = NULL;
-                (void)it;
                 {
                     /* recompute none on dev against the same reference */
                     const double e = grad_err(layout, fd2.grads_nr, fr.grads, w2, sizeof w2);
@@ -879,6 +877,7 @@ int rrc_e2e_run(const rrc_backend *dev, const rrc_e2e_opts *o, rrc_e2e_result *r
             snprintf(fd, sizeof fd, "%s/%s", k_fam[fam], d ? "bf16" : "f32");
             if (o->only && !strstr(fd, o->only)) continue;
             run_case(&c, res->workdir, fam, d ? RRC_BF16 : RRC_F32);
+            if (o->on_case_done) o->on_case_done(o->user);
         }
     }
     if (!o->keep) rm_tree(res->workdir);

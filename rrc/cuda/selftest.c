@@ -162,7 +162,7 @@ typedef struct report {
 #endif
     char options[512];
     pass_rec passes[3];
-    int e2e_ran, e2e_fails;
+    int e2e_ran, e2e_fails, e2e_running;
     rrc_e2e_result e2e;
     int complete, fails;
     char fatal[RRC_ERROR_MSG_MAX + 64];
@@ -465,7 +465,7 @@ static void report_write(void) {
         const rrc_e2e_result *e = &R->e2e;
         rrc_jw_obj_begin(&w);
         rrc_jw_key(&w, "result");
-        rrc_jw_str(&w, R->e2e_fails ? "FAIL" : "PASS");
+        rrc_jw_str(&w, R->e2e_running ? "INCOMPLETE" : R->e2e_fails ? "FAIL" : "PASS");
         rrc_jw_key(&w, "checks");
         rrc_jw_int(&w, e->checks);
         rrc_jw_key(&w, "failures");
@@ -596,6 +596,13 @@ static void destroy_dev(const rrc_backend *dev) {
  * default cap of 2^20 blocks that needs more than 2^28 elements or 2^20 rows). */
 #define GRID_PASS_BLOCKS 3u
 
+/* rewrite the report after every end-to-end case (the longest stage) */
+static void e2e_case_done(void *user) {
+    (void)user;
+    g_rep.e2e_ran = 1;
+    report_write();
+}
+
 /* The last line of stdout is always "rrc_selftest: PASS|FAIL" (the Makefile's checks rely on it). */
 static int finish(int fails) {
     g_rep.fails = fails;
@@ -617,6 +624,8 @@ static int fatal(const char *what) {
 }
 
 int main(int argc, char **argv) {
+    /* line-buffered even into a pipe (| tee): a crash must not lose the lines of finished checks */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     cfg c;
     memset(&c, 0, sizeof c);
     memset(&g_rep, 0, sizeof g_rep);
@@ -800,7 +809,10 @@ int main(int argc, char **argv) {
         eo.tf32 = tf32;
         eo.keep = e2e_keep;
         eo.verbose = verbose;
+        eo.on_case_done = e2e_case_done;
+        g_rep.e2e_running = 1;
         g_rep.e2e_fails = rrc_e2e_run(dev, &eo, &g_rep.e2e);
+        g_rep.e2e_running = 0;
         g_rep.e2e_ran = 1;
         fails += g_rep.e2e_fails;
 #ifndef RRC_SELFTEST_HOST

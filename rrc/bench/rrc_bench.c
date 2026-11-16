@@ -686,6 +686,7 @@ static rrc_status write_json(const run *R, const args *a, const char *model_dir,
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     args a;
     const int pr = parse_args(argc, argv, &a);
     if (pr == 1) {
@@ -729,8 +730,10 @@ int main(int argc, char **argv) {
         rrc_cuda_options_default(&co);
         st = rrc_cuda_backend_create_ex(a.device, &co, &R.be);
     }
-    if (st == RRC_OK && rrc_cuda_device_info_get(R.be, &R.info) == RRC_OK) R.have_info = 1;
-    rrc_clear_error();
+    if (st == RRC_OK) {
+        if (rrc_cuda_device_info_get(R.be, &R.info) == RRC_OK) R.have_info = 1;
+        else rrc_clear_error(); /* informational only; a creation error above stays for the report */
+    }
     if (rrc_cuda_build_is_host_shim()) {
         snprintf(R.status, sizeof R.status, "smoke (HOST-ONLY fake CUDA runtime: no GPU, timings are host wall clock)");
         snprintf(R.timing_source, sizeof R.timing_source, "host wall clock via the fake runtime's events (not GPU time)");

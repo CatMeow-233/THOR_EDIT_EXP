@@ -57,6 +57,9 @@ typedef struct rrc_e2e_opts {
     int keep;             /* keep the work directory */
     int verbose;
     FILE *out;            /* NULL: stdout */
+    /* called after every family x dtype case with the partial result (e.g. to rewrite a report) */
+    void (*on_case_done)(void *user);
+    void *user;
 } rrc_e2e_opts;
 
 typedef struct rrc_e2e_item {

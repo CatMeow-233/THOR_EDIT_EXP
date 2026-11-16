@@ -284,6 +284,8 @@ cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST) $(SHIM_BENCH)
 	$(SHIM_BENCH) --synthetic-model qwen3 --dtype f32 --seq-len 8 --micro-batch 1 --grad-accum 2 --warmup 1 --steps 1 --lora-r 4 --attn-chunk 4 --ce-chunk 4 --out $(BUILD)/test_tmp/bench_shim.json 2> $(BUILD)/test_tmp/bench_shim.log || { cat $(BUILD)/test_tmp/bench_shim.log; exit 1; }
 	@grep -q '"measured_on": null' $(BUILD)/test_tmp/bench_shim.json && grep -q '"tokens_per_s": null' $(BUILD)/test_tmp/bench_shim.json || { echo "rrc_bench_shim claimed a measurement"; exit 1; }
 	@echo "rrc_bench_shim: JSON written, no measurement claimed (HOST-ONLY)"
+	@if command -v python3 >/dev/null 2>&1; then python3 $(SHIM_DIR)/check_reports.py $(BUILD)/test_tmp/selftest_shim_report.json $(BUILD)/test_tmp/bench_shim.json; \
+	 else echo "check_reports (JSON of the CUDA mains): SKIPPED (no python3)"; fi
 	@$(call expect_fail,RRC_FAKE_LT=reject $(SHIM_SELFTEST) --quick --only gemm,$(BUILD)/test_tmp/selftest_shim_reject.log,cuBLASLt refusing everything)
 	@$(call expect_fail,$(SHIM_SELFTEST) --only nonexistent_op,$(BUILD)/test_tmp/selftest_shim_nomatch.log,no check run)
 	@echo "cuda-host-test: OK (HOST-ONLY: real cuda/*.cu sources on a fake runtime and host threads; no GPU)"
