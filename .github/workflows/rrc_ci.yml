@@ -102,5 +102,6 @@ jobs:
         run: gcc --version; "$CUDA_DEST/tk/bin/nvcc" --version
       - name: make cuda-objs cuda (COMPILED-ONLY, sm_120)
         run: make -C rrc cuda-objs cuda CUDA_HOME="$CUDA_DEST/tk"
+      # no torch in this job: the two torch-interop C sub-tests report SKIP here (the cpu job runs them)
       - name: make test with CUDA_HOME (nvcc header check + HOST-ONLY cuda-host-test on the fake runtime)
         run: make -C rrc test CUDA_HOME="$CUDA_DEST/tk"
