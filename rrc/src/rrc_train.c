@@ -89,7 +89,12 @@ int main(int argc, char **argv) {
         if (rrc_cuda_backend_create(0, &be) != RRC_OK) return fail("CUDA backend");
         /* rrc_train_run_on frees every buffer of the run (model, adapter, optimizer) before it
          * returns, on error paths too, so the backend is destroyed last. */
-        const rrc_status st = rrc_train_run_on(&c, be);
+        /* the device's total memory sets the automatic memory pre-flight budget (DESIGN.md §13) */
+        rrc_cuda_device_info info;
+        uint64_t total = 0;
+        if (rrc_cuda_device_info_get(be, &info) == RRC_OK) total = (uint64_t)info.total_mem;
+        else rrc_clear_error();
+        const rrc_status st = rrc_train_run_on_device(&c, be, total);
         int rc = 0;
         if (st != RRC_OK) rc = fail("training");
         rrc_cuda_backend_destroy(be);

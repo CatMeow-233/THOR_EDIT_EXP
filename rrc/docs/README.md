@@ -4,7 +4,8 @@
 what exists so far: the build, the frozen backend interface, the CPU reference backend, the JSON /
 safetensors / config loaders (stage A); the model forward / backward with LoRA and the SFT training
 driver `rrc_train` with its data tools (stage B, model line); the CUDA backend and its selftest
-(stage B, CUDA line); and their tests.
+(stage B, CUDA line); the dry-run backend, `rrc_census` and the trainer's memory pre-flight (stage C,
+DESIGN.md §13); and their tests.
 
 Status: the CPU parts are **TESTED (CPU)**. Everything that runs on a GPU (the CUDA backend,
 `rrc_selftest`, `rrc_train_cuda`) is **COMPILED-ONLY** (no GPU in the development environment);
@@ -21,7 +22,7 @@ section). Nothing here makes a performance claim; every performance figure is NO
 ## Build
 
 ```sh
-make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_train, rrc_data (CPU backend)
+make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_train, rrc_data, rrc_census (CPU backend)
 make -C rrc test                # build and run the C unit tests (build/rrc_tests)
 make -C rrc test CUDA_HOME=/usr/local/cuda        # + nvcc compile check of all headers (sm_120)
 make -C rrc test RRC_NVCC=/path/to/bin/nvcc       # same, with an explicit nvcc
@@ -95,6 +96,12 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   CPU build's refusal of `"backend": "cuda"`. With `CUDA_HOME` set and `RRC_TEST_HOST_SHIM_TRAIN=1`
   it also runs `"backend": "cuda"` through `build/rrc_train_shim` (HOST-ONLY: the real `cuda/*.cu`
   on the fake runtime, minutes per step) and compares it with the CPU run.
+* `rrc/tests/test_census.py` (stage C, DESIGN.md §13) — `build/rrc_census`: the report's fields for
+  the three presets, every role's GEMM FLOPs against closed-form formulas of the shapes, every
+  base-weight GEMM on the native bf16 plan path, the shape-only parameter count against
+  transformers for tiny variants, refusals, and `build/rrc_train`'s memory pre-flight refusing a run
+  over a small fake budget. The C suite `census` checks the dry run against a real CPU run of tiny
+  models (identical GEMM sequence, FLOPs, peak bytes, layout).
 * `make -C rrc asan` — `make test` under AddressSanitizer + UBSan (build/asan): the C tests,
   `rrc_selftest_host` and its negative checks, and with `CUDA_HOME` the HOST-ONLY `cuda-host-test`.
 * `make -C rrc tsan` — the `data` and `train` C suites (prefetch thread next to the training loop)
@@ -117,6 +124,21 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   FILE --seq-len T --rows B --count N --out OUT [--seed S] [--no-shuffle] [--truncation drop]
   [--pad-id P] [--no-prefetch] [--hold H] [--start-epoch E --start-index I]` writes the first N
   packed micro-batches exactly as the trainer's loader builds them.
+* `build/rrc_census (--config PATH | --preset NAME) --seq-len T [--micro-batch B] [--grad-accum M]
+  [--r N] [--alpha X] [--rslora] [--targets LIST] [--layers L0,...] [--recompute full|none]
+  [--attn-chunk N] [--ce-chunk N] [--dtype bf16|f32] [--max-positions N] [--target cuda|cpu]
+  [--scratch-cap N] [--tf32] [--allow-unknown-keys] [--pretty] [--out FILE]`, `build/rrc_census
+  --list-presets`: GEMM census and memory of one training step, **computed** by a dry run of the
+  real model / LoRA / optimizer code on a shape-only model (DESIGN.md §13; nothing runs on a device,
+  nothing is measured). PATH is a real HF `config.json` (or its directory), e.g. copied from the GPU
+  machine; the presets `qwen3-8b`, `qwen2.5-7b`, `llama-3.1-8b` are assumed shapes typed in from the
+  public model cards, NOT_TESTED against the real files (the output says so). The JSON has GEMM
+  FLOPs by (A/B/C dtypes, plan path) and by role (base_fwd, base_dx, lm_head_fwd, lm_head_dx, lora,
+  attention), the native and native-bf16 shares, conversion bytes, syncs / transfers, per-op calls
+  and bytes, and the peak memory by category (weights, RoPE tables, LoRA params + grads, AdamW,
+  workspace, and with `--target cuda` the CUDA backend's GEMM scratch, cuBLASLt workspace and
+  partial buffers). Defaults are rrc_train's (r 8, alpha 16, all seven targets, attn_chunk 256,
+  ce_chunk 1024, recompute full, bf16).
 * `python rrc/tools/prepare_sft.py` and `build/rrc_train`: see the next section.
 
 ## Training (`rrc_train`)
@@ -182,10 +204,20 @@ Outputs in `output_dir`:
 * `batches/step-<N>.safetensors` with `dump_batches: true` (tokens / labels / position_ids / doc_ids
   `[grad_accum_steps, micro_batch_size, seq_len]`).
 
+Memory pre-flight (DESIGN.md §13): before it loads the model or allocates anything on the backend,
+`rrc_train` runs one training step of the config's shapes on the dry-run backend (the same code as
+`rrc_census`) and refuses the run (exit 2, `RRC_ERR_OOM`, with the computed breakdown and what to
+change) if the computed peak exceeds `memory_budget_bytes`. Default (null): on `"cuda"` the
+device's total memory minus 1 GiB (left for the CUDA context and fragmentation, which the dry run
+does not see; an assumption, NOT_TESTED on a GPU; no check if the total is unknown), on the CPU
+backends unlimited; 0 disables the check; a number sets the budget in bytes. The computed peak is
+logged at info level. It is a computation, not a measurement: it covers the op-table allocations
+plus, on `"cuda"`, the GEMM promotion scratch, the cuBLASLt workspace and the sum_squares partials.
+
 Resume: `"resume_from": "<output_dir>/checkpoint-<K>"` continues bit-identically (CPU, tested) to
 the uninterrupted run. The config fields that determine the trajectory must be unchanged (they are
 compared with the fingerprint stored in `rrc_state.bin`; output_dir, save_steps, stop_after_step,
-prefetch, recompute, dump_batches may change), the data file must be the same (hash), and the
+prefetch, recompute, dump_batches, memory_budget_bytes may change), the data file must be the same (hash), and the
 adapter must hold the saved parameters (hash). Lines of `metrics.jsonl` after step K (and a partial
 last line) are dropped before appending.
 
@@ -237,6 +269,7 @@ out-of-range values. Required: `model_dir`, `data_path`, `output_dir`, `seq_len`
 | `save_steps` | 0 | checkpoint every N steps (0: only at the end / `stop_after_step`) |
 | `stop_after_step` | 0 | > 0: checkpoint and exit after this step (the schedule still spans `max_steps`) |
 | `dump_batches` | false | write the packed batches of every step to `output_dir/batches/` (tests, debugging) |
+| `memory_budget_bytes` | null | memory pre-flight (below): null = automatic (CUDA: device total memory − 1 GiB; CPU backends: unlimited), 0 = no check, N > 0 = refuse a run whose computed peak exceeds N bytes. Not part of the resume fingerprint |
 <!-- end of config fields -->
 
 Example (`train.json`):
@@ -273,6 +306,8 @@ machine add `"backend": "cuda"` and run `rrc/build/rrc_train_cuda`; COMPILED-ONL
 | `include/rrc/data.h`, `src/data.c` | `.rrcbin` reader (validation), shuffling, packing, prefetch thread (stage B, step 2) |
 | `include/rrc/train.h`, `src/train.c` | LR schedules, clip + AdamW, training config, `rrc_state.bin`, checkpoints, training loop |
 | `src/rrc_train.c`, `src/rrc_data.c` | `build/rrc_train`, `build/rrc_data` |
+| `include/rrc/dryrun.h`, `src/dryrun_backend.c` | dry-run backend: fake handles, live / peak bytes, recorded calls, the GEMM plan's path per call (stage C) |
+| `include/rrc/census.h`, `src/census.c`, `src/rrc_census.c` | GEMM census + memory of one step by a dry run; presets; `build/rrc_census`; the trainer's memory pre-flight uses it |
 | `tools/prepare_sft.py` | JSONL -> `.rrcbin` with a local tokenizer |
 | `tools/torch_reference.py` | PyTorch + PEFT reference training loop and the packing spec in Python (tests) |
 
@@ -295,7 +330,8 @@ range check fails; `--allow-fallback` turns the GEMM path requirement off.
 Without a GPU: `make -C rrc cuda-objs CUDA_HOME=...` compiles every `.cu` (CI);
 `rrc/tools/fetch_cuda_toolkit.sh DEST` assembles a compile-only CUDA 12.9 toolkit from pinned
 PyPI wheels and conda packages (not needed for the CPU build; not run by tests). `make -C rrc test`
-also runs the kernel bodies, the GEMM plan and the selftest harness on CPU through the host
+also runs the kernel bodies, the GEMM plan (pure host C, part of `librrc.a` since stage C because
+the dry-run backend uses it) and the selftest harness on CPU through the host
 emulation backend (`build/rrc_selftest_host`); with `CUDA_HOME` set it also builds the real
 `cuda/*.cu` sources with g++ against a fake CUDA runtime and runs them on host threads
 (`make -C rrc cuda-host-test`, HOST-ONLY: no GPU, no real cuBLASLt); `make -C rrc asan` runs the

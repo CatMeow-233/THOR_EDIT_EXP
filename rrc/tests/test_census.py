@@ -151,3 +151,39 @@ def test_fraction_of_attention_flops_is_reported(census):
     roles = {x["role"]: x["flop_fraction"] for x in d["gemm"]["by_role"]}
     assert math.isclose(sum(roles.values()), 1.0, rel_tol=1e-12)
     assert 0.05 < roles["attention"] < 0.3 and roles["lm_head_fwd"] < 0.05
+
+
+def _write_rrcbin(path: pathlib.Path, docs: list[list[int]], vocab: int) -> None:
+    import struct
+
+    body = b"".join(
+        struct.pack("<I", len(d)) + struct.pack(f"<{len(d)}I", *d) + bytes([0] + [1] * (len(d) - 1)) for d in docs
+    )
+    path.write_bytes(b"RRCBIN01" + struct.pack("<QQQ", len(docs), vocab, sum(map(len, docs))) + body)
+
+
+def test_rrc_train_memory_preflight_refuses_over_budget(rrc_build, census, tmp_path):
+    """rrc_train runs the same dry run before allocating and refuses a run whose computed peak
+    exceeds memory_budget_bytes (CPU backend, a small fake budget); the peak it uses is the census's
+    op-table peak for the same shapes (CPU target)."""
+    mdir = tmp_path / "m"
+    mtm.make_variant("qwen3", str(mdir), seed=0)
+    cfg_hf = json.loads((mdir / "config.json").read_text())
+    data = tmp_path / "d.rrcbin"
+    _write_rrcbin(data, [[1, 2, 3, 4, 5], [6, 7, 8], [9, 10, 11, 12, 13, 14, 15]], cfg_hf["vocab_size"])
+    d = run(census, "--config", str(mdir), "--seq-len", "16", "--micro-batch", "2", "--target", "cpu", "--r", "4",
+            "--alpha", "8", "--attn-chunk", "5", "--ce-chunk", "7")
+    peak = d["memory"]["peak_total_bytes"]
+    base = dict(model_dir=str(mdir), data_path=str(data), seq_len=16, micro_batch_size=2, max_steps=1,
+                lora=dict(r=4, alpha=8), attn_chunk=5, ce_chunk=7)
+    for budget, ok in [(peak - 1, False), (peak, True), (0, True), (None, True)]:
+        out = tmp_path / f"o_{budget}"
+        cfg = tmp_path / f"c_{budget}.json"
+        cfg.write_text(json.dumps({**base, "output_dir": str(out), "memory_budget_bytes": budget}))
+        p = subprocess.run([str(rrc_build / "rrc_train"), "--config", str(cfg)], capture_output=True, text=True)
+        if ok:
+            assert p.returncode == 0, (budget, p.stderr)
+            assert (out / "metrics.jsonl").is_file()
+        else:
+            assert p.returncode == 2 and "memory pre-flight" in p.stderr and f"{peak} bytes" in p.stderr, p.stderr
+            assert "memory_budget_bytes" in p.stderr and not out.exists()

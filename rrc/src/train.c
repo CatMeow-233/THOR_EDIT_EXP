@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "rrc/census.h"
 #include "rrc/json.h"
 #include "rrc/safetensors.h"
 
@@ -192,6 +193,7 @@ void rrc_train_config_default(rrc_train_config *c) {
     c->max_positions = 0;
     c->recompute = RRC_RECOMPUTE_FULL;
     c->prefetch = 1;
+    c->memory_budget_bytes = -1;
 }
 
 static rrc_status get_str(const rrc_json *v, const char *key, int nullable, char *dst, size_t cap) {
@@ -409,6 +411,9 @@ rrc_status rrc_train_config_parse(const char *text, size_t len, rrc_train_config
             S(get_int(v, k, 0, INT32_MAX, &c->stop_after_step));
         } else if (!strcmp(k, "dump_batches")) {
             S(get_bool(v, k, &c->dump_batches));
+        } else if (!strcmp(k, "memory_budget_bytes")) {
+            if (v->type == RRC_JSON_NULL) c->memory_budget_bytes = -1;
+            else S(get_int(v, k, 0, INT64_MAX, &c->memory_budget_bytes));
         } else {
             st = RRC_ERROR(RRC_ERR_PARSE, "config: unknown key \"%s\" (every field is listed in rrc/docs/README.md)", k);
             goto done;
@@ -601,6 +606,9 @@ rrc_status rrc_train_config_to_json(const rrc_train_config *c, char **out) {
     rrc_jw_int(&w, c->stop_after_step);
     rrc_jw_key(&w, "dump_batches");
     rrc_jw_bool(&w, c->dump_batches);
+    rrc_jw_key(&w, "memory_budget_bytes");
+    if (c->memory_budget_bytes >= 0) rrc_jw_int(&w, c->memory_budget_bytes);
+    else rrc_jw_null(&w);
     rrc_jw_obj_end(&w);
     size_t n;
     return rrc_jw_finish(&w, out, &n);
@@ -1261,10 +1269,92 @@ static int holds_run(const char *dir, const char *mpath) {
     return found;
 }
 
-static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, int64_t *start_step) {
+static double gib(uint64_t b) { return (double)b / (double)(1ull << 30); }
+
+rrc_status rrc_train_memory_preflight(const rrc_train_config *c, const rrc_model_config *mc, int cuda,
+                                      uint64_t device_total_bytes, rrc_train_preflight *out) {
+    RRC_REQUIRE(c && mc, RRC_ERR_INVALID_ARG, "null argument");
+    rrc_train_preflight pf;
+    memset(&pf, 0, sizeof pf);
+    if (c->memory_budget_bytes > 0) {
+        pf.budget_bytes = (uint64_t)c->memory_budget_bytes;
+        snprintf(pf.budget_source, sizeof pf.budget_source, "memory_budget_bytes");
+    } else if (c->memory_budget_bytes == 0) {
+        snprintf(pf.budget_source, sizeof pf.budget_source, "none (memory_budget_bytes = 0)");
+    } else if (!cuda) {
+        snprintf(pf.budget_source, sizeof pf.budget_source, "none (CPU backend: unlimited by default)");
+    } else if (device_total_bytes > (uint64_t)RRC_TRAIN_CUDA_MEMORY_MARGIN) {
+        pf.budget_bytes = device_total_bytes - (uint64_t)RRC_TRAIN_CUDA_MEMORY_MARGIN;
+        snprintf(pf.budget_source, sizeof pf.budget_source, "device total %.2f GiB - margin %.2f GiB",
+                 gib(device_total_bytes), gib((uint64_t)RRC_TRAIN_CUDA_MEMORY_MARGIN));
+    } else {
+        snprintf(pf.budget_source, sizeof pf.budget_source, "none (device total memory unknown)");
+    }
+    rrc_census_opts o;
+    rrc_census_opts_default(&o);
+    o.model.dtype = c->dtype;
+    o.model.max_positions = c->max_positions;
+    o.model.attn_chunk = c->attn_chunk;
+    o.model.ce_chunk = c->ce_chunk;
+    o.model.recompute = c->recompute;
+    o.lora = c->lora;
+    o.seq_len = c->seq_len;
+    o.micro_batch = c->micro_batch_size;
+    o.grad_accum = 1; /* memory does not depend on the window length */
+    o.target = cuda ? RRC_CENSUS_TARGET_CUDA : RRC_CENSUS_TARGET_CPU;
+    rrc_census_result *r = (rrc_census_result *)malloc(sizeof *r);
+    if (!r) return RRC_ERROR(RRC_ERR_OOM, "memory pre-flight result");
+    rrc_status st = rrc_census_run(mc, &o, r);
+    if (st == RRC_OK) {
+        pf.peak_bytes = r->peak_total_bytes;
+        pf.weights_bytes = r->weights_bytes + r->rope_bytes;
+        pf.lora_bytes = r->lora_bytes;
+        pf.adam_bytes = r->adam_bytes;
+        pf.workspace_bytes = r->workspace_bytes;
+        pf.internal_bytes = r->gemm_scratch_bytes + r->cublaslt_workspace_bytes + r->sum_squares_partials_bytes;
+    }
+    free(r);
+    if (out) *out = pf;
+    if (st != RRC_OK) return rrc_error_context(st, __FILE__, __LINE__, "memory pre-flight");
+    if (pf.budget_bytes && pf.peak_bytes > pf.budget_bytes)
+        return RRC_ERROR(RRC_ERR_OOM,
+                         "memory pre-flight: this run needs about %.2f GiB (%llu bytes) of %s memory, computed by a "
+                         "dry run of one step (not measured): weights + RoPE tables %.2f GiB, LoRA params + grads "
+                         "%.2f GiB, AdamW m / v %.2f GiB, workspace %.2f GiB, backend-internal buffers %.2f GiB; the "
+                         "budget is %.2f GiB (%llu bytes, %s). Lower seq_len or micro_batch_size, use \"recompute\": "
+                         "\"full\", smaller attn_chunk / ce_chunk, or set \"memory_budget_bytes\" (0 disables the "
+                         "check)",
+                         gib(pf.peak_bytes), (unsigned long long)pf.peak_bytes, cuda ? "device" : "backend",
+                         gib(pf.weights_bytes), gib(pf.lora_bytes), gib(pf.adam_bytes), gib(pf.workspace_bytes),
+                         gib(pf.internal_bytes), gib(pf.budget_bytes), (unsigned long long)pf.budget_bytes,
+                         pf.budget_source);
+    return RRC_OK;
+}
+
+static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, uint64_t device_total, int64_t *start_step) {
     const rrc_train_config *c = t->c;
     *start_step = 0;
     t->be = device_be ? device_be : c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC ? rrc_backend_cpu_f32acc() : rrc_backend_cpu();
+    {
+        /* The shape checks (the same as after the model load below, same messages and statuses) and
+         * the memory pre-flight run on config.json alone, before anything is allocated on the
+         * backend or output_dir is created. */
+        rrc_model_config mc0;
+        RRC_CHECK_CTX(rrc_config_load(c->model_dir, 0, &mc0), "loading the model %s", c->model_dir);
+        const int64_t npos0 = c->max_positions > 0 ? c->max_positions : mc0.max_position_embeddings;
+        RRC_REQUIRE(c->seq_len <= npos0, RRC_ERR_INVALID_ARG,
+                    "seq_len = %lld exceeds the model's positions (%lld; max_positions / max_position_embeddings)",
+                    (long long)c->seq_len, (long long)npos0);
+        RRC_REQUIRE(c->pad_token_id < mc0.vocab_size, RRC_ERR_RANGE, "pad_token_id = %d >= vocab_size %lld",
+                    (int)c->pad_token_id, (long long)mc0.vocab_size);
+        rrc_train_preflight pf;
+        RRC_CHECK(rrc_train_memory_preflight(c, &mc0, device_be != NULL, device_total, &pf));
+        rrc_log(RRC_LOG_INFO, "memory pre-flight (computed by a dry run, not measured): peak %.3f GiB, budget %s%.3f GiB",
+                gib(pf.peak_bytes), pf.budget_bytes ? "" : "none: ", pf.budget_bytes ? gib(pf.budget_bytes) : 0.0);
+        if (!pf.budget_bytes) rrc_log(RRC_LOG_INFO, "memory pre-flight budget: %s", pf.budget_source);
+        if (device_be && c->memory_budget_bytes < 0 && !device_total)
+            rrc_log(RRC_LOG_WARN, "memory pre-flight: the device's total memory is unknown, no budget applied");
+    }
     rrc_model_opts mo;
     rrc_model_opts_default(&mo);
     mo.dtype = c->dtype;
@@ -1375,9 +1465,13 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, int64_
     return RRC_OK;
 }
 
-rrc_status rrc_train_run(const rrc_train_config *c) { return rrc_train_run_on(c, NULL); }
+rrc_status rrc_train_run(const rrc_train_config *c) { return rrc_train_run_on_device(c, NULL, 0); }
 
 rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be) {
+    return rrc_train_run_on_device(c, device_be, 0);
+}
+
+rrc_status rrc_train_run_on_device(const rrc_train_config *c, const rrc_backend *device_be, uint64_t device_total) {
     RRC_REQUIRE(c, RRC_ERR_INVALID_ARG, "null argument");
     RRC_REQUIRE(c->backend >= RRC_TRAIN_BACKEND_CPU && c->backend <= RRC_TRAIN_BACKEND_CUDA, RRC_ERR_INVALID_ARG,
                 "config: invalid backend %d", (int)c->backend);
@@ -1392,7 +1486,7 @@ rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device
     memset(&t, 0, sizeof t);
     t.c = c;
     int64_t step0 = 0;
-    rrc_status st = trainer_setup(&t, device_be, &step0);
+    rrc_status st = trainer_setup(&t, device_be, device_total, &step0);
     const int64_t M = c->grad_accum_steps;
     const int64_t end = c->stop_after_step > 0 ? c->stop_after_step : c->max_steps;
     const int64_t warmup = rrc_train_config_warmup(c);

@@ -712,7 +712,7 @@ integration, §12, COMPILED-ONLY); no performance figure exists
     `target_modules` that is not a list (PEFT writes a string for a regex target) are refused,
     because the alpha / rslora / dropout / DoRA / layer checks could not run on them. The training
     config's own `"target_modules": "all-linear"` is unaffected.
-39. **Memory**: there is no pre-flight memory check (NOT DONE). The trainer logs, after the first
+39. **Memory**: there is no pre-flight memory check (NOT DONE in this step; added in §13 item 5). The trainer logs, after the first
     step, the per-step workspace bytes and the LoRA parameter + gradient + Adam state bytes (base
     weights not included). A reviewer computed from the measuring pass of the workspace layout (not
     run on a GPU, NOT_TESTED): an 8B-class bf16 model with r = 16 on all linears would need about
@@ -1051,3 +1051,160 @@ The model line (§10) and the CUDA line (§11) were merged with merge commits; n
 5. **End-to-end CPU smoke**: `rrc/tests/test_e2e_cpu.py` (tiny qwen3 + tokenizer trained in the test
    -> `prepare_sft.py` -> `rrc_train` cpu -> `metrics.jsonl`, checkpoints -> `PeftModel`). It is a
    plumbing check, not a numerical one (`test_train_vs_torch.py` is) and not a GPU validation.
+
+## 13. Stage C census: GEMM paths and memory at 8B shapes (computed, not measured)
+
+Status: the dry-run backend, the shape-only model, `rrc_census` and the trainer's memory pre-flight
+are **TESTED (CPU)**: they are pure host C and are checked against real CPU runs of tiny models
+(item 6). Every number they print for an 8B model is **computed** from the op-call sequence of one
+training step; nothing ran on a GPU and nothing in this section is a measurement. "Native" means the
+level-0 path of the CUDA GEMM plan (§11.2) under its assumed cuBLASLt type table, which is
+NOT_TESTED on a device. The 8B shapes are **assumed**: built-in presets typed in from the public
+model cards of Qwen3-8B, Qwen2.5-7B and Llama-3.1-8B, NOT_TESTED against the real `config.json`
+files (huggingface.co is not reachable here); `rrc_census --config` takes the real file.
+
+1. **Dry-run backend** (`include/rrc/dryrun.h`, `src/dryrun_backend.c`): an op table that computes
+   nothing (`host_accessible = 0`). `alloc` returns fake handles in the upper (kernel) half of the
+   address space (`0xffff800000000000 + offset`, 256-byte aligned, never reused): a user-mode
+   dereference faults on x86-64 and AArch64, distinct allocations never overlap, so `ops.c`'s alias
+   checks and the plan's alignment computation see a consistent address space. It tracks live and
+   peak bytes; `memcpy_h2d/d2d`, `memset0`, `sync` only count; `memcpy_d2h` zero-fills the host side
+   (the loss download and the gradient norm read 0, deterministically). Every op records its shapes,
+   dtypes and computed bytes moved (one read of each input, one write of each output); `gemm` also
+   records m, n, k, batch and the A/B/C dtypes and runs `rrc_gemm_plan_make` at level NATIVE plus
+   every chunk (`rrc_gemm_plan_chunk` with a fake scratch base): promotions, C scratch, chunks,
+   scratch bytes, converted elements and bytes, the smallest operand alignment. The plan
+   (`cuda/gemm_plan.c`, pure host C) moved from `librrc_cuda.a` into `librrc.a` for this;
+   `librrc_cuda.a` resolves it from there (link order `librrc_cuda.a librrc.a`, unchanged).
+2. **Shape-only model** (`rrc_model_create_shape_only(be, cfg, opts, &m)`): the loader's weight
+   layout (one allocation in expected-tensor order, the fused `[gate; up]` view), views and RoPE
+   allocation built from a config alone; nothing is read or computed, the zero-filled allocations
+   stay zero. `rrc_model_load` now calls the same builder; its behaviour (error order, statuses,
+   `*out = NULL` on failure) is unchanged (the existing model tests pass unmodified).
+3. **Finding and fix.** The census found exactly one class of base-weight GEMM off the native bf16
+   path: the input gradients through the frozen k_proj / v_proj weights, `dxn += dK Wk` and
+   `dxn += dV Wv`, whose A operand is the f32 dK / dV accumulator (§10 item 3), so the plan promotes
+   the bf16 weight (f32 × bf16 → f32). That is 2 GEMMs per layer: 72 / 56 / 64 calls per step and
+   2.47 / 0.84 / 2.20 TFLOP (computed) for the three presets at T = 4096. Every other base-weight
+   GEMM (q/o/gate-up/down forward and input gradients, the LM head both ways) was already
+   bf16 × bf16. Fix (model code): with a bf16 model the layer backward converts dK, then dV, once to
+   bf16 into `w->dob` (free after `attn_bwd`; Q ≥ KV) and runs those GEMMs bf16 × bf16 → f32; the
+   accumulators stay f32 and the LoRA k/v backward keeps reading them (fp32, like PEFT), so only the
+   base-weight input gradient sees the rounded copy — HF in bf16 keeps dK itself in bf16. Numerics
+   (one-off A/B, not a test; the window of `test_lora_bf16_matches_peft`, mean relative L2 error of
+   the LoRA gradients against fp32 on the same bf16-rounded weights, `cpu` backend; `cpu-f32acc`
+   alike): llama3_rope 0.00750 → 0.00754, qwen2_tied 0.00820 → 0.00821, qwen3_hd32_bias 0.00976 →
+   0.00977, HF-bf16 itself 0.00952 / 0.00999 / 0.01088; the worst per-tensor ratio to the test's
+   tolerance `2·e_HF + 0.005` is unchanged (0.430 / 0.431 / 0.583); logits and loss are
+   bit-identical (forward untouched). The "before" values reproduce §10 item 3's exactly. Tests:
+   `census.census_8b_presets_base_weight_gemms_native` (exact call counts per role and every
+   base-weight call on a bf16 × bf16 combination, for all three presets; it failed on the code before
+   the fix with "base_dx: 72 of 216 ...") and the same assertion in `rrc/tests/test_census.py`.
+4. **`rrc_census`** (`include/rrc/census.h`, `src/census.c`, `build/rrc_census`): builds the
+   shape-only model, the LoRA adapter (`rrc_lora_create`) and the AdamW state
+   (`rrc_optimizer_create`) on a dry-run backend, then runs two optimizer steps exactly as the
+   trainer does (zero grads; `grad_accum` micro-batches of forward + backward; clip + AdamW; sync) on
+   rows of one full-length document, every token labelled (the worst case for attention and the LM
+   head), and reports the second step (steady state: the first also allocates the workspace and
+   grows the scratch). GEMM roles are decided by operand addresses (B inside the LM-head weight →
+   `lm_head_*`, inside the other base weights → `base_fwd` / `base_dx` by `trans_b`, any operand in the
+   LoRA parameters / gradients → `lora`, the rest → `attention`). JSON: FLOPs by (A, B, C dtypes, plan
+   path) and by role, native and native-bf16 fractions, conversion bytes, syncs and transfers, per-op
+   calls and bytes, memory by category; every field labelled computed.
+
+   Tables (computed; presets at seq_len 4096, micro-batch 1, LoRA r 16 / alpha 32 on all seven
+   modules of every layer, recompute full, attn_chunk 256, ce_chunk 1024, bf16, CUDA target; after
+   the fix of item 3, "before" in parentheses):
+
+   | preset | base params | LoRA params | GEMM calls / step | GEMM TFLOP / step | native share | native bf16 share |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | Qwen3-8B | 8.191 B | 43.65 M | 39190 | 189.79 | 0.9244 | 0.9238 (0.9107) |
+   | Qwen2.5-7B | 7.616 B | 40.37 M | 20694 | 169.64 | 0.9404 | 0.9400 (0.9350) |
+   | Llama-3.1-8B | 8.030 B | 41.94 M | 34806 | 185.66 | 0.9308 | 0.9302 (0.9184) |
+
+   By role (TFLOP per step and share of all GEMM FLOPs; A B C dtypes: calls):
+
+   | role | Qwen3-8B | Qwen2.5-7B | Llama-3.1-8B | combinations (plan path) |
+   | --- | --- | --- | --- | --- |
+   | base_fwd | 97.79 (0.515) | 89.98 (0.531) | 97.65 (0.526) | bf16 bf16 bf16 (native) |
+   | base_dx | 56.90 (0.300) | 53.46 (0.315) | 57.17 (0.308) | bf16 bf16 f32 (native: q, k, v, gate-up into the f32 `dxn`), bf16 bf16 bf16 (native: o, down) |
+   | lm_head_fwd | 5.10 (0.027) | 4.46 (0.026) | 4.30 (0.023) | bf16 bf16 bf16 (native) |
+   | lm_head_dx | 5.10 (0.027) | 4.46 (0.026) | 4.30 (0.023) | bf16 bf16 bf16 (native) |
+   | attention | 23.51 (0.124) | 15.97 (0.094) | 20.88 (0.113) | bf16 bf16 f32 scores / dP (native); f32 bf16 bf16 P·V / dQ (promote B, C scratch); f32 bf16 f32 dV / dK (promote B) |
+   | lora | 1.40 (0.007) | 1.30 (0.008) | 1.35 (0.007) | f32 f32 f32 (native); f32 f32 bf16 `y += s t Bᵀ` (C scratch); bf16 f32 f32 `t`, `dB`, `dt` (promote A); f32 bf16 f32 `dA` (promote B) |
+
+   The base-weight GEMM call counts are exact formulas of the code (forward 6L, recompute 5(L−1)
+   without down_proj, input gradients 6L, LM head ⌈4095 / 1024⌉ = 4 each way), and every role's
+   FLOPs equal closed-form expressions of the shapes written independently in
+   `rrc/tests/test_census.py`. Native-bf16 share of the attention FLOPs: 0.444 for all three (scores
+   in forward, recompute and backward, and dP: 4 of the 9 equal-sized GEMM sets per recomputed
+   layer); the rest runs promoted because P and dS are f32 (§10 item 3). No GEMM of these steps has
+   an operand aligned to less than 16 bytes (`align_lt16_calls` = 0).
+
+   Conversions, transfers, synchronisation (per step, computed):
+
+   | preset | plan conversions (bytes read + written; before fix) | max GEMM scratch | sync | memcpy_h2d | memcpy_d2h | memset0 | CUDA host waits |
+   | --- | --- | --- | --- | --- | --- | --- | --- |
+   | Qwen3-8B | 368.0 GB (369.8 GB) | 64 MiB | 2 | 6 (98 296 B) | 2 (16 384 B) | 74 | 10 |
+   | Qwen2.5-7B | 335.9 GB (336.6 GB) | 56 MiB | 2 | 6 (98 296 B) | 2 (16 384 B) | 58 | 10 |
+   | Llama-3.1-8B | 353.9 GB (355.5 GB) | 64 MiB | 2 | 6 (98 296 B) | 2 (16 384 B) | 66 | 10 |
+
+   The LoRA branch causes 87 % / 92 % / 88 % of the conversion bytes (Qwen3-8B: 319.9 of 368.0 GB,
+   of which 157.7 GB is the f32-scratch round trip of the bf16 C of `y += s t Bᵀ` and 129.6 GB the
+   widening of bf16 activations / output gradients for `t = x Aᵀ`, `dB`, `dt`); the rest is attention
+   (P·V, dQ, dV, dK: 48.1 / 26.0 / 42.7 GB). "CUDA host waits" = sync + memcpy_h2d +
+   memcpy_d2h + free, the calls on which the CUDA backend waits for its stream (§11.5).
+
+   Memory (GiB, computed; op-table allocations plus the CUDA backend's internal buffers):
+
+   | preset | weights | RoPE tables | LoRA params + grads | AdamW m, v | workspace | GEMM scratch | cuBLASLt ws | peak total |
+   | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+   | Qwen3-8B | 15.256 | 0.020 | 0.325 | 0.325 | 2.729 | 0.062 | 0.031 | 18.750 |
+   | Qwen2.5-7B | 14.185 | 0.062 | 0.301 | 0.301 | 2.529 | 0.055 | 0.031 | 17.465 |
+   | Llama-3.1-8B | 14.958 | 0.062 | 0.312 | 0.313 | 2.614 | 0.062 | 0.031 | 18.353 |
+
+   (sum_squares partials ≈ 40 KiB each; not included: the CUDA context, allocator rounding and
+   fragmentation, host memory.) This agrees with the reviewer's estimate of §10 item 39 (about 20 GB
+   at B = 1, T = 4096): 18.75 GiB = 20.1 GB for the Qwen3-8B preset. The RoPE tables cover
+   `max_position_embeddings` (40960 / 131072 / 131072 rows).
+5. **Memory pre-flight** (`rrc_train_memory_preflight`, run by `trainer_setup` before the model is
+   loaded, anything is allocated on the backend or `output_dir` is created): the census dry run of
+   one step of the config's shapes (`grad_accum` 1; memory does not depend on it; CPU target for the
+   CPU backends, CUDA target on `"cuda"`), then the peak against `memory_budget_bytes`: null
+   (default) = automatic — device total memory minus `RRC_TRAIN_CUDA_MEMORY_MARGIN` (1 GiB, an
+   assumption for the CUDA context and fragmentation, NOT_TESTED) on `"cuda"` (`build/rrc_train_cuda`
+   passes `cudaMemGetInfo`'s total via `rrc_train_run_on_device`; unknown total → a warning and no
+   check, as on the HOST-ONLY fake runtime, which reports 0), unlimited on the CPU backends; 0 = no
+   check; N > 0 = N bytes. Over budget: `RRC_ERR_OOM` with the breakdown and the remedies. The
+   seq_len / pad_token_id checks now also run on `config.json` before the pre-flight (same messages
+   and statuses, so a too-long `seq_len` is not reported as a pre-flight failure). Not part of the
+   resume fingerprint. Tested on CPU with small fake budgets (`train.train_memory_preflight`: the
+   boundary peak / peak − 1, the CUDA automatic budget with a fake device total, the refusal leaving
+   no `output_dir`; `test_census.py::test_rrc_train_memory_preflight_refuses_over_budget` through
+   `build/rrc_train`). The CUDA path is COMPILED-ONLY; by hand (not part of the tests),
+   `build/rrc_train_shim` (HOST-ONLY, the fake runtime reports a total of 0) trained one step of a
+   tiny qwen3 model with the "total memory unknown" warning and refused a 1000-byte
+   `memory_budget_bytes` before creating `output_dir`.
+6. **Census checked against reality** (TESTED, CPU): `census.census_dryrun_matches_cpu_run` runs one
+   training step of tiny qwen3 (bf16 and f32, both recompute policies) and llama (MQA) models on a
+   counting CPU backend and the same step on the dry-run backend with a shape-only model: identical
+   GEMM sequences (every field of every call), equal FLOPs, equal op-table peak and workspace bytes,
+   the shape-only layout equal to the loaded one view by view, and `rrc_census_run`'s totals and
+   memory categories equal to the CPU run's. `test_census.py` checks the shape-only parameter count
+   against transformers' `model.parameters()` for four tiny variants, the FLOPs of every role against
+   closed-form formulas at the preset shapes, and the report's fields. The suite runs under
+   `make asan`.
+7. **Not done / open** (NOT_TESTED unless stated):
+   * Whether cuBLASLt accepts each "native" call on the 5090 (type table, alignment, heuristics) —
+     `rrc_selftest` on the device; the census reports what the plan would ask for.
+   * Attention: half of its FLOPs run promoted (f32 P / dS against bf16 Q, K, V; §10 item 3 keeps them
+     f32). A bf16 P as in HF, or the fused attention kernel of §3, would move them to the native path;
+     a numerics change that needs its own A/B against the PEFT tolerances.
+   * LoRA: its conversions are most of the converted bytes (item 4: ~0.32 TB per step at these
+     shapes, computed); the bf16 copy of A / B allowed by
+     §3 or a fused LoRA epilogue would remove them; not done (fp32 LoRA GEMMs like PEFT).
+   * The presets are unverified transcriptions; real `config.json` files may carry keys outside rrc's
+     ignore list (for example `use_mrope`, which some Qwen2.5 files are recalled to contain;
+     unverified), which `rrc_census` / `rrc_train` refuse unless `--allow-unknown-keys` /
+     `RRC_CONFIG_ALLOW_UNKNOWN_KEYS`.
+   * No time estimate is derived from these counts.
