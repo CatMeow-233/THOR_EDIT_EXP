@@ -21,7 +21,11 @@ RRC_HD static inline int rrc_kc_attn_allowed(int64_t j, int64_t q, int causal, c
 
 /* Online (max, sum-of-exp) state, mergeable in any tree order by a device reduction. Invariant:
  * m == -INFINITY implies s == 0 (empty, or only -inf pushed), so -inf values never produce
- * exp(-inf - (-inf)) = NaN. */
+ * exp(-inf - (-inf)) = NaN. A NaN input poisons the state (m = s = NaN) and a merge with a state
+ * holding a NaN returns that state, checked before the -inf shortcuts: otherwise a NaN in a lane
+ * whose other values are all -inf (or a lane holding only the NaN) would be dropped by the tree,
+ * where the serial CPU reduction and torch give NaN. Non-NaN inputs take the same branches as
+ * before (bit-identical results). */
 typedef struct rrc_kc_lse {
     float m; /* running max (-INFINITY when empty) */
     float s; /* sum of exp(x - m) */
@@ -34,6 +38,11 @@ RRC_HD static inline rrc_kc_lse rrc_kc_lse_init(void) {
     return a;
 }
 RRC_HD static inline rrc_kc_lse rrc_kc_lse_push(rrc_kc_lse a, float x) {
+    if (x != x) { /* NaN */
+        a.m = x;
+        a.s = x;
+        return a;
+    }
     if (x == -INFINITY) return a; /* contributes exp(-inf) = 0; also keeps (-inf, 0) for an empty state */
     if (x > a.m) {
         a.s = a.s * expf(a.m - x) + 1.0f; /* exp(-inf) = 0 for the first element */
@@ -44,6 +53,8 @@ RRC_HD static inline rrc_kc_lse rrc_kc_lse_push(rrc_kc_lse a, float x) {
     return a;
 }
 RRC_HD static inline rrc_kc_lse rrc_kc_lse_merge(rrc_kc_lse a, rrc_kc_lse b) {
+    if (a.m != a.m || a.s != a.s) return a; /* NaN propagates (before the -inf shortcuts) */
+    if (b.m != b.m || b.s != b.s) return b;
     if (b.m == -INFINITY) return a;
     if (a.m == -INFINITY) return b;
     rrc_kc_lse r;

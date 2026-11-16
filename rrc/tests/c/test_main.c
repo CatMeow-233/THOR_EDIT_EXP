@@ -21,6 +21,8 @@ RT_SUITE(contracts)
 RT_SUITE(model)
 RT_SUITE(data)
 RT_SUITE(train)
+RT_SUITE(gemm_plan)
+RT_SUITE(kc_items)
 
 typedef struct {
     const char *name;
@@ -40,6 +42,8 @@ static const rt_suite k_suites[] = {
     {"model", rt_suite_model, &rt_suite_model_n},
     {"data", rt_suite_data, &rt_suite_data_n},
     {"train", rt_suite_train, &rt_suite_train_n},
+    {"gemm_plan", rt_suite_gemm_plan, &rt_suite_gemm_plan_n},
+    {"kc_items", rt_suite_kc_items, &rt_suite_kc_items_n},
 };
 
 static int g_case_failures = 0;

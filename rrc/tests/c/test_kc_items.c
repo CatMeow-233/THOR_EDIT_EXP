@@ -1,0 +1,279 @@
+/* Execution coverage of the CUDA kernel bodies on CPU (DESIGN.md §11.4): the host emulation
+ * backend (rrc/cuda/kc_emu.c) runs every op through the per-item bodies of
+ * kernels_common/rrc_kc_items.h with the kernels' phase structure, each phase over its items in
+ * shuffled order, and the backend-agnostic selftest harness (rrc/cuda/selftest_ops.c, the code
+ * of rrc_selftest) compares it with rrc_backend_cpu_f32acc:
+ *   - bit-identical for every op whose arithmetic is the same (embedding, bias, rope, swiglu,
+ *     add/axpy/scale/convert, adamw, every GEMM path including promoted and kernel ones);
+ *   - REDUCE tolerance for the reductions (rmsnorm, softmax, cross entropy, sum_squares), whose
+ *     fixed lane/tree order differs from the CPU's sequential order: fp32 reassociation error is
+ *     bounded by n * 2^-24 relative to the sum of magnitudes (n = terms), the harness allows
+ *     (1e-5 + n * 2^-24) of the output scale;
+ *   - each case runs twice with different item orders and must be bit-identical (the reduction
+ *     order depends only on the shape);
+ *   - range errors are reported (by the op, or by the next sync in deferred mode) and the
+ *     offending items write nothing and read nothing out of bounds.
+ * The harness is also run with the double-accumulation CPU backend as the device, which checks
+ * that its tolerances accept a correct backend with different (more exact) arithmetic. */
+#include "kc_emu.h"
+#include "ops_util.h"
+#include "rrc_kc_items.h"
+#include "selftest_ops.h"
+
+static int emu_path(const rrc_backend *be, char *buf, size_t n) {
+    rrc_gemm_exec_report rep;
+    if (!rrc_emu_last_gemm(be, &rep)) return 0;
+    snprintf(buf, n, "%s", rep.desc);
+    return 1;
+}
+
+/* Run the harness, its log goes to a file that is printed on failure. */
+static int g_require_lt = 0; /* rrc_st_opts.require_lt for the next harness() calls */
+static void harness(const rrc_backend *dev, const char *only, const char *log) {
+    FILE *f = fopen(rt_path(log), "w+");
+    RT_ASSERT(f, "cannot open %s", rt_path(log));
+    rrc_st_opts o;
+    memset(&o, 0, sizeof o);
+    o.seed = 99;
+    o.quick = 1;
+    o.out = f;
+    o.only = only;
+    o.gemm_path = rrc_backend_is_emu(dev) ? emu_path : NULL;
+    o.strict = rrc_backend_is_emu(dev); /* bitwise for GEMM (all paths), swiglu and bias_grad */
+    o.require_lt = g_require_lt;
+    rrc_st_result r;
+    int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
+    RT_EXPECT(fails == 0, "%s: %d failed checks (log: %s)", dev->name, fails, rt_path(log));
+    RT_EXPECT(r.checks > 0 && r.det_checks == r.checks, "harness ran (%d checks)", r.checks);
+    if (!only) RT_EXPECT(r.checks > 400 && r.range_checks == 8, "full run: %d checks, %d range checks", r.checks, r.range_checks);
+    if (fails) {
+        rewind(f);
+        char line[512];
+        int shown = 0;
+        while (fgets(line, sizeof line, f) && shown < 60)
+            if (strstr(line, "FAIL") || strstr(line, "error") || strstr(line, "worst element")) {
+                fputs(line, stderr);
+                shown++;
+            }
+    }
+    fclose(f);
+}
+
+RT_TEST(emu_vs_cpu_all_ops) {
+    rrc_emu_options eo;
+    rrc_emu_options_default(&eo);
+    eo.seed = 1234;
+    const rrc_backend *emu = NULL;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    g_require_lt = 1; /* every aligned case reaches the (simulated) library, as rrc_selftest requires */
+    harness(emu, NULL, "selftest_emu.log");
+    g_require_lt = 0;
+    rrc_emu_backend_destroy(emu);
+}
+
+/* Run the harness quietly (log to a file) and return its failure count and result. */
+static int harness_quiet(const rrc_backend *dev, rrc_st_opts *o, const char *log, rrc_st_result *r) {
+    FILE *f = fopen(rt_path(log), "w");
+    if (!f) return -1;
+    o->out = f;
+    int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), o, r);
+    fclose(f);
+    return fails;
+}
+
+/* rrc_selftest must not PASS when cuBLASLt is never used (every GEMM on the kernel fallback, as
+ * with a misconfigured heuristic) or when a natively supported triple is not run natively; nor
+ * when nothing was checked at all (an --only filter matching no op). Regressions: both passed. */
+RT_TEST(harness_fails_on_fallback_and_empty_runs) {
+    rrc_emu_options eo;
+    rrc_emu_options_default(&eo);
+    eo.lt_reject_mask = 0xFFu; /* the simulated library refuses every type triple */
+    const rrc_backend *emu = NULL;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    rrc_st_opts o;
+    memset(&o, 0, sizeof o);
+    o.seed = 7;
+    o.quick = 1;
+    o.only = "gemm";
+    o.gemm_path = emu_path;
+    o.strict = 1;
+    o.require_lt = 1;
+    rrc_st_result r;
+    int fails = harness_quiet(emu, &o, "selftest_reject_all.log", &r);
+    RT_EXPECT(fails > 0 && r.failures == 0 && r.path_failures >= 9,
+              "all GEMMs on the kernel level: %d fails, %d value failures, %d path failures (log %s)", fails, r.failures,
+              r.path_failures, rt_path("selftest_reject_all.log"));
+    o.require_lt = 0; /* opt-in: forced/simulated fallbacks without the requirement still pass */
+    fails = harness_quiet(emu, &o, "selftest_reject_all_allowed.log", &r);
+    RT_EXPECT(fails == 0 && r.path_checks == 0, "without require_lt: %d fails", fails);
+    rrc_emu_backend_destroy(emu);
+    /* bf16 x bf16 -> f32 refused natively: correct via promote-all, but required at level 0 */
+    eo.lt_reject_mask = 1u << 6;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    o.require_lt = 1;
+    fails = harness_quiet(emu, &o, "selftest_reject_bbf.log", &r);
+    RT_EXPECT(fails > 0 && r.failures == 0 && r.path_failures == 1, "native triple at promote-all: %d fails, %d path failures",
+              fails, r.path_failures);
+    /* the multi-chunk requirement: the default cap never chunks these cases, a tiny cap does */
+    o.require_lt = 0;
+    o.require_chunked = 1;
+    fails = harness_quiet(emu, &o, "selftest_chunk_default.log", &r);
+    RT_EXPECT(fails == 1 && r.path_failures == 1, "default cap: nothing chunked must fail (%d)", fails);
+    rrc_emu_backend_destroy(emu);
+    rrc_emu_options_default(&eo);
+    eo.scratch_cap_elems = 40;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    fails = harness_quiet(emu, &o, "selftest_chunk_capped.log", &r);
+    RT_EXPECT(fails == 0, "40-float cap chunks: %d fails", fails);
+    /* a filter matching no op */
+    memset(&o, 0, sizeof o);
+    o.only = "nonexistent_op";
+    fails = harness_quiet(emu, &o, "selftest_no_match.log", &r);
+    RT_EXPECT(fails > 0 && r.checks == 0 && r.range_checks == 0, "no check ran: %d fails", fails);
+    rrc_emu_backend_destroy(emu);
+}
+
+RT_TEST(emu_deferred_errors_and_forced_paths) {
+    rrc_emu_options eo;
+    rrc_emu_options_default(&eo);
+    eo.deferred_errors = 1; /* the CUDA backend's default: reported by the next sync */
+    const rrc_backend *emu = NULL;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    harness(emu, "embedding", "selftest_emu_deferred_embed.log");
+    harness(emu, "rope", "selftest_emu_deferred_rope.log");
+    harness(emu, "cross_entropy", "selftest_emu_deferred_ce.log");
+    rrc_emu_backend_destroy(emu);
+    /* every GEMM through the kernel level, and through promote-all with a tiny scratch cap */
+    rrc_emu_options_default(&eo);
+    eo.gemm_min_level = RRC_GEMM_LEVEL_KERNEL;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    harness(emu, "gemm", "selftest_emu_kernel_gemm.log");
+    rrc_emu_backend_destroy(emu);
+    rrc_emu_options_default(&eo);
+    eo.gemm_min_level = RRC_GEMM_LEVEL_PROMOTE_ALL;
+    eo.scratch_cap_elems = 300;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    harness(emu, "gemm", "selftest_emu_promote_gemm.log");
+    rrc_emu_backend_destroy(emu);
+}
+
+RT_TEST(cpu_double_passes_harness_tolerances) { harness(rrc_backend_cpu(), NULL, "selftest_cpu64.log"); }
+
+RT_TEST(emu_range_items_write_nothing) {
+    /* a bad token id must neither read the table out of bounds (ASan build) nor write its row */
+    const rrc_backend *emu = NULL;
+    RT_OK(rrc_emu_backend_create(NULL, &emu));
+    const int64_t T = 6, D = 5, V = 4;
+    float table[20], out_init[30];
+    for (int i = 0; i < 20; i++) table[i] = (float)i;
+    for (int i = 0; i < 30; i++) out_init[i] = -7.0f;
+    int32_t ids[6] = {0, 3, 1000000, 2, -50, 1};
+    rrc_buf tb = rt_upload(emu, RRC_F32, table, V * D), ob = rt_upload(emu, RRC_F32, out_init, T * D),
+            ib = rt_upload_i32(emu, ids, T);
+    RT_STATUS(rrc_embedding_fwd(emu, T, D, V, ib, tb, ob), RRC_ERR_RANGE);
+    float *got = rt_download(ob, T * D);
+    for (int64_t t = 0; t < T; t++)
+        for (int64_t c = 0; c < D; c++) {
+            float want = (ids[t] >= 0 && ids[t] < V) ? table[ids[t] * D + c] : -7.0f;
+            RT_EXPECT(got[t * D + c] == want, "token %lld col %lld: %g want %g", (long long)t, (long long)c,
+                      (double)got[t * D + c], (double)want);
+        }
+    free(got);
+    rrc_buf_free(&tb);
+    rrc_buf_free(&ob);
+    rrc_buf_free(&ib);
+    rrc_emu_backend_destroy(emu);
+}
+
+RT_TEST(tree_order_fixed) {
+    /* the tree's result depends only on the partials, and differs (in general) from a sequential
+     * sum: the device order is not the CPU order, which is why reductions have a tolerance */
+    float part[RRC_KC_LANES], copy[RRC_KC_LANES];
+    rt_rng rng = {5};
+    for (int i = 0; i < RRC_KC_LANES; i++) part[i] = rt_uniform(&rng) * (float)(1 + i % 7) * 1e3f;
+    memcpy(copy, part, sizeof part);
+    double ref = 0.0;
+    for (int i = 0; i < RRC_KC_LANES; i++) ref += part[i];
+    float a = rrc_kc_tree_sum(part);
+    /* same levels executed lane-descending within each level */
+    for (int s = RRC_KC_LANES / 2; s > 0; s >>= 1)
+        for (int l = s - 1; l >= 0; l--) rrc_kc_tree_sum_step(copy, l, s);
+    RT_EXPECT(rrc_f32_bits(a) == rrc_f32_bits(copy[0]), "tree level order irrelevant");
+    RT_CLOSE(a, ref, 1e-2, 1e-5);
+    rrc_kc_lse l[RRC_KC_LANES];
+    for (int i = 0; i < RRC_KC_LANES; i++) l[i] = rrc_kc_lse_push(rrc_kc_lse_init(), i % 5 == 0 ? -INFINITY : rt_uniform(&rng) * 30);
+    rrc_kc_lse r = rrc_kc_tree_lse(l);
+    RT_EXPECT(isfinite(r.m) && isfinite(r.s) && r.s >= 1.0f, "lse tree with -inf lanes: m %g s %g", (double)r.m,
+              (double)r.s);
+}
+
+/* NaN logits: the device cross entropy must give NaN loss and gradients like the CPU reference
+ * (and torch) even when the NaN's lane holds no other finite logit. Regression: a NaN pushed into
+ * an empty lane state gave (m = -inf, s = NaN), which the tree's -inf shortcut then discarded. */
+RT_TEST(emu_xent_nan_propagates) {
+    const rrc_backend *emu = NULL, *cpu = rrc_backend_cpu_f32acc();
+    RT_OK(rrc_emu_backend_create(NULL, &emu));
+    /* {vocab, NaN position, lane-mates of the NaN are -inf} */
+    static const int64_t cases[][3] = {{4, 1, 0}, {300, 100, 0}, {1024, 5, 1}, {300, 10, 0}, {1024, 5, 0}};
+    for (int ci = 0; ci < 5; ci++) {
+        const int64_t V = cases[ci][0], at = cases[ci][1];
+        for (int zdt = 0; zdt < 2; zdt++) {
+            const rrc_dtype dt = zdt ? RRC_BF16 : RRC_F32;
+            float *z = (float *)malloc((size_t)V * sizeof(float));
+            RT_ASSERT(z, "alloc");
+            rt_rng rng = {(uint64_t)(31 + ci)};
+            rt_fill(&rng, z, V, 3.0f);
+            if (cases[ci][2])
+                for (int64_t j = at % RRC_KC_LANES; j < V; j += RRC_KC_LANES) z[j] = -INFINITY;
+            z[at] = NAN;
+            const int32_t label = (int32_t)(at == 0 ? 1 : 0);
+            float *res[2][2]; /* [backend][loss, grad] */
+            const rrc_backend *bes[2] = {cpu, emu};
+            for (int b = 0; b < 2; b++) {
+                rrc_buf zb = rt_upload(bes[b], dt, z, V), lb = rt_upload_i32(bes[b], &label, 1);
+                float zero = 0.0f;
+                rrc_buf loss = rt_upload(bes[b], RRC_F32, &zero, 1);
+                RT_OK(rrc_cross_entropy_fwd_bwd(bes[b], 1, V, zb, V, lb, loss, 1.0f, rrc_buf_none(), 1));
+                res[b][0] = rt_download(loss, 1);
+                res[b][1] = rt_download(zb, V);
+                rrc_buf_free(&zb);
+                rrc_buf_free(&lb);
+                rrc_buf_free(&loss);
+            }
+            RT_EXPECT(isnan(res[0][0][0]), "case %d: the CPU reference gives NaN", ci);
+            RT_EXPECT(isnan(res[1][0][0]), "case %d (%s, vocab %lld, NaN at %lld%s): emu loss %g, cpu %g", ci,
+                      rrc_dtype_name(dt), (long long)V, (long long)at, cases[ci][2] ? ", lane-mates -inf" : "",
+                      (double)res[1][0][0], (double)res[0][0][0]);
+            RT_EXPECT(isnan(res[1][1][label]) == isnan(res[0][1][label]), "case %d: grad[label] emu %g cpu %g", ci,
+                      (double)res[1][1][label], (double)res[0][1][label]);
+            for (int b = 0; b < 2; b++) {
+                free(res[b][0]);
+                free(res[b][1]);
+            }
+            free(z);
+        }
+    }
+    /* the state algebra itself: NaN wins over -inf, empty and finite states in either order */
+    rrc_kc_lse nan_s = rrc_kc_lse_push(rrc_kc_lse_init(), NAN), fin = rrc_kc_lse_push(rrc_kc_lse_init(), 2.0f);
+    rrc_kc_lse empty = rrc_kc_lse_init(), ninf = rrc_kc_lse_push(rrc_kc_lse_init(), -INFINITY);
+    const rrc_kc_lse others[3] = {fin, empty, ninf};
+    for (int i = 0; i < 3; i++) {
+        rrc_kc_lse a = rrc_kc_lse_merge(nan_s, others[i]), b = rrc_kc_lse_merge(others[i], nan_s);
+        RT_EXPECT(isnan(a.m) && isnan(a.s) && isnan(b.m) && isnan(b.s), "merge with NaN state (%d): (%g, %g) (%g, %g)", i,
+                  (double)a.m, (double)a.s, (double)b.m, (double)b.s);
+    }
+    rrc_kc_lse after = rrc_kc_lse_push(rrc_kc_lse_push(fin, NAN), 5.0f);
+    RT_EXPECT(isnan(after.m) && isnan(after.s), "NaN stays after later pushes");
+    rrc_emu_backend_destroy(emu);
+}
+
+const rt_case rt_suite_kc_items[] = {
+    RT_CASE(emu_vs_cpu_all_ops),
+    RT_CASE(emu_deferred_errors_and_forced_paths),
+    RT_CASE(cpu_double_passes_harness_tolerances),
+    RT_CASE(emu_range_items_write_nothing),
+    RT_CASE(tree_order_fixed),
+    RT_CASE(emu_xent_nan_propagates),
+    RT_CASE(harness_fails_on_fallback_and_empty_runs),
+};
+const size_t rt_suite_kc_items_n = sizeof rt_suite_kc_items / sizeof rt_suite_kc_items[0];
