@@ -76,78 +76,69 @@ static rrc_status upload_weights(load_ctx *c, const rrc_st_set *set) {
     return st;
 }
 
-rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_model_opts *opts, rrc_model **out) {
-    RRC_REQUIRE(be && dir && out, RRC_ERR_INVALID_ARG, "null argument");
-    *out = NULL;
-    rrc_model_opts o;
-    if (opts)
-        o = *opts;
-    else
-        rrc_model_opts_default(&o);
-    RRC_REQUIRE(o.dtype == RRC_F32 || o.dtype == RRC_BF16, RRC_ERR_DTYPE, "model dtype must be f32 or bf16, got %s",
-                rrc_dtype_name(o.dtype));
-    RRC_CHECK(check_exec(o.attn_chunk, o.ce_chunk, o.recompute));
-    RRC_REQUIRE(o.max_positions >= 0 && o.max_positions <= INT32_MAX, RRC_ERR_INVALID_ARG,
-                "max_positions = %lld out of range", (long long)o.max_positions);
+static rrc_status check_opts(const rrc_model_opts *o) {
+    RRC_REQUIRE(o->dtype == RRC_F32 || o->dtype == RRC_BF16, RRC_ERR_DTYPE, "model dtype must be f32 or bf16, got %s",
+                rrc_dtype_name(o->dtype));
+    RRC_CHECK(check_exec(o->attn_chunk, o->ce_chunk, o->recompute));
+    RRC_REQUIRE(o->max_positions >= 0 && o->max_positions <= INT32_MAX, RRC_ERR_INVALID_ARG,
+                "max_positions = %lld out of range", (long long)o->max_positions);
+    return RRC_OK;
+}
 
-    rrc_model *m = (rrc_model *)calloc(1, sizeof *m);
-    if (!m) return RRC_ERROR(RRC_ERR_OOM, "rrc_model");
-    m->be = be;
-    m->opts = o;
-    m->storage = rrc_buf_none();
-    m->rope_storage = rrc_buf_none();
-    rrc_st_set *set = NULL;
+/* RoPE table rows; config.json's max_position_embeddings is bounded by no tensor: the RoPE tables
+ * (2 * n_pos * head_dim / 2 floats) are refused before any allocation when the count leaves the
+ * range that max_positions has (<= 2^31 - 1) or the byte size overflows */
+static rrc_status set_n_pos(rrc_model *m) {
+    const rrc_model_config *cfg = &m->cfg;
+    m->n_pos = m->opts.max_positions > 0 ? m->opts.max_positions : cfg->max_position_embeddings;
+    int64_t bytes = 0;
+    if (m->n_pos > INT32_MAX ||
+        __builtin_mul_overflow(m->n_pos, cfg->head_dim, &bytes) || /* 2 tables x head_dim / 2 */
+        __builtin_mul_overflow(bytes, (int64_t)sizeof(float), &bytes) ||
+        (uint64_t)bytes > (uint64_t)SIZE_MAX)
+        return RRC_ERROR(RRC_ERR_UNSUPPORTED,
+                         "RoPE tables for %lld positions (config.json max_position_embeddings) x head_dim %lld: "
+                         "at most 2^31 - 1 positions; set max_positions to bound the tables",
+                         (long long)m->n_pos, (long long)cfg->head_dim);
+    return RRC_OK;
+}
+
+/* Lay out every base tensor in one allocation (expected-tensor order, so gate_proj and up_proj of a
+ * layer are adjacent and form the fused [2I, H] matrix), allocate it, upload the checkpoint's
+ * tensors from `set` (NULL: shape only, the zero-filled allocation is kept), bind the views and set
+ * up the RoPE tables (computed and uploaded with a checkpoint; allocated only without one). */
+static rrc_status build_model(rrc_model *m, const rrc_st_set *set) {
+    const rrc_backend *be = m->be;
+    const rrc_model_config *cfg = &m->cfg;
+    const rrc_model_opts o = m->opts;
     rrc_tensor_spec *specs = NULL;
     size_t n_specs = 0;
     int64_t *offsets = NULL;
     float *cs = NULL, *sn = NULL;
     rrc_status st;
-    RRC_CHECK_GOTO(st, rrc_config_load(dir, o.config_flags, &m->cfg), fail);
-    const rrc_model_config *cfg = &m->cfg;
-    m->n_pos = o.max_positions > 0 ? o.max_positions : cfg->max_position_embeddings;
-    /* config.json's max_position_embeddings is bounded by no tensor: the RoPE tables (2 * n_pos *
-     * head_dim / 2 floats) are refused before any allocation when the count leaves the range that
-     * max_positions has (<= 2^31 - 1) or the byte size overflows */
-    {
-        int64_t bytes = 0;
-        if (m->n_pos > INT32_MAX ||
-            __builtin_mul_overflow(m->n_pos, cfg->head_dim, &bytes) || /* 2 tables x head_dim / 2 */
-            __builtin_mul_overflow(bytes, (int64_t)sizeof(float), &bytes) ||
-            (uint64_t)bytes > (uint64_t)SIZE_MAX) {
-            st = RRC_ERROR(RRC_ERR_UNSUPPORTED,
-                           "RoPE tables for %lld positions (config.json max_position_embeddings) x head_dim %lld: "
-                           "at most 2^31 - 1 positions; set max_positions to bound the tables",
-                           (long long)m->n_pos, (long long)cfg->head_dim);
-            goto fail;
-        }
-    }
-    RRC_CHECK_GOTO(st, rrc_st_open_checkpoint(dir, &set), fail);
-    RRC_CHECK_GOTO(st, rrc_config_check_tensors(cfg, set), fail);
-    RRC_CHECK_GOTO(st, rrc_config_expected_tensors(cfg, &specs, &n_specs), fail);
+    RRC_CHECK_GOTO(st, rrc_config_expected_tensors(cfg, &specs, &n_specs), done);
     offsets = (int64_t *)malloc(n_specs * sizeof(int64_t));
     if (!offsets) {
         st = RRC_ERROR(RRC_ERR_OOM, "weight offsets");
-        goto fail;
+        goto done;
     }
-    /* All weights in one allocation, in the expected-tensor order, so gate_proj and up_proj of a
-     * layer are adjacent and form the fused [2I, H] matrix. */
     int64_t total = 0;
     for (size_t i = 0; i < n_specs; i++) {
         int64_t n = specs[i].shape[0] * (specs[i].ndim == 2 ? specs[i].shape[1] : 1);
         offsets[i] = total;
         if (__builtin_add_overflow(total, n, &total)) {
             st = RRC_ERROR(RRC_ERR_SHAPE, "weight element count overflows");
-            goto fail;
+            goto done;
         }
     }
-    RRC_CHECK_GOTO(st, rrc_buf_alloc(be, o.dtype, total, &m->storage), fail);
+    RRC_CHECK_GOTO(st, rrc_buf_alloc(be, o.dtype, total, &m->storage), done);
     load_ctx c = {m, specs, n_specs, offsets};
-    RRC_CHECK_GOTO(st, upload_weights(&c, set), fail);
+    if (set) RRC_CHECK_GOTO(st, upload_weights(&c, set), done);
 
     m->layers = (rrc_layer_weights *)calloc((size_t)cfg->num_layers, sizeof(rrc_layer_weights));
     if (!m->layers) {
         st = RRC_ERROR(RRC_ERR_OOM, "layer table");
-        goto fail;
+        goto done;
     }
     m->embed = weight_view(&c, "model.embed_tokens.weight");
     m->norm = weight_view(&c, "model.norm.weight");
@@ -170,7 +161,7 @@ rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_mode
         const int64_t gi = cfg->intermediate_size * cfg->hidden_size;
         if (g.numel != gi || u.numel != gi || (char *)u.ptr != (char *)g.ptr + (size_t)gi * rrc_dtype_size(o.dtype)) {
             st = RRC_ERROR(RRC_ERR_INTERNAL, "gate_proj / up_proj of layer %lld are not adjacent", (long long)l);
-            goto fail;
+            goto done;
         }
         w->wgu = rrc_view(m->storage, (int64_t)(((char *)g.ptr - (char *)m->storage.ptr) / rrc_dtype_size(o.dtype)),
                           2 * gi);
@@ -178,31 +169,90 @@ rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_mode
     }
     /* RoPE tables */
     const int64_t half = cfg->head_dim / 2;
-    cs = (float *)malloc((size_t)(m->n_pos * half) * sizeof(float));
-    sn = (float *)malloc((size_t)(m->n_pos * half) * sizeof(float));
-    if (!cs || !sn) {
-        st = RRC_ERROR(RRC_ERR_OOM, "rope tables");
-        goto fail;
+    if (set) {
+        cs = (float *)malloc((size_t)(m->n_pos * half) * sizeof(float));
+        sn = (float *)malloc((size_t)(m->n_pos * half) * sizeof(float));
+        if (!cs || !sn) {
+            st = RRC_ERROR(RRC_ERR_OOM, "rope tables");
+            goto done;
+        }
+        RRC_CHECK_GOTO(st, rrc_rope_tables(cfg, m->n_pos, cs, sn), done);
     }
-    RRC_CHECK_GOTO(st, rrc_rope_tables(cfg, m->n_pos, cs, sn), fail);
-    RRC_CHECK_GOTO(st, rrc_buf_alloc(be, RRC_F32, 2 * m->n_pos * half, &m->rope_storage), fail);
+    RRC_CHECK_GOTO(st, rrc_buf_alloc(be, RRC_F32, 2 * m->n_pos * half, &m->rope_storage), done);
     m->cos_tab = rrc_view(m->rope_storage, 0, m->n_pos * half);
     m->sin_tab = rrc_view(m->rope_storage, m->n_pos * half, m->n_pos * half);
-    RRC_CHECK_GOTO(st, rrc_buf_upload(m->cos_tab, cs, m->n_pos * half), fail);
-    RRC_CHECK_GOTO(st, rrc_buf_upload(m->sin_tab, sn, m->n_pos * half), fail);
+    if (set) {
+        RRC_CHECK_GOTO(st, rrc_buf_upload(m->cos_tab, cs, m->n_pos * half), done);
+        RRC_CHECK_GOTO(st, rrc_buf_upload(m->sin_tab, sn, m->n_pos * half), done);
+    }
+    st = RRC_OK;
+done:
     free(cs);
     free(sn);
     free(offsets);
     free(specs);
+    return st;
+}
+
+static rrc_status model_new(const rrc_backend *be, const rrc_model_opts *opts, rrc_model **out) {
+    *out = NULL;
+    rrc_model_opts o;
+    if (opts)
+        o = *opts;
+    else
+        rrc_model_opts_default(&o);
+    RRC_CHECK(check_opts(&o));
+    rrc_model *m = (rrc_model *)calloc(1, sizeof *m);
+    if (!m) return RRC_ERROR(RRC_ERR_OOM, "rrc_model");
+    m->be = be;
+    m->opts = o;
+    m->storage = rrc_buf_none();
+    m->rope_storage = rrc_buf_none();
+    *out = m;
+    return RRC_OK;
+}
+
+rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_model_opts *opts, rrc_model **out) {
+    RRC_REQUIRE(be && dir && out, RRC_ERR_INVALID_ARG, "null argument");
+    *out = NULL;
+    rrc_model *m = NULL;
+    RRC_CHECK(model_new(be, opts, &m));
+    rrc_st_set *set = NULL;
+    rrc_status st;
+    RRC_CHECK_GOTO(st, rrc_config_load(dir, m->opts.config_flags, &m->cfg), fail);
+    RRC_CHECK_GOTO(st, set_n_pos(m), fail);
+    RRC_CHECK_GOTO(st, rrc_st_open_checkpoint(dir, &set), fail);
+    RRC_CHECK_GOTO(st, rrc_config_check_tensors(&m->cfg, set), fail);
+    RRC_CHECK_GOTO(st, build_model(m, set), fail);
     rrc_st_close(set);
     *out = m;
     return RRC_OK;
 fail:
-    free(cs);
-    free(sn);
-    free(offsets);
-    free(specs);
     rrc_st_close(set);
+    rrc_model_free(m);
+    return st;
+}
+
+rrc_status rrc_model_create_shape_only(const rrc_backend *be, const rrc_model_config *cfg, const rrc_model_opts *opts,
+                                       rrc_model **out) {
+    RRC_REQUIRE(be && cfg && out, RRC_ERR_INVALID_ARG, "null argument");
+    *out = NULL;
+    rrc_model *m = NULL;
+    RRC_CHECK(model_new(be, opts, &m));
+    m->cfg = *cfg;
+    rrc_status st = RRC_OK;
+    if (!(cfg->vocab_size > 0 && cfg->hidden_size > 0 && cfg->intermediate_size > 0 && cfg->num_layers > 0 &&
+          cfg->num_heads > 0 && cfg->num_kv_heads > 0 && cfg->num_heads % cfg->num_kv_heads == 0 &&
+          cfg->head_dim > 0 && cfg->head_dim % 2 == 0 && cfg->max_position_embeddings > 0)) {
+        st = RRC_ERROR(RRC_ERR_INVALID_ARG, "shape-only model: invalid config (sizes must be positive, heads a "
+                                            "multiple of kv heads, head_dim even)");
+        goto fail;
+    }
+    RRC_CHECK_GOTO(st, set_n_pos(m), fail);
+    RRC_CHECK_GOTO(st, build_model(m, NULL), fail);
+    *out = m;
+    return RRC_OK;
+fail:
     rrc_model_free(m);
     return st;
 }

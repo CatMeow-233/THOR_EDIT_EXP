@@ -28,16 +28,20 @@ CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP $(RRC_SAN_FLAGS)
 LDLIBS   += -fopenmp -lm -lpthread $(RRC_SAN_FLAGS)
 
 LIB_SRCS  := $(wildcard $(RRC_DIR)/src/*.c)
-BIN_NAMES := rrc_inspect rrc_fwdbwd rrc_train rrc_data
+BIN_NAMES := rrc_inspect rrc_fwdbwd rrc_train rrc_data rrc_census
 LIB_SRCS  := $(filter-out $(patsubst %,$(RRC_DIR)/src/%.c,$(BIN_NAMES)),$(LIB_SRCS))
 LIB_OBJS  := $(patsubst $(RRC_DIR)/src/%.c,$(BUILD)/obj/src/%.o,$(LIB_SRCS))
+# The CUDA line's pure host GEMM plan (cuda/gemm_plan.c, no CUDA dependency) is part of librrc.a: the
+# dry-run backend (src/dryrun_backend.c, used by rrc_census and the trainer's memory pre-flight) asks
+# it which path each GEMM would take. librrc_cuda.a gets it from librrc.a (link order cuda, then rrc).
+LIB_OBJS  += $(BUILD)/obj/cuda_host/gemm_plan.o
 LIB       := $(BUILD)/librrc.a
 
 BINS      := $(patsubst %,$(BUILD)/%,$(BIN_NAMES))
 
-# Pure-C parts of the CUDA line (GEMM plan, host emulation backend, selftest harness): gcc-built,
-# linked into the C tests, rrc_selftest_host and librrc_cuda.a. No CUDA dependency.
-CUDA_HOST_SRCS := $(RRC_DIR)/cuda/gemm_plan.c $(RRC_DIR)/cuda/kc_emu.c $(RRC_DIR)/cuda/selftest_ops.c
+# Pure-C parts of the CUDA line (host emulation backend, selftest harness): gcc-built, linked into
+# the C tests, rrc_selftest_host and librrc_cuda.a. No CUDA dependency. (The GEMM plan is in librrc.a.)
+CUDA_HOST_SRCS := $(RRC_DIR)/cuda/kc_emu.c $(RRC_DIR)/cuda/selftest_ops.c
 CUDA_HOST_OBJS := $(patsubst $(RRC_DIR)/cuda/%.c,$(BUILD)/obj/cuda_host/%.o,$(CUDA_HOST_SRCS))
 CPPFLAGS += -I$(RRC_DIR)/cuda
 CFLAGS   += $(SAN)

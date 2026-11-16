@@ -23,6 +23,7 @@ RT_SUITE(data)
 RT_SUITE(train)
 RT_SUITE(gemm_plan)
 RT_SUITE(kc_items)
+RT_SUITE(census)
 
 typedef struct {
     const char *name;
@@ -44,6 +45,7 @@ static const rt_suite k_suites[] = {
     {"train", rt_suite_train, &rt_suite_train_n},
     {"gemm_plan", rt_suite_gemm_plan, &rt_suite_gemm_plan_n},
     {"kc_items", rt_suite_kc_items, &rt_suite_kc_items_n},
+    {"census", rt_suite_census, &rt_suite_census_n},
 };
 
 static int g_case_failures = 0;

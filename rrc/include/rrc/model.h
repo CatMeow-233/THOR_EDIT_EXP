@@ -50,6 +50,13 @@ typedef struct rrc_model rrc_model;
  * converted on the host to opts->dtype (f32 -> bf16 with RNE) and uploaded to `be`. */
 rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_model_opts *opts, rrc_model **out);
 void rrc_model_free(rrc_model *m);
+/* Shape-only model for dry runs and memory planning (DESIGN.md §13): the same weight layout,
+ * views and RoPE table allocation as rrc_model_load for `cfg` (a config from rrc_config_load /
+ * rrc_config_from_json), allocated on `be` but never filled: no checkpoint is read, the weights and
+ * the RoPE tables keep the zeros of rrc_buf_alloc. Intended for the dry-run backend (rrc/dryrun.h);
+ * on a real backend it gives a model of zero weights. */
+rrc_status rrc_model_create_shape_only(const rrc_backend *be, const rrc_model_config *cfg, const rrc_model_opts *opts,
+                                       rrc_model **out);
 
 const rrc_model_config *rrc_model_get_config(const rrc_model *m);
 const rrc_backend *rrc_model_backend(const rrc_model *m);
