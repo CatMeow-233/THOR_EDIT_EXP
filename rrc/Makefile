@@ -20,12 +20,12 @@ CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP
 LDLIBS   += -fopenmp -lm -lpthread
 
 LIB_SRCS  := $(wildcard $(RRC_DIR)/src/*.c)
-LIB_SRCS  := $(filter-out $(RRC_DIR)/src/rrc_inspect.c,$(LIB_SRCS))
+BIN_NAMES := rrc_inspect rrc_fwdbwd
+LIB_SRCS  := $(filter-out $(patsubst %,$(RRC_DIR)/src/%.c,$(BIN_NAMES)),$(LIB_SRCS))
 LIB_OBJS  := $(patsubst $(RRC_DIR)/src/%.c,$(BUILD)/obj/src/%.o,$(LIB_SRCS))
 LIB       := $(BUILD)/librrc.a
 
-BIN_SRCS  := $(RRC_DIR)/src/rrc_inspect.c
-BINS      := $(BUILD)/rrc_inspect
+BINS      := $(patsubst %,$(BUILD)/%,$(BIN_NAMES))
 
 TEST_SRCS := $(wildcard $(RRC_DIR)/tests/c/*.c)
 TEST_OBJS := $(patsubst $(RRC_DIR)/tests/c/%.c,$(BUILD)/obj/tests/%.o,$(TEST_SRCS))
@@ -53,7 +53,7 @@ NVCCFLAGS += -std=c++17 -ccbin $(CC) -arch=$(CUDA_ARCH) -gencode arch=$(CUDA_COM
 CUDA_SRCS := $(wildcard $(RRC_DIR)/cuda/*.cu)
 CUDA_OBJS := $(patsubst $(RRC_DIR)/cuda/%.cu,$(BUILD)/obj/cuda/%.o,$(CUDA_SRCS))
 
-.PHONY: all cpu test cuda clean nvcc-check
+.PHONY: all cpu test cuda clean nvcc-check asan
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -71,7 +71,7 @@ $(LIB): $(LIB_OBJS)
 	rm -f $@
 	ar rcs $@ $^
 
-$(BUILD)/rrc_inspect: $(BUILD)/obj/src/rrc_inspect.o $(LIB)
+$(BINS): $(BUILD)/%: $(BUILD)/obj/src/%.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # --wrap=malloc: tests/c/test_contracts.c counts the allocation sizes of library code.
@@ -110,7 +110,17 @@ $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
+# C tests under AddressSanitizer + UndefinedBehaviorSanitizer, built in a separate directory
+# ($(BUILD)/asan); any UBSan report aborts the run. OMP_NUM_THREADS defaults to 2 here.
+ASAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+asan:
+	@$(MAKE) --no-print-directory BUILD=$(BUILD)/asan CFLAGS="$(ASAN_FLAGS)" \
+	  LDLIBS="$(ASAN_FLAGS) -fopenmp -lm -lpthread" cpu $(BUILD)/asan/rrc_tests
+	@mkdir -p $(BUILD)/asan/test_tmp
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} \
+	  RRC_TEST_TMPDIR=$(BUILD)/asan/test_tmp $(BUILD)/asan/rrc_tests
+
 clean:
 	rm -rf $(BUILD)
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(BUILD)/obj/src/rrc_inspect.d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(patsubst %,$(BUILD)/obj/src/%.d,$(BIN_NAMES))

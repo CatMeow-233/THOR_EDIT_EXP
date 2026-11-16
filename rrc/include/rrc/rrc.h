@@ -8,5 +8,7 @@
 #include "rrc/config.h"
 #include "rrc/tensor.h"
 #include "rrc/backend.h"
+#include "rrc/lora.h"
+#include "rrc/model.h"
 
 #endif
