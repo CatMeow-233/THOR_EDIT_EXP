@@ -464,7 +464,10 @@ rrc_status rrc_census_to_json(const rrc_census_result *r, const rrc_census_opts 
            s->calls[RRC_DR_SYNC] + s->calls[RRC_DR_H2D] + s->calls[RRC_DR_D2H] + s->calls[RRC_DR_FREE]);
     kv_str(w, "cuda_host_waits_note", "sync + memcpy_h2d + memcpy_d2h + free: the calls on which the CUDA backend "
                                       "waits for its stream (DESIGN.md 11.5); scratch growth adds more, but not in a "
-                                      "steady-state step");
+                                      "steady-state step. With the pinned h2d staging ring (on by default, DESIGN.md "
+                                      "15.3) memcpy_h2d waits at most for the event of an earlier copy out of the "
+                                      "same slot, not for the stream, so this is an upper bound; it is exact with "
+                                      "RRC_CUDA_H2D_STAGING_BYTES=0");
     rrc_jw_obj_end(w);
     /* ops */
     rrc_jw_key(w, "ops");

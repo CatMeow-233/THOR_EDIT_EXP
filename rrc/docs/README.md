@@ -140,6 +140,12 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   `rrc_selftest_host` and its negative checks, and with `CUDA_HOME` the HOST-ONLY `cuda-host-test`.
 * `make -C rrc tsan` — the `data` and `train` C suites (prefetch thread next to the training loop)
   under ThreadSanitizer (build/tsan; `OMP_NUM_THREADS=1` because libgomp is not instrumented).
+* CI: `.github/workflows/rrc_ci.yml` (on changes under `rrc/`). Job `cpu` (TESTED on CPU): `make
+  cpu test`, `make asan`, `make tsan`, the pytest suite with CPU torch and pinned transformers /
+  PEFT. Job `cuda-compile` (separate, so a toolkit download failure never hides the CPU results):
+  assembles the compile-only toolkit with `tools/fetch_cuda_toolkit.sh` (package downloads cached,
+  every file sha256-checked), then `make cuda-objs cuda` (COMPILED-ONLY) and `make test CUDA_HOME=...`
+  (nvcc header check + HOST-ONLY `cuda-host-test`). No CI job has a GPU.
 
 ## Tools
 

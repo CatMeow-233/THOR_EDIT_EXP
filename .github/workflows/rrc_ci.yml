@@ -1,0 +1,106 @@
+name: rrc CI
+
+# CI for rrc/ (the C11/CUDA LoRA fine-tuning engine). No job here has or needs a GPU:
+#   cpu           TESTED on CPU: C unit tests, ASan/UBSan, TSan, pytest against transformers + PEFT
+#                 with tiny models built in-process (rrc/tools/make_tiny_model.py); never downloads
+#                 a model or a dataset (HF_HUB_OFFLINE=1).
+#   cuda-compile  COMPILED-ONLY: nvcc compile + link of the CUDA backend and tools against a
+#                 compile-only toolkit, plus the HOST-ONLY tests (the real cuda/*.cu on a fake CUDA
+#                 runtime, on the CPU). Nothing in it runs on, or says anything about, a GPU.
+# The two jobs are independent, so a failed toolkit download never hides the CPU results.
+on:
+  push:
+    paths:
+      - "rrc/**"
+      - ".github/workflows/rrc_ci.yml"
+  pull_request:
+    paths:
+      - "rrc/**"
+      - ".github/workflows/rrc_ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rrc-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  TORCH_VERSION: "2.15.0"
+  HF_HUB_OFFLINE: "1"          # guarantee: no model downloads in CI
+  TOKENIZERS_PARALLELISM: "false"
+
+jobs:
+  cpu:
+    name: CPU build, C tests, sanitizers, pytest (TESTED on CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: .github/workflows/rrc_ci.yml
+      - name: Install Python test dependencies (CPU torch)
+        # exactly what rrc/tests, rrc/tools and rrc/bench import (torch, transformers, peft,
+        # safetensors, tokenizers, pytest; jinja2 for tokenizer chat templates, numpy for torch),
+        # pinned to the versions the suite was run with
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu \
+            || pip install "torch==${TORCH_VERSION}"
+          pip install transformers==5.23.0 peft==0.21.3 safetensors==0.8.0 tokenizers==0.23.3 \
+            jinja2==3.1.6 pytest==9.2.0 numpy==2.5.3
+          python -c "import torch; print('torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"
+      - name: Toolchain
+        run: gcc --version; make --version
+      - name: make cpu test (C unit tests, offdev pass, rrc_selftest_host on kc-emu)
+        run: make -C rrc cpu test
+      - name: make asan (C tests and rrc_selftest_host under ASan + UBSan)
+        run: make -C rrc asan
+      - name: make tsan (data / train suites with the prefetch thread under TSan)
+        run: make -C rrc tsan
+      - name: pytest rrc/tests (vs transformers + PEFT, tiny models, CPU)
+        run: python -m pytest rrc/tests -q --durations=15
+
+  cuda-compile:
+    # COMPILED-ONLY: no GPU and no NVIDIA driver here. Builds against a compile-only CUDA 12.9
+    # toolkit (nvcc, headers, libcudart, libcublasLt) assembled by rrc/tools/fetch_cuda_toolkit.sh
+    # from pinned PyPI wheels and conda packages, each sha256-checked. The HOST-ONLY step runs the
+    # real cuda/*.cu sources on a fake CUDA runtime on the CPU. Never run anything here that needs
+    # a GPU (rrc_selftest, rrc_train_cuda and rrc_bench are only linked, never executed).
+    name: CUDA compile (COMPILED-ONLY) + HOST-ONLY tests
+    # fixed image: nvcc 12.9 accepts host gcc up to 14 (crt/host_config.h); ubuntu-24.04 ships gcc 13,
+    # a later rolling ubuntu-latest may not
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Toolkit path
+        run: echo "CUDA_DEST=${RUNNER_TEMP}/cuda-toolkit" >> "$GITHUB_ENV"
+      - name: Cache the toolkit package downloads
+        # only the downloaded wheels / conda packages are cached; the script runs on every build
+        # and checks every file against its pinned sha256, so a cache hit is verified too
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda-toolkit/downloads
+          key: rrc-cuda-tk-dl-${{ runner.os }}-${{ hashFiles('rrc/tools/fetch_cuda_toolkit.sh') }}
+      - name: Fetch and assemble the compile-only CUDA toolkit
+        run: |
+          python -m pip install --upgrade pip
+          pip install zstandard==0.25.0
+          bash rrc/tools/fetch_cuda_toolkit.sh "$CUDA_DEST"
+          rm -rf "$CUDA_DEST/unpacked"
+          df -h "$CUDA_DEST"
+      - name: Toolchain
+        run: gcc --version; "$CUDA_DEST/tk/bin/nvcc" --version
+      - name: make cuda-objs cuda (COMPILED-ONLY, sm_120)
+        run: make -C rrc cuda-objs cuda CUDA_HOME="$CUDA_DEST/tk"
+      - name: make test with CUDA_HOME (nvcc header check + HOST-ONLY cuda-host-test on the fake runtime)
+        run: make -C rrc test CUDA_HOME="$CUDA_DEST/tk"

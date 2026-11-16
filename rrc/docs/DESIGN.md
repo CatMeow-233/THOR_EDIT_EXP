@@ -1160,7 +1160,11 @@ files (huggingface.co is not reachable here); `rrc_census --config` takes the re
    of which 157.7 GB is the f32-scratch round trip of the bf16 C of `y += s t Bᵀ` and 129.6 GB the
    widening of bf16 activations / output gradients for `t = x Aᵀ`, `dB`, `dt`); the rest is attention
    (P·V, dQ, dV, dK: 48.1 / 26.0 / 42.7 GB). "CUDA host waits" = sync + memcpy_h2d +
-   memcpy_d2h + free, the calls on which the CUDA backend waits for its stream (§11.5).
+   memcpy_d2h + free, the calls on which the CUDA backend waits for its stream (§11.5). Since the
+   integration with §15 the pinned h2d staging ring is on by default: a staged `memcpy_h2d` waits at
+   most for the event of an earlier copy out of the same slot, not for the whole stream, so the
+   column is an upper bound (exact with `RRC_CUDA_H2D_STAGING_BYTES=0`; counted from the code, the
+   full-stream waits of a steady-state step are then sync + d2h + free = 4 for each preset).
 
    Memory (GiB, computed; op-table allocations plus the CUDA backend's internal buffers):
 
