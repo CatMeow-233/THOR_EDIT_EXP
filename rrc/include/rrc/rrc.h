@@ -4,6 +4,7 @@
 
 #include "rrc/common.h"
 #include "rrc/json.h"
+#include "rrc/fileio.h"
 #include "rrc/safetensors.h"
 #include "rrc/config.h"
 #include "rrc/tensor.h"

@@ -167,6 +167,13 @@ test: cpu $(TEST_BIN) $(SELFTEST_HOST)
 	@echo "rrc_selftest_host e2e control: jitter device PASS"
 	@$(call expect_fail,$(SELFTEST_HOST) --backend fault --only e2e --e2e-filter f32,$(BUILD)/test_tmp/selftest_fault.log,a subtly wrong attention backward)
 	@echo "rrc_selftest_host e2e control: fault device FAIL ($$(grep -c '^  FAIL' $(BUILD)/test_tmp/selftest_fault.log) failing checks), as required"
+	@# bf16 at the full GPU size, where the anchored tolerance is capped (DESIGN.md §15.1): the jitter device
+	@# passes, and a 10% softmax-bwd fault fails the bf16 grad check of every family (2 training steps:
+	@# the capped logits / grad checks do not depend on the step count)
+	$(SELFTEST_HOST) --backend jitter --only e2e --e2e-size full --e2e-filter bf16 --e2e-steps 2 > $(BUILD)/test_tmp/selftest_jitter_bf16_full.log || { cat $(BUILD)/test_tmp/selftest_jitter_bf16_full.log; exit 1; }
+	@$(call expect_fail,$(SELFTEST_HOST) --backend fault --fault-amp 1e-1 --only e2e --e2e-size full --e2e-filter bf16 --e2e-steps 2,$(BUILD)/test_tmp/selftest_fault_bf16_full.log,a 10% attention-backward fault in bf16)
+	@for f in llama qwen2 qwen3; do grep -q "^  FAIL $$f/bf16/grad " $(BUILD)/test_tmp/selftest_fault_bf16_full.log || { echo "bf16 fault control: the $$f/bf16/grad check did not fail (log $(BUILD)/test_tmp/selftest_fault_bf16_full.log)"; exit 1; }; done
+	@echo "rrc_selftest_host bf16 full-size controls: jitter device PASS, 10% fault FAIL in the grad check of every family, as required"
 	@# negative checks of the program's exit status: no cuBLASLt (simulated: every triple refused) and
 	@# an --only filter matching nothing must both fail
 	@$(call expect_fail,$(SELFTEST_HOST) --quick --only gemm --reject-mask 0xFF,$(BUILD)/test_tmp/selftest_reject.log,every GEMM on the kernel fallback)
@@ -287,6 +294,9 @@ cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST) $(SHIM_BENCH)
 	@# the program's CUDA main (pass logic, options) on one cheap op; test_cuda_host ran every op already
 	$(SHIM_SELFTEST) --quick --only convert > $(BUILD)/test_tmp/selftest_shim.log || { cat $(BUILD)/test_tmp/selftest_shim.log; exit 1; }
 	@grep -E "^(capped|grid) pass" $(BUILD)/test_tmp/selftest_shim.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim.log
+	@# the small-ring pass (the multi-chunk h2d staging path a real weight load takes; 4 KiB ring)
+	$(SHIM_SELFTEST) --only h2d_ring > $(BUILD)/test_tmp/selftest_shim_ring.log || { cat $(BUILD)/test_tmp/selftest_shim_ring.log; exit 1; }
+	@grep -E "^h2d ring pass" $(BUILD)/test_tmp/selftest_shim_ring.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim_ring.log
 	@# the end-to-end checks (tiny qwen3, f32 + bf16: model, LoRA, trainer, staging ring) through the real backend
 	$(SHIM_SELFTEST) --only e2e --e2e-size tiny --e2e-filter qwen3 --report $(BUILD)/test_tmp/selftest_shim_report.json > $(BUILD)/test_tmp/selftest_shim_e2e.log || { cat $(BUILD)/test_tmp/selftest_shim_e2e.log; exit 1; }
 	@grep -E "^end-to-end summary" $(BUILD)/test_tmp/selftest_shim_e2e.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim_e2e.log

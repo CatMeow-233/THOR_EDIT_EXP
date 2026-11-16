@@ -23,7 +23,8 @@
  * CPU double-accumulation backend (`--backend cpu`), or two test devices over cpu-f32acc:
  * `jitter` (every GEMM output perturbed by up to k * 2^-24 relative: a correct device with
  * different rounding, which must PASS) and `fault` (jitter plus attn_softmax_bwd scaled by
- * 1 + 1e-3: a subtly wrong backward, which the end-to-end checks must FAIL). No GPU is used. */
+ * 1 + 1e-3, or 1 + X with --fault-amp X: a subtly wrong backward, which the end-to-end checks must
+ * FAIL). No GPU is used. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,10 +63,11 @@ static void usage(void) {
             "                    [--report FILE] [--no-e2e] [--e2e-size full|quick|tiny] [--e2e-steps N] [--e2e-dir DIR] [--e2e-keep]\n"
             "                    [--e2e-filter FAMILY/DTYPE]\n"
 #ifndef RRC_SELFTEST_HOST
-            "                    [--max-grid N] [--no-grid-pass]\n"
+            "                    [--max-grid N] [--no-grid-pass]   (--only h2d_ring: only the small staging-ring pass)\n"
 #endif
 #ifdef RRC_SELFTEST_HOST
-            "       (host build) [--backend emu|cpu|jitter|fault] [--deferred] [--reject-mask M] [--min-align A]\n"
+            "       (host build) [--backend emu|cpu|jitter|fault] [--fault-amp X] [--deferred] [--reject-mask M]\n"
+            "                    [--min-align A]\n"
 #endif
     );
 }
@@ -83,6 +85,7 @@ typedef struct cfg {
 /* ---- host test devices (jitter / fault) over cpu-f32acc -------------------------------------------------- */
 #ifdef RRC_SELFTEST_HOST
 static rrc_backend g_wrap;
+static double g_fault_amp = 1e-3; /* --fault-amp: the relative error of the fault device's softmax bwd */
 
 /* A deterministic pseudo-random u in [-1, 1) from (value bits, index, k): the same inputs give the
  * same perturbation, so the jitter device is deterministic (as a GPU must be) but rounds
@@ -123,7 +126,7 @@ static rrc_status w_softmax_bwd(const rrc_backend *be, int64_t batch, int64_t ro
     RRC_CHECK(base->attn_softmax_bwd(base, batch, rows, cols, ld, batch_stride, p, dp, scale, ds));
     for (int64_t b = 0; b < batch; b++)
         for (int64_t r = 0; r < rows; r++)
-            for (int64_t j = 0; j < cols; j++) perturb(ds.ptr, ds.dtype, b * batch_stride + r * ld + j, 1e-3, 0, 0);
+            for (int64_t j = 0; j < cols; j++) perturb(ds.ptr, ds.dtype, b * batch_stride + r * ld + j, g_fault_amp, 0, 0);
     return RRC_OK;
 }
 static const rrc_backend *make_wrap(int fault) {
@@ -159,6 +162,14 @@ typedef struct report {
     rrc_cuda_gemm_shape *census;
     size_t n_census;
     int64_t census_dropped;
+    /* the h2d staging ring of the backend that ran (rrc_cuda_stats after creation), and what was asked */
+    size_t ring_req_bytes, ring_bytes;
+    int ring_req_slots, ring_slots, have_ring;
+    /* the small-ring pass (multi-chunk staging path) */
+    int ring_pass_ran, ring_pass_fails;
+    int64_t ring_pass_uploads, ring_pass_bytes, ring_pass_chunks, ring_pass_waits, ring_pass_direct, ring_pass_wrong;
+    size_t ring_pass_ring_bytes;
+    char ring_pass_detail[256];
 #endif
     char options[512];
     pass_rec passes[3];
@@ -317,6 +328,12 @@ static void report_e2e_gemm(rrc_jw *w, const report *R) {
     rrc_jw_int(w, s->h2d_staged_chunks);
     rrc_jw_key(w, "h2d_slot_waits");
     rrc_jw_int(w, s->h2d_slot_waits);
+    rrc_jw_key(w, "h2d_direct");
+    rrc_jw_int(w, s->h2d_direct);
+    rrc_jw_key(w, "staging_bytes"); /* the ring of the backend that ran (0: disabled) */
+    rrc_jw_int(w, (int64_t)s->staging_bytes);
+    rrc_jw_key(w, "staging_slots");
+    rrc_jw_int(w, s->staging_slots);
     rrc_jw_key(w, "stream_syncs");
     rrc_jw_int(w, s->stream_syncs);
     rrc_jw_obj_end(w);
@@ -455,6 +472,48 @@ static void report_write(void) {
     }
     rrc_jw_key(&w, "options");
     rrc_jw_str(&w, R->options);
+#ifndef RRC_SELFTEST_HOST
+    rrc_jw_key(&w, "h2d_staging");
+    if (R->have_ring) {
+        rrc_jw_obj_begin(&w);
+        rrc_jw_key(&w, "requested_bytes");
+        rrc_jw_int(&w, (int64_t)R->ring_req_bytes);
+        rrc_jw_key(&w, "requested_slots");
+        rrc_jw_int(&w, R->ring_req_slots);
+        rrc_jw_key(&w, "active_bytes"); /* rrc_cuda_stats.staging_bytes: 0 = disabled (or the pinned allocation failed) */
+        rrc_jw_int(&w, (int64_t)R->ring_bytes);
+        rrc_jw_key(&w, "active_slots");
+        rrc_jw_int(&w, R->ring_slots);
+        rrc_jw_obj_end(&w);
+    } else {
+        rrc_jw_null(&w);
+    }
+    rrc_jw_key(&w, "h2d_ring_pass");
+    if (R->ring_pass_ran) {
+        rrc_jw_obj_begin(&w);
+        rrc_jw_key(&w, "result");
+        rrc_jw_str(&w, R->ring_pass_fails ? "FAIL" : "PASS");
+        rrc_jw_key(&w, "ring_bytes");
+        rrc_jw_int(&w, (int64_t)R->ring_pass_ring_bytes);
+        rrc_jw_key(&w, "uploads");
+        rrc_jw_int(&w, R->ring_pass_uploads);
+        rrc_jw_key(&w, "bytes");
+        rrc_jw_int(&w, R->ring_pass_bytes);
+        rrc_jw_key(&w, "staged_chunks");
+        rrc_jw_int(&w, R->ring_pass_chunks);
+        rrc_jw_key(&w, "slot_waits");
+        rrc_jw_int(&w, R->ring_pass_waits);
+        rrc_jw_key(&w, "direct");
+        rrc_jw_int(&w, R->ring_pass_direct);
+        rrc_jw_key(&w, "wrong_elements");
+        rrc_jw_int(&w, R->ring_pass_wrong);
+        rrc_jw_key(&w, "detail");
+        rrc_jw_str(&w, R->ring_pass_detail);
+        rrc_jw_obj_end(&w);
+    } else {
+        rrc_jw_null(&w);
+    }
+#endif
     rrc_jw_key(&w, "op_passes");
     rrc_jw_arr_begin(&w);
     for (int i = 0; i < 3; i++)
@@ -471,10 +530,26 @@ static void report_write(void) {
         rrc_jw_key(&w, "failures");
         rrc_jw_int(&w, e->failures);
         rrc_jw_key(&w, "tolerance_rule");
-        rrc_jw_str(&w, "dev_err <= max(K * ref_err, floor); dev_err = err(dev, cpu-f32acc), ref_err = err(cpu-f32acc, cpu "
-                       "double accumulation); det_*: number of differing values/bytes, must be 0");
+        rrc_jw_str(&w, "dev_err <= max(K * ref_err, floor) (bf16: max(min(K * ref_err, bf16_cap), floor)); dev_err = "
+                       "err(dev, cpu-f32acc), ref_err = err(cpu-f32acc, cpu double accumulation); det_*: number of "
+                       "differing values/bytes, must be 0");
         rrc_jw_key(&w, "K");
         rrc_jw_double(&w, RRC_E2E_K);
+        rrc_jw_key(&w, "tolerances");
+        rrc_jw_obj_begin(&w);
+        for (int q = 0; q < rrc_e2e_num_quantities(); q++) {
+            rrc_jw_key(&w, rrc_e2e_quantity_name(q));
+            rrc_jw_obj_begin(&w);
+            rrc_jw_key(&w, "floor_f32");
+            rrc_jw_double(&w, rrc_e2e_floor(q, 0));
+            rrc_jw_key(&w, "floor_bf16");
+            rrc_jw_double(&w, rrc_e2e_floor(q, 1));
+            rrc_jw_key(&w, "cap_bf16"); /* null: uncapped */
+            if (isfinite(rrc_e2e_bf16_cap(q))) rrc_jw_double(&w, rrc_e2e_bf16_cap(q));
+            else rrc_jw_null(&w);
+            rrc_jw_obj_end(&w);
+        }
+        rrc_jw_obj_end(&w);
         rrc_jw_key(&w, "items");
         rrc_jw_arr_begin(&w);
         for (int i = 0; i < e->n_items; i++) {
@@ -570,11 +645,27 @@ static rrc_status make_dev(const cfg *c, int64_t scratch_cap, unsigned max_grid,
         printf("kernel image versions unavailable: %s\n", rrc_last_error());
         rrc_clear_error();
     }
+    /* the ring the backend actually set up (rounded to 256-byte slots; 0 if disabled or the pinned
+     * allocation failed), not the requested size */
+    rrc_cuda_stats rs;
+    memset(&rs, 0, sizeof rs);
+    if (rrc_cuda_stats_get(*dev, &rs) != RRC_OK) rrc_clear_error();
+    g_rep.ring_req_bytes = co.h2d_staging_bytes;
+    g_rep.ring_req_slots = co.h2d_staging_slots;
+    g_rep.ring_bytes = rs.staging_bytes;
+    g_rep.ring_slots = rs.staging_slots;
+    g_rep.have_ring = 1;
+    char ring[160];
+    if (rs.staging_bytes)
+        snprintf(ring, sizeof ring, "%zu bytes in %d slots (requested %zu in %d)", rs.staging_bytes, rs.staging_slots,
+                 co.h2d_staging_bytes, co.h2d_staging_slots);
+    else
+        snprintf(ring, sizeof ring, "disabled (requested %zu bytes in %d slots)", co.h2d_staging_bytes,
+                 co.h2d_staging_slots);
     printf("options: tf32 %s, sync_each_op %s, gemm ladder starts at level %d, gemm scratch cap %lld floats, max grid %u "
-           "blocks%s, h2d staging %zu bytes in %d slots\n",
+           "blocks%s, h2d staging ring %s\n",
            co.allow_tf32 ? "on" : "off", co.sync_each_op ? "on" : "off", co.gemm_min_level,
-           (long long)co.gemm_scratch_cap_elems, co.max_grid_blocks, co.max_grid_blocks ? "" : " (default)",
-           co.h2d_staging_bytes, co.h2d_staging_slots);
+           (long long)co.gemm_scratch_cap_elems, co.max_grid_blocks, co.max_grid_blocks ? "" : " (default)", ring);
     return RRC_OK;
 #endif
 }
@@ -595,6 +686,126 @@ static void destroy_dev(const rrc_backend *dev) {
  * row-stride loop runs several iterations per block even at the selftest's small sizes (with the
  * default cap of 2^20 blocks that needs more than 2^28 elements or 2^20 rows). */
 #define GRID_PASS_BLOCKS 3u
+
+#ifndef RRC_SELFTEST_HOST
+/* Small-ring pass: the multi-chunk path of the pinned h2d staging ring (DESIGN.md §15.3) on the
+ * device. With the default 32 MiB ring every upload of the op and end-to-end checks fits in one
+ * slot, so the chunked loop of memcpy_h2d (one copy split over several slots, waiting on its own
+ * earlier slots), which a real weight load runs for every large tensor, would otherwise first run
+ * there. A RING_PASS_BYTES ring in RING_PASS_SLOTS slots: uploads of odd sizes and one of
+ * RING_PASS_BIG floats (the ring wraps many times inside that one copy) from ONE host array that
+ * is overwritten right after each upload returns (the source may be reused on return), then every
+ * buffer is downloaded and compared bit for bit, and the backend's counters must show the staged
+ * path (chunk count computed from the sizes, no direct copies). */
+#define RING_PASS_BYTES 4096
+#define RING_PASS_SLOTS 4
+#define RING_PASS_BIG ((int64_t)262147) /* floats: about 1 MiB, 1025 chunks of 1 KiB (the ring wraps 256 times) */
+static int ring_pass(const cfg *c) {
+    static const int64_t sizes[] = {37, 1000, 5, 256, 256, 257, 3, 700, 1, RING_PASS_BIG, 1029};
+    enum { NB = (int)(sizeof sizes / sizeof sizes[0]) };
+    report *R = &g_rep;
+    R->ring_pass_ran = 1;
+    R->ring_pass_fails = 1;
+    rrc_cuda_options co;
+    rrc_cuda_options_default(&co);
+    co.h2d_staging_bytes = RING_PASS_BYTES;
+    co.h2d_staging_slots = RING_PASS_SLOTS;
+    co.sync_each_op = 0; /* the ring path (sync_each_op uploads directly) */
+    co.allow_tf32 = c->tf32;
+    const rrc_backend *be = NULL;
+    rrc_buf bufs[NB];
+    int nalloc = 0;
+    float *src = NULL, *got = NULL;
+    rrc_cuda_stats st;
+    memset(&st, 0, sizeof st);
+    rrc_status s = rrc_cuda_backend_create_ex(c->device, &co, &be);
+    if (s != RRC_OK) {
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "backend creation failed: %s", rrc_last_error());
+        goto out;
+    }
+    if (rrc_cuda_stats_get(be, &st) != RRC_OK || st.staging_bytes != RING_PASS_BYTES || st.staging_slots != RING_PASS_SLOTS) {
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail,
+                 "the %d-byte ring is not active (staging_bytes %zu, slots %d; pinned allocation failed?)",
+                 RING_PASS_BYTES, st.staging_bytes, st.staging_slots);
+        goto out;
+    }
+    R->ring_pass_ring_bytes = st.staging_bytes;
+    if (rrc_cuda_stats_reset(be) != RRC_OK) {
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "stats reset: %s", rrc_last_error());
+        goto out;
+    }
+    src = (float *)malloc((size_t)RING_PASS_BIG * sizeof(float));
+    got = (float *)malloc((size_t)RING_PASS_BIG * sizeof(float));
+    if (!src || !got) {
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "out of host memory");
+        goto out;
+    }
+    const int64_t slot = RING_PASS_BYTES / RING_PASS_SLOTS;
+    int64_t want_chunks = 0, bytes = 0;
+    for (int i = 0; i < NB; i++) {
+        want_chunks += (sizes[i] * 4 + slot - 1) / slot;
+        bytes += sizes[i] * 4;
+    }
+    for (int i = 0; i < NB; i++) {
+        if (rrc_buf_alloc(be, RRC_F32, sizes[i], &bufs[i]) != RRC_OK) {
+            snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "alloc: %s", rrc_last_error());
+            goto out;
+        }
+        nalloc++;
+    }
+    for (int i = 0; i < NB; i++) {
+        for (int64_t j = 0; j < sizes[i]; j++) src[j] = (float)(1000003 * i + j);
+        if (rrc_buf_upload(bufs[i], src, sizes[i]) != RRC_OK) {
+            snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "upload %d: %s", i, rrc_last_error());
+            goto out;
+        }
+        for (int64_t j = 0; j < RING_PASS_BIG; j++) src[j] = -7.0f; /* reuse the source at once */
+    }
+    int64_t wrong = 0;
+    for (int i = 0; i < NB; i++) {
+        if (rrc_buf_download(bufs[i], got, sizes[i]) != RRC_OK) {
+            snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "download %d: %s", i, rrc_last_error());
+            goto out;
+        }
+        for (int64_t j = 0; j < sizes[i]; j++) wrong += got[j] != (float)(1000003 * i + j);
+    }
+    if (rrc_cuda_stats_get(be, &st) != RRC_OK) {
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "stats: %s", rrc_last_error());
+        goto out;
+    }
+    R->ring_pass_uploads = st.h2d_calls;
+    R->ring_pass_bytes = st.h2d_bytes;
+    R->ring_pass_chunks = st.h2d_staged_chunks;
+    R->ring_pass_waits = st.h2d_slot_waits;
+    R->ring_pass_direct = st.h2d_direct;
+    R->ring_pass_wrong = wrong;
+    if (wrong)
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail, "%lld wrong elements after the staged uploads",
+                 (long long)wrong);
+    else if (st.h2d_calls != NB || st.h2d_staged_chunks != want_chunks || st.h2d_direct != 0 ||
+             st.h2d_slot_waits < want_chunks - RING_PASS_SLOTS)
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail,
+                 "counters: %lld uploads (want %d), %lld chunks (want %lld), %lld direct (want 0), %lld slot waits "
+                 "(want >= %lld)",
+                 (long long)st.h2d_calls, (int)NB, (long long)st.h2d_staged_chunks, (long long)want_chunks,
+                 (long long)st.h2d_direct, (long long)st.h2d_slot_waits, (long long)(want_chunks - RING_PASS_SLOTS));
+    else {
+        R->ring_pass_fails = 0;
+        snprintf(R->ring_pass_detail, sizeof R->ring_pass_detail,
+                 "%d uploads, %lld bytes in %lld chunks of %lld bytes, %lld slot waits, data bit-exact", (int)NB,
+                 (long long)bytes, (long long)want_chunks, (long long)slot, (long long)st.h2d_slot_waits);
+    }
+out:
+    for (int i = 0; i < nalloc; i++) rrc_buf_free(&bufs[i]);
+    free(src);
+    free(got);
+    if (be) rrc_cuda_backend_destroy(be);
+    rrc_clear_error();
+    printf("h2d ring pass (%d-byte ring, %d slots): %s  %s\n", RING_PASS_BYTES, RING_PASS_SLOTS,
+           R->ring_pass_fails ? "FAIL" : "PASS", R->ring_pass_detail);
+    return R->ring_pass_fails;
+}
+#endif
 
 /* rewrite the report after every end-to-end case (the longest stage) */
 static void e2e_case_done(void *user) {
@@ -686,6 +897,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--deferred")) c.eo.deferred_errors = 1;
         else if (!strcmp(a, "--reject-mask") && v) c.eo.lt_reject_mask = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--min-align") && v) c.eo.lt_min_align = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--fault-amp") && v) {
+            char *end = NULL;
+            g_fault_amp = strtod(argv[++i], &end);
+            if (!end || *end || !(g_fault_amp > 0 && g_fault_amp < 1)) {
+                usage();
+                return 2;
+            }
+        }
 #endif
         else {
             usage();
@@ -698,7 +917,14 @@ int main(int argc, char **argv) {
     }
     /* --only e2e: only the end-to-end checks; any other filter: only matching op checks */
     const int only_e2e = only && !strcmp(only, "e2e");
-    const int run_ops = !only_e2e;
+#ifndef RRC_SELFTEST_HOST
+    /* --only h2d_ring: only the small-ring staging pass (CUDA builds) */
+    const int only_ring = only && !strcmp(only, "h2d_ring");
+    const int run_ring = !only_e2e && (!only || only_ring);
+#else
+    const int only_ring = 0;
+#endif
+    const int run_ops = !only_e2e && !only_ring;
     if (only && !only_e2e) e2e = 0;
 #ifdef RRC_SELFTEST_HOST
     if (strcmp(c.backend, "cpu") && strcmp(c.backend, "emu") && strcmp(c.backend, "jitter") && strcmp(c.backend, "fault")) {
@@ -793,6 +1019,12 @@ int main(int argc, char **argv) {
         destroy_dev(dev);
         report_write();
     }
+#ifndef RRC_SELFTEST_HOST
+    if (run_ring) {
+        fails += ring_pass(&c);
+        report_write();
+    }
+#endif
     /* end-to-end: tiny models, trainer, determinism (default device options) */
     if (e2e) {
         s = make_dev(&c, c.scratch_cap, c.max_grid, 0, &dev, &tf32);
@@ -847,7 +1079,7 @@ int main(int argc, char **argv) {
         destroy_dev(dev);
         report_write();
     }
-    if (!run_ops && !e2e) {
+    if (!run_ops && !e2e && !only_ring) {
         printf("FAIL: no check ran\n");
         fails++;
     }

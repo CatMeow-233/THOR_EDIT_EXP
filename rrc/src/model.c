@@ -124,9 +124,10 @@ static rrc_status build_model(rrc_model *m, const rrc_st_set *set) {
     }
     int64_t total = 0;
     for (size_t i = 0; i < n_specs; i++) {
-        int64_t n = specs[i].shape[0] * (specs[i].ndim == 2 ? specs[i].shape[1] : 1);
+        int64_t n = 0;
         offsets[i] = total;
-        if (__builtin_add_overflow(total, n, &total)) {
+        if (__builtin_mul_overflow(specs[i].shape[0], specs[i].ndim == 2 ? specs[i].shape[1] : 1, &n) ||
+            __builtin_add_overflow(total, n, &total)) {
             st = RRC_ERROR(RRC_ERR_SHAPE, "weight element count overflows");
             goto done;
         }
@@ -158,7 +159,11 @@ static rrc_status build_model(rrc_model *m, const rrc_st_set *set) {
         w->qn = layer_view(&c, l, "self_attn.q_norm.weight");
         w->kn = layer_view(&c, l, "self_attn.k_norm.weight");
         rrc_buf g = layer_view(&c, l, "mlp.gate_proj.weight"), u = layer_view(&c, l, "mlp.up_proj.weight");
-        const int64_t gi = cfg->intermediate_size * cfg->hidden_size;
+        int64_t gi = 0;
+        if (__builtin_mul_overflow(cfg->intermediate_size, cfg->hidden_size, &gi)) {
+            st = RRC_ERROR(RRC_ERR_SHAPE, "intermediate_size x hidden_size overflows");
+            goto done;
+        }
         if (g.numel != gi || u.numel != gi || (char *)u.ptr != (char *)g.ptr + (size_t)gi * rrc_dtype_size(o.dtype)) {
             st = RRC_ERROR(RRC_ERR_INTERNAL, "gate_proj / up_proj of layer %lld are not adjacent", (long long)l);
             goto done;

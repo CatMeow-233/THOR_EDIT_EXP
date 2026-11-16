@@ -1,7 +1,7 @@
 """Tokenize SFT data offline into rrc's .rrcbin format (rrc/include/rrc/data.h, rrc/docs/README.md).
 
     python rrc/tools/prepare_sft.py --tokenizer /path/to/local/tokenizer --input data.jsonl \
-        --output data.rrcbin [--chat-template template.jinja] [--no-eos]
+        --output data.rrcbin [--chat-template template.jinja] [--no-eos] [--skip-refused]
 
 The tokenizer is loaded from a LOCAL directory only (``local_files_only=True``; nothing is downloaded).
 Each JSONL line is one example, either
@@ -15,7 +15,14 @@ Each JSONL line is one example, either
 Assistant spans of a conversation are found on the rendered text: for assistant message i, the span
 is ``[len(render(messages[:i], add_generation_prompt=True)), len(render(messages[:i+1])))``; the
 template must be prefix-stable (each rendering a prefix of the next and of the full conversation),
-otherwise the example is refused. The full text is tokenized once (``add_special_tokens=False``,
+otherwise the example is refused. Qwen3's stock chat template is NOT prefix-stable for multi-turn
+conversations: it renders an empty ``<think>\n\n</think>\n\n`` block only into assistant turns after
+the last user message, so ``render(messages[:2])`` is not a prefix of a 4-message conversation's
+rendering. Use a prefix-preserving training template for such data, e.g. TRL's
+``trl/chat_templates/qwen3_training.jinja`` via ``--chat-template`` (single-turn conversations work
+with the stock template). A refused example aborts the conversion (exit status 2, no output file)
+unless ``--skip-refused`` is given, which skips and counts it (``skipped_refused`` in the summary).
+The full text is tokenized once (``add_special_tokens=False``,
 since the template already contains them) with offsets, and a token is a target iff its first
 character lies in an assistant span (so the end-of-turn marker the template emits inside the span is
 a target too).
@@ -89,6 +96,14 @@ def read_rrcbin(path: str) -> tuple[int, list[tuple[list[int], list[int]]]]:
     return vocab, docs
 
 
+class NotPrefixStable(ValueError):
+    """The chat template does not render each conversation prefix as a prefix of the next."""
+
+
+class RefusedExample(ValueError):
+    """An example that cannot be converted (its message names the example and the reason)."""
+
+
 def _render(tok: Any, messages: list[dict[str, Any]], template: str | None, gen_prompt: bool) -> str:
     if not messages:
         return ""
@@ -113,9 +128,12 @@ def tokenize_messages(
         prefix = _render(tok, messages[:i], template, True)
         upto = _render(tok, messages[: i + 1], template, False)
         if not upto.startswith(prefix) or not full.startswith(upto):
-            raise ValueError(
-                "the chat template is not prefix-stable for this conversation (rendering of the first i "
-                "messages is not a prefix of the next rendering); cannot locate the assistant tokens"
+            raise NotPrefixStable(
+                f"the chat template is not prefix-stable for this conversation (the rendering of the first {i} "
+                "messages is not a prefix of the next rendering); cannot locate the assistant tokens. Qwen3's "
+                "stock template does this for multi-turn conversations (an empty <think> block only after the "
+                "last user message): pass a prefix-preserving training template with --chat-template (e.g. "
+                "TRL's trl/chat_templates/qwen3_training.jinja), or --skip-refused to skip such examples"
             )
         spans.append((len(prefix), len(upto)))
     enc = tok(full, add_special_tokens=False, return_offsets_mapping=True)
@@ -160,19 +178,33 @@ def convert(
     template: str | None = None,
     add_eos: bool = True,
     vocab_size: int | None = None,
+    skip_refused: bool = False,
 ) -> dict[str, int]:
     vocab = int(vocab_size if vocab_size is not None else len(tok))
     docs = []
     skipped = 0
+    refused = 0
+    first_refusal = None
     for i, ex in enumerate(examples):
         try:
             ids, mask = tokenize_example(tok, ex, template, add_eos)
+        except NotPrefixStable as e:
+            if not skip_refused:
+                raise RefusedExample(f"example {i}: {e}") from e
+            refused += 1
+            first_refusal = first_refusal or f"example {i}: {e}"
+            continue
         except Exception as e:
-            raise ValueError(f"example {i}: {e}") from e
+            raise RefusedExample(f"example {i}: {e}") from e
         if not ids:
             skipped += 1
             continue
         docs.append((ids, mask))
+    if refused:
+        print(f"prepare_sft: warning: skipped {refused} example(s) the chat template cannot mask; first: "
+              f"{first_refusal}", file=sys.stderr)
+    if not docs:
+        raise RefusedExample("no documents to write" + (f" ({refused} refused)" if refused else ""))
     write_rrcbin(output, docs, vocab)
     return {
         "num_docs": len(docs),
@@ -180,6 +212,7 @@ def convert(
         "total_tokens": sum(len(t) for t, _ in docs),
         "label_tokens": sum(sum(m) for _, m in docs),
         "skipped_empty": skipped,
+        "skipped_refused": refused,
     }
 
 
@@ -202,6 +235,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chat-template", help="file with a Jinja chat template overriding the tokenizer's")
     ap.add_argument("--no-eos", action="store_true", help="do not append EOS to prompt/completion examples")
     ap.add_argument("--vocab-size", type=int, help="header vocab_size (default len(tokenizer))")
+    ap.add_argument(
+        "--skip-refused",
+        action="store_true",
+        help="skip (and count) conversations the chat template cannot mask (not prefix-stable) instead of aborting",
+    )
     args = ap.parse_args(argv)
     from transformers import AutoTokenizer
 
@@ -212,7 +250,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.chat_template:
         with open(args.chat_template, encoding="utf-8") as f:
             template = f.read()
-    stats = convert(tok, read_jsonl(args.input), args.output, template, not args.no_eos, args.vocab_size)
+    try:
+        stats = convert(
+            tok, read_jsonl(args.input), args.output, template, not args.no_eos, args.vocab_size, args.skip_refused
+        )
+    except (ValueError, OSError) as e:  # a clean message, no traceback; nothing is written
+        print(f"prepare_sft: error: {e}", file=sys.stderr)
+        return 2
     json.dump(stats, sys.stdout)
     sys.stdout.write("\n")
     return 0

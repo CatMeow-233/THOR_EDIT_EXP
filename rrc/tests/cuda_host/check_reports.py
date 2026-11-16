@@ -25,7 +25,10 @@ def need(d: dict, keys: list[str], where: str) -> None:
 
 def main() -> None:
     rep = json.load(open(sys.argv[1]))
-    need(rep, ["schema", "tool", "complete", "result", "build", "device", "op_passes", "e2e"], "selftest report")
+    need(rep, ["schema", "tool", "complete", "result", "build", "device", "op_passes", "e2e", "h2d_staging"],
+         "selftest report")
+    ring = rep["h2d_staging"]
+    need(ring, ["requested_bytes", "requested_slots", "active_bytes", "active_slots"], "h2d_staging")
     if rep["tool"] != "rrc_selftest" or not rep["complete"] or rep["result"] != "PASS":
         fail(f"selftest report: tool {rep['tool']}, complete {rep['complete']}, result {rep['result']}")
     b = rep["build"]
@@ -43,7 +46,10 @@ def main() -> None:
     need(e, ["result", "items", "model_gemm_tally", "model_gemm_census", "model_gemm_census_dropped_calls"], "e2e")
     t = e["model_gemm_tally"]
     need(t, ["per_dtype_combination", "calls_total", "kernel_fallback_calls", "kernel_fallback_flop_share",
-             "h2d_calls", "h2d_staged_chunks", "stream_syncs"], "model_gemm_tally")
+             "h2d_calls", "h2d_staged_chunks", "h2d_direct", "staging_bytes", "staging_slots", "stream_syncs"],
+         "model_gemm_tally")
+    if t["staging_bytes"] != ring["active_bytes"]:
+        fail(f"model_gemm_tally.staging_bytes {t['staging_bytes']} != h2d_staging.active_bytes {ring['active_bytes']}")
     if t["calls_total"] <= 0 or t["h2d_staged_chunks"] <= 0:
         fail(f"model_gemm_tally: {t['calls_total']} GEMM calls, {t['h2d_staged_chunks']} staged chunks")
     calls = sum(sum(v["calls_per_level"]) for v in t["per_dtype_combination"].values())

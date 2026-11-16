@@ -17,6 +17,8 @@
  * Tolerances are anchored to the reference's own arithmetic error: with err(x, y) a normalized
  * maximum difference (below), a check passes when
  *       err(dev, cpu_f32acc) <= max(K * err(cpu_f32acc, cpu), floor[quantity][dtype])
+ * (for bf16 the anchored term is capped: max(floor, min(K * err(cpu_f32acc, cpu), cap[quantity])),
+ * see selftest_e2e.c and DESIGN.md §15.1)
  * where cpu is the double-accumulation backend, K = RRC_E2E_K: a device whose fp32 arithmetic is as
  * accurate as the CPU's fp32 reference lands within about 2x that anchor. Normalizations:
  * logits / grads / grad norms / losses per step: max |d| / max |ref| over the quantity (grads
@@ -38,6 +40,13 @@ extern "C" {
 #endif
 
 #define RRC_E2E_K 10.0
+
+/* The tolerance table (for reports): quantity names (logits, loss, grad, train_loss,
+ * train_grad_norm, train_params), their floors (bf16 != 0: the bf16 floor) and bf16 caps. */
+int rrc_e2e_num_quantities(void);
+const char *rrc_e2e_quantity_name(int q);
+double rrc_e2e_floor(int q, int bf16);
+double rrc_e2e_bf16_cap(int q);
 
 typedef enum rrc_e2e_size {
     RRC_E2E_SIZE_FULL = 0,  /* the GPU run: hidden ~128, seq 64, 2 rows */

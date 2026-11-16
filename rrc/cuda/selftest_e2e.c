@@ -18,7 +18,20 @@
  * k * 2^-24 relative, the fp32 bound of a different summation order) at the full GPU sizes, and the
  * `fault` device (attn_softmax_bwd off by 1e-3 relative) exceeds the grad floor about 5x. bf16: a few
  * bf16 ulps (2^-8 = 3.9e-3), since one flipped bf16 rounding of an activation already moves the
- * outputs by about that much; the anchor usually dominates there. */
+ * outputs by about that much. At the quick and tiny sizes the bf16 anchor is small and the floor
+ * decides (K * anchor / tol <= 0.1 for bf16 logits, loss and grad); at the full GPU size the bf16
+ * anchor is about 0.02 for the grads and 0.04 for the final parameters, so K * anchor alone would
+ * allow 0.2 / 0.45: a bf16-only fault of 10% in the attention backward passed for two families.
+ * The bf16 logits and grad tolerances are therefore capped (k_cap_bf16, below the uncapped values):
+ *       tol = max(floor, min(K * anchor, cap))   (bf16; f32 and TF32 are uncapped)
+ * Calibrated HOST-ONLY at the full size (rrc_selftest_host, DESIGN.md §15.1): each cap is about 3x
+ * the jitter device's largest bf16 error there (grad 0.026, logits 0.0093: 4.8x) and about 4x the
+ * anchor (grad 0.020, logits 0.0093); the `fault` device with --fault-amp 0.1 (a 10% softmax-backward error) fails
+ * the bf16 grad check of every family (grad errors 0.126-0.147 against tolerances 0.06-0.08; `make
+ * test` runs this control). A 5% fault is not reliably caught in bf16 (qwen2 0.074 passes, llama
+ * 0.081 fails by 1%, qwen3 0.065 fails on the floor): bf16 errors that small are left to the f32
+ * end-to-end checks and the per-op bf16 checks. The GPU's own bf16 error is NOT_TESTED: a cap too
+ * tight for it would show as a bf16 FAIL near the cap on the first GPU run. */
 enum { Q_LOGITS = 0, Q_LOSS, Q_GRAD, Q_TLOSS, Q_TGNORM, Q_TPARAM, Q_N };
 static const double k_floor[Q_N][2] = {
     /* f32     bf16 */
@@ -29,7 +42,32 @@ static const double k_floor[Q_N][2] = {
     {1e-4, 6e-2}, /* grad norm per step */
     {8e-4, 1e-1}, /* final parameters: max |d| / (lr * steps) */
 };
+/* INFINITY: uncapped. The training quantities stay uncapped: their anchors grow legitimately when
+ * --e2e-steps is small (the final parameters in units of lr * steps: anchor 0.16-0.52 at 2 steps,
+ * the jitter device 0.26-0.75), and the grad check is the one that sees a backward fault. */
+static const double k_cap_bf16[Q_N] = {
+    4.5e-2,   /* logits */
+    INFINITY, /* loss (K * anchor stays below the floor at every size) */
+    8e-2,     /* LoRA grads */
+    INFINITY, /* training loss */
+    INFINITY, /* grad norm */
+    INFINITY, /* final parameters */
+};
 static const char *k_qname[Q_N] = {"logits", "loss", "grad", "train_loss", "train_grad_norm", "train_params"};
+
+int rrc_e2e_num_quantities(void) { return Q_N; }
+const char *rrc_e2e_quantity_name(int q) { return q >= 0 && q < Q_N ? k_qname[q] : NULL; }
+double rrc_e2e_floor(int q, int bf16) { return q >= 0 && q < Q_N ? k_floor[q][bf16 ? 1 : 0] : NAN; }
+double rrc_e2e_bf16_cap(int q) { return q >= 0 && q < Q_N ? k_cap_bf16[q] : NAN; }
+
+/* the tolerance of quantity q (the rule above); tf32: dev f32 GEMMs may use TF32 */
+static double e2e_tol(int q, int bf, int tf32, double ref_err) {
+    double fl = k_floor[q][bf];
+    if (!bf && tf32) fl = k_floor[q][1] / 8.0; /* TF32: 10-bit mantissa products */
+    double anchored = RRC_E2E_K * ref_err;
+    if (bf && anchored > k_cap_bf16[q]) anchored = k_cap_bf16[q];
+    return fmax(anchored, fl);
+}
 
 /* ---- model shapes ------------------------------------------------------------------------------------ */
 
@@ -402,11 +440,9 @@ static void cmp_item(ctx *c, const char *fd, int q, int bf, double dev_err, doub
         c->res->failures++; /* never drop a check silently */
         return;
     }
-    double fl = k_floor[q][bf];
-    if (!bf && c->o->tf32) fl = k_floor[q][1] / 8.0; /* TF32: 10-bit mantissa products */
     it->dev_err = dev_err;
     it->ref_err = ref_err;
-    it->tol = fmax(RRC_E2E_K * ref_err, fl);
+    it->tol = e2e_tol(q, bf, c->o->tf32, ref_err);
     it->pass = isfinite(dev_err) && dev_err <= it->tol;
     if (detail) snprintf(it->detail, sizeof it->detail, "%s", detail);
     item_done(c, it);
@@ -723,11 +759,9 @@ static void run_case(ctx *c, const char *work, int fam, rrc_dtype dt) {
                     const double e = grad_err(layout, fd2.grads_nr, fr.grads, w2, sizeof w2);
                     rrc_e2e_item *ri = item_new(c, fd, "grad_recompute_none");
                     if (ri) {
-                        double fl = k_floor[Q_GRAD][bf];
-                        if (!bf && o->tf32) fl = k_floor[Q_GRAD][1] / 8.0;
                         ri->dev_err = e;
                         ri->ref_err = ga;
-                        ri->tol = fmax(RRC_E2E_K * ga, fl);
+                        ri->tol = e2e_tol(Q_GRAD, bf, o->tf32, ga);
                         ri->pass = isfinite(e) && e <= ri->tol;
                         snprintf(ri->detail, sizeof ri->detail, "%s", w2);
                         item_done(c, ri);
@@ -860,7 +894,7 @@ int rrc_e2e_run(const rrc_backend *dev, const rrc_e2e_opts *o, rrc_e2e_result *r
     if (!base || !base[0]) base = "/tmp";
     snprintf(res->workdir, sizeof res->workdir, "%s/rrc_e2e_XXXXXX", base);
     fprintf(c.out, "end-to-end checks: dev '%s' vs ref 'cpu-f32acc' (tiny models written in C; tolerance = max(%g x "
-                   "err(cpu-f32acc, cpu), floor))\n",
+                   "err(cpu-f32acc, cpu), floor), the anchored part capped for bf16)\n",
             dev->name, RRC_E2E_K);
     if (!mkdtemp(res->workdir)) {
         fprintf(c.out, "FAIL: cannot create a work directory under %s: %s\n", base, strerror(errno));

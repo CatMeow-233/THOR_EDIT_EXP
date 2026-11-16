@@ -253,6 +253,8 @@ ACCEPTED: dict[str, dict[str, Any]] = {
     "qwen2_sliding_but_no_sliding_layers": dict(model_type="qwen2", use_sliding_window=True, sliding_window=16,
                                                 max_window_layers=2),
     "qwen2_attention_bias_key_ignored": dict(model_type="qwen2", attention_bias=False),
+    # carried by some qwen2-architecture checkpoints; transformers' qwen2 model does not read it
+    "qwen2_use_mrope_false": dict(model_type="qwen2", use_mrope=False),
     "qwen3_head_dim_default_128": dict(model_type="qwen3"),
     "qwen3_attention_bias": dict(model_type="qwen3", head_dim=16, attention_bias=True),
     "qwen3_llama3_rope": dict(model_type="qwen3", head_dim=16,
@@ -279,6 +281,8 @@ REFUSED: dict[str, tuple[dict[str, Any], str]] = {
     "llama_gelu": (dict(model_type="llama", hidden_act="gelu"), "hidden_act"),
     "qwen2_attention_dropout": (dict(model_type="qwen2", attention_dropout=0.1), "attention_dropout"),
     "llama_unknown_key": (dict(model_type="llama", my_new_feature=1), "my_new_feature"),
+    "qwen2_use_mrope_true": (dict(model_type="qwen2", use_mrope=True), "use_mrope"),
+    "llama_too_many_layers": (dict(model_type="llama", num_hidden_layers=1025), "num_hidden_layers"),
 }
 
 
@@ -362,3 +366,14 @@ def test_rope_long_positions_bound(name: str, tmp_path: pathlib.Path, rrc_inspec
         for k, p in enumerate(positions):
             diff = (got[k] - ref[0, k, :half].double()).abs().max().item()
             assert diff <= bounds[p], f"{name_t} at position {p}: max diff {diff:.3g} > {bounds[p]}"
+
+
+# rrc_inspect --positions: a position whose RoPE table would not fit (review finding: (maxp + 1) * half
+# wrapped, a too-small buffer was allocated and written, SEGV) is an argument error, not a crash.
+@pytest.mark.parametrize("pos", ["2305843009213693951", "9223372036854775807", "2147483647", "99999999999999999999"])
+def test_inspect_refuses_out_of_range_positions(pos: str, tmp_path: pathlib.Path, rrc_inspect: pathlib.Path) -> None:
+    d = write_config(tmp_path / "pos", dict(model_type="llama"))
+    proc = subprocess.run([str(rrc_inspect), "--config-only", "--positions", pos, str(d)],
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert "usage" in proc.stderr

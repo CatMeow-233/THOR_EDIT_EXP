@@ -53,8 +53,10 @@ static const char *const k_common_keys[] = {
 };
 static const char *const k_llama_keys[] = {"attention_bias", "mlp_bias", "pretraining_tp"};
 /* qwen2: attention_bias / mlp_bias are not read by the qwen2 model (biases are fixed). */
+/* qwen2: use_mrope (carried by some qwen2-architecture checkpoints derived from multimodal ones) is
+ * not read by transformers' qwen2 model; false / null is accepted, true is refused. */
 static const char *const k_qwen2_keys[] = {"use_sliding_window", "sliding_window", "max_window_layers", "layer_types",
-                                           "attention_bias", "mlp_bias"};
+                                           "attention_bias", "mlp_bias", "use_mrope"};
 static const char *const k_qwen3_keys[] = {"use_sliding_window", "sliding_window", "max_window_layers", "layer_types",
                                            "attention_bias", "mlp_bias"};
 
@@ -109,6 +111,13 @@ static rrc_status get_bool_field(const rrc_json *root, const char *key, int def,
 
 static rrc_status require_positive(const char *key, int64_t v) {
     RRC_REQUIRE(v > 0, RRC_ERR_UNSUPPORTED, "config.json: \"%s\" = %lld must be > 0", key, (long long)v);
+    return RRC_OK;
+}
+
+/* upper bounds: config.json is untrusted input, and its sizes feed size_t / int64 products */
+static rrc_status require_at_most(const char *key, int64_t v, int64_t hi) {
+    RRC_REQUIRE(v <= hi, RRC_ERR_UNSUPPORTED, "config.json: \"%s\" = %lld is larger than the supported maximum %lld",
+                key, (long long)v, (long long)hi);
     return RRC_OK;
 }
 
@@ -205,6 +214,54 @@ static rrc_status parse_rope(const rrc_json *root, rrc_model_config *c) {
     return UNSUP("config.json: rope_type \"%s\" is not supported (only \"default\" and \"llama3\")", rtype);
 }
 
+/* Number of base-model weight elements of `c` (the expected tensors of rrc_config_expected_tensors),
+ * with every product and sum checked: RRC_ERR_SHAPE when it does not fit in int64. */
+static rrc_status config_weight_elems(const rrc_model_config *c, int64_t *out) {
+    const int64_t H = c->hidden_size, I = c->intermediate_size, V = c->vocab_size, D = c->head_dim;
+    int64_t Q = 0, KV = 0, emb = 0, qo = 0, kv = 0, mlp = 0, per = 0, t = 0;
+    int ov = 0;
+#define MUL(a, b, r) (ov |= __builtin_mul_overflow((int64_t)(a), (int64_t)(b), (r)))
+#define ADD(a, r) (ov |= __builtin_add_overflow(*(r), (int64_t)(a), (r)))
+    MUL(c->num_heads, D, &Q);
+    MUL(c->num_kv_heads, D, &KV);
+    MUL(V, H, &emb);
+    MUL(Q, H, &qo);
+    MUL(KV, H, &kv);
+    MUL(I, H, &mlp);
+    /* per layer: q, o (Q x H), k, v (KV x H), gate, up, down (I x H), two norms (H), biases, q/k norms (D) */
+    MUL(qo, 2, &per);
+    MUL(kv, 2, &t);
+    ADD(t, &per);
+    MUL(mlp, 3, &t);
+    ADD(t, &per);
+    MUL(H, 2, &t);
+    ADD(t, &per);
+    if (c->qkv_bias) {
+        ADD(Q, &per);
+        ADD(KV, &per);
+        ADD(KV, &per);
+    }
+    if (c->o_bias) ADD(H, &per);
+    if (c->qk_norm) {
+        ADD(D, &per);
+        ADD(D, &per);
+    }
+    MUL(per, c->num_layers, &t);
+    ADD(emb, &t);
+    ADD(H, &t);
+    if (!c->tie_word_embeddings) ADD(emb, &t);
+#undef MUL
+#undef ADD
+    if (ov || Q <= 0 || KV <= 0)
+        return RRC_ERROR(RRC_ERR_SHAPE,
+                         "config: the base-model weight element count overflows (hidden %lld, intermediate %lld, "
+                         "vocab %lld, layers %lld, heads %lld, kv heads %lld, head_dim %lld)",
+                         (long long)H, (long long)I, (long long)V, (long long)c->num_layers, (long long)c->num_heads,
+                         (long long)c->num_kv_heads, (long long)D);
+    *out = t;
+    return RRC_OK;
+}
+
 rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_config *out) {
     RRC_REQUIRE(root && out, RRC_ERR_INVALID_ARG, "null argument");
     RRC_REQUIRE(root->type == RRC_JSON_OBJECT, RRC_ERR_PARSE, "config.json: top level must be an object");
@@ -253,6 +310,11 @@ rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_
     RRC_CHECK(require_positive("num_hidden_layers", c->num_layers));
     RRC_CHECK(require_positive("num_attention_heads", c->num_heads));
     RRC_CHECK(require_positive("max_position_embeddings", c->max_position_embeddings));
+    RRC_CHECK(require_at_most("vocab_size", c->vocab_size, RRC_CONFIG_MAX_DIM));
+    RRC_CHECK(require_at_most("hidden_size", c->hidden_size, RRC_CONFIG_MAX_DIM));
+    RRC_CHECK(require_at_most("intermediate_size", c->intermediate_size, RRC_CONFIG_MAX_DIM));
+    RRC_CHECK(require_at_most("num_hidden_layers", c->num_layers, RRC_CONFIG_MAX_LAYERS));
+    RRC_CHECK(require_at_most("num_attention_heads", c->num_heads, RRC_CONFIG_MAX_DIM));
 
     /* num_key_value_heads: absent -> heads (llama) / 32 (qwen); null -> heads */
     const rrc_json *kv = rrc_json_get(root, "num_key_value_heads");
@@ -260,6 +322,7 @@ rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_
     else if (kv->type == RRC_JSON_NULL) c->num_kv_heads = c->num_heads;
     else RRC_CHECK(rrc_json_as_int(kv, "num_key_value_heads", &c->num_kv_heads));
     RRC_CHECK(require_positive("num_key_value_heads", c->num_kv_heads));
+    RRC_CHECK(require_at_most("num_key_value_heads", c->num_kv_heads, RRC_CONFIG_MAX_DIM));
     RRC_REQUIRE(c->num_heads % c->num_kv_heads == 0, RRC_ERR_UNSUPPORTED,
                 "config.json: num_attention_heads (%lld) is not a multiple of num_key_value_heads (%lld)",
                 (long long)c->num_heads, (long long)c->num_kv_heads);
@@ -278,6 +341,7 @@ rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_
         RRC_CHECK(rrc_json_as_int(hd, "head_dim", &c->head_dim));
     }
     RRC_CHECK(require_positive("head_dim", c->head_dim));
+    RRC_CHECK(require_at_most("head_dim", c->head_dim, RRC_CONFIG_MAX_DIM));
     RRC_REQUIRE(c->head_dim % 2 == 0, RRC_ERR_UNSUPPORTED, "config.json: head_dim = %lld must be even for RoPE",
                 (long long)c->head_dim);
 
@@ -316,6 +380,14 @@ rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_
             c->qkv_bias = 1;
             c->o_bias = 0;
             c->qk_norm = 0;
+            const rrc_json *mr = rrc_json_get(root, "use_mrope");
+            if (!is_null_or_absent(mr)) {
+                int mrope;
+                RRC_CHECK(get_bool_field(root, "use_mrope", 0, &mrope));
+                if (mrope)
+                    return UNSUP("config.json: use_mrope = true (multimodal RoPE) is not supported for qwen2 (only "
+                                 "false; transformers' qwen2 model does not read the key)");
+            }
         }
         /* sliding window: Qwen2Config/Qwen3Config.__post_init__ */
         int use_sw;
@@ -349,6 +421,14 @@ rrc_status rrc_config_from_json(const rrc_json *root, unsigned flags, rrc_model_
                          (long long)sliding, (long long)mwl);
         }
     }
+
+    /* the whole base model (products and sums checked): every later size computation (weight
+     * layout, byte counts, LoRA shapes) then stays far inside int64 */
+    int64_t welems = 0;
+    RRC_CHECK(config_weight_elems(c, &welems));
+    RRC_REQUIRE(welems <= RRC_CONFIG_MAX_WEIGHT_ELEMS, RRC_ERR_UNSUPPORTED,
+                "config.json: the base model has %lld weight elements, more than the supported %lld (2^40)",
+                (long long)welems, (long long)RRC_CONFIG_MAX_WEIGHT_ELEMS);
 
     RRC_CHECK(parse_rope(root, c));
 
@@ -448,8 +528,17 @@ static void spec(rrc_tensor_spec *s, size_t *k, const char *name, int ndim, int6
 
 rrc_status rrc_config_expected_tensors(const rrc_model_config *c, rrc_tensor_spec **out, size_t *n) {
     RRC_REQUIRE(c && out && n, RRC_ERR_INVALID_ARG, "null argument");
+    /* the config may not come from rrc_config_from_json: bound it here as well (the spec count and
+     * every shape product below must not wrap) */
+    RRC_REQUIRE(c->num_layers > 0 && c->num_layers <= RRC_CONFIG_MAX_LAYERS, RRC_ERR_SHAPE,
+                "num_layers = %lld out of range [1, %d]", (long long)c->num_layers, RRC_CONFIG_MAX_LAYERS);
+    int64_t welems = 0;
+    RRC_CHECK(config_weight_elems(c, &welems));
     size_t per_layer = 2 + 4 + 3 + (c->qkv_bias ? 3 : 0) + (c->o_bias ? 1 : 0) + (c->qk_norm ? 2 : 0);
-    size_t total = 1 + (size_t)c->num_layers * per_layer + 1 + (c->tie_word_embeddings ? 0 : 1);
+    size_t total = 0;
+    if (__builtin_mul_overflow((size_t)c->num_layers, per_layer, &total) ||
+        __builtin_add_overflow(total, (size_t)(2 + (c->tie_word_embeddings ? 0 : 1)), &total))
+        return RRC_ERROR(RRC_ERR_SHAPE, "tensor spec count overflows");
     rrc_tensor_spec *s = (rrc_tensor_spec *)calloc(total, sizeof(rrc_tensor_spec));
     if (!s) return RRC_ERROR(RRC_ERR_OOM, "tensor specs");
     size_t k = 0;

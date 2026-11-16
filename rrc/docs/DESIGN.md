@@ -325,13 +325,31 @@ left open or a place where the implementation differs from the text above, and w
 10. **llama3 rope scaling is accepted for every family** (the formula does not depend on the
     family; §1 lists it under Llama because that is where it occurs). Qwen2's
     `attention_bias`/`mlp_bias` and Qwen3's `mlp_bias` keys are ignored because the transformers
-    models do not read them (the tensor-set check still catches any mismatch).
+    models do not read them (the tensor-set check still catches any mismatch). Qwen2's `use_mrope`
+    (carried by some qwen2-architecture checkpoints; the transformers qwen2 model does not read it)
+    is accepted when false or null and refused when true.
+    Upper bounds (config.json is untrusted input; review finding: a `num_hidden_layers` of
+    11⁻¹ mod 2⁶⁴ wrapped the size_t tensor-spec count and the layer loop wrote past the array):
+    `vocab_size`, `hidden_size`, `intermediate_size`, `num_attention_heads`,
+    `num_key_value_heads` and `head_dim` ≤ 2³¹ − 1, `num_hidden_layers` ≤ 1024 (the LoRA layer
+    table), and the base model's weight element count, every product and sum checked, ≤ 2⁴⁰
+    (`include/rrc/config.h`); `rrc_config_expected_tensors` re-checks the count with checked
+    arithmetic for configs built elsewhere. `max_position_embeddings` bounds no tensor and stays
+    unbounded (the RoPE table is refused above 2³¹ − 1 rows unless `max_positions` bounds it).
 11. **Safetensors strictness**: like the reference `safetensors` package, the data block must be
     tiled exactly (overlaps, holes and uncovered bytes are errors); in addition every tensor entry
     must have exactly the keys dtype/shape/data_offsets. F16 checkpoints are read and converted
     exactly to f32 by `rrc_st_to_f32` (or RNE to bf16), but F16 is not an engine dtype
     (`rrc_st_dtype_to_rrc` refuses it); I64 converts to I32 with a range check. The tensor-set
-    checker accepts only F32/BF16 model weights.
+    checker accepts only F32/BF16 model weights. Untrusted-input hardening (review findings):
+    duplicate JSON keys are detected by a linear scan in objects of up to 16 keys and by sorting
+    (key, offset) in larger ones (a safetensors header or an index weight_map), so a 200k-entry
+    header parses in well under a second instead of minutes; the shard list of an index is
+    deduplicated by sorting too. Every input file (config.json, safetensors, index, `.rrcbin`,
+    `rrc_state.bin`, training config) is opened with `O_NONBLOCK` and refused unless it is a regular
+    file (a FIFO no longer blocks the program); temporary files of atomic writes are created with
+    `O_CREAT | O_EXCL | O_NOFOLLOW` after unlinking a stale entry (`include/rrc/fileio.h`), so a
+    planted symlink is never written through.
 12. **Extra files not in §2**: `src/rrc_inspect.c` (`build/rrc_inspect`, prints the loader's view
     of a checkpoint as JSON for the pytest comparison), `tests/cuda/headers_check.cu` (the nvcc
     compile check run by `make test` when `CUDA_HOME`/`RRC_NVCC` is set), `tests/c/rt.h` (test
@@ -1220,9 +1238,9 @@ files (huggingface.co is not reachable here); `rrc_census --config` takes the re
      shapes, computed); the bf16 copy of A / B allowed by
      §3 or a fused LoRA epilogue would remove them; not done (fp32 LoRA GEMMs like PEFT).
    * The presets are unverified transcriptions; real `config.json` files may carry keys outside rrc's
-     ignore list (for example `use_mrope`, which some Qwen2.5 files are recalled to contain;
-     unverified), which `rrc_census` / `rrc_train` refuse unless `--allow-unknown-keys` /
-     `RRC_CONFIG_ALLOW_UNKNOWN_KEYS`.
+     ignore list, which `rrc_census` / `rrc_train` refuse unless `--allow-unknown-keys` /
+     `RRC_CONFIG_ALLOW_UNKNOWN_KEYS` (`rrc_train` has no such option; qwen2's `use_mrope: false`,
+     seen on some qwen2-architecture checkpoints, is accepted since item 10 of §9).
    * No time estimate is derived from these counts.
 
 ## 14. Device-pointer audit
@@ -1346,16 +1364,37 @@ largest displacement Adam can produce), a check passes when
 `err(dev, cpu-f32acc) ≤ max(K · err(cpu-f32acc, cpu), floor)` with K = 10: the anchor is the fp32
 reference's own error against the double-accumulation backend, so a device whose fp32 arithmetic
 is as accurate as the CPU's lands within about twice the anchor. The floors cover an anchor that is
-accidentally tiny:
+accidentally tiny. In bf16 the anchored term of the logits and grad checks is capped:
+`tol = max(min(K · err(cpu-f32acc, cpu), cap), floor)` (the report's `e2e.tolerances`):
 
-| quantity | floor f32 | floor bf16 |
-| --- | --- | --- |
-| logits | 6e-5 | 3e-2 |
-| loss | 6e-6 | 1e-2 |
-| grad (per tensor) | 3e-4 | 6e-2 |
-| train loss (per step) | 2e-5 | 2e-2 |
-| train grad norm (per step) | 1e-4 | 6e-2 |
-| train params (lr · steps units) | 8e-4 | 1e-1 |
+| quantity | floor f32 | floor bf16 | cap bf16 |
+| --- | --- | --- | --- |
+| logits | 6e-5 | 3e-2 | 4.5e-2 |
+| loss | 6e-6 | 1e-2 | none |
+| grad (per tensor) | 3e-4 | 6e-2 | 8e-2 |
+| train loss (per step) | 2e-5 | 2e-2 | none |
+| train grad norm (per step) | 1e-4 | 6e-2 | none |
+| train params (lr · steps units) | 8e-4 | 1e-1 | none |
+
+Why the cap (review finding): at the quick and tiny sizes the bf16 anchor is small and the floor
+decides (K · anchor / tol ≤ 0.1 for bf16 logits, loss and grad), but at the full GPU size the bf16
+anchor is about 0.02 for the grads (llama, qwen2) and 0.04 for the final parameters, so the
+uncapped rule gave effective bf16 tolerances of 0.2 (grad) and 0.41–0.45 (params): a 10% error in
+the attention softmax backward passed every llama and qwen2 bf16 check (grad errors 0.147 /
+0.145). Effective bf16 tolerances now, at the full size: grad 0.08 (llama, qwen2) and 0.06 (qwen3,
+floor); logits 0.03–0.045; params unchanged, 0.19–0.45. The training quantities stay uncapped:
+their anchors grow legitimately with few steps (params anchor 0.16–0.52 at `--e2e-steps 2`, where
+the jitter device reaches 0.26–0.75), and the grad check is the one a backward fault shows in.
+Calibration of the caps (HOST-ONLY in the sense of "no GPU": host test devices on the CPU, full
+size, the same at 1, 2 and 4 OpenMP threads): the jitter device's largest bf16 errors are 0.026
+(grad) and 0.0093 (logits), so the caps are about 3× and 4.8× those and about 4× the anchors; the
+fault device with `--fault-amp 0.1` (10%) fails the bf16 grad check of every family (0.147 / 0.145
+/ 0.126) and `make test` requires exactly that (a control with `--e2e-size full --e2e-filter bf16
+--e2e-steps 2`, next to a jitter run of the same set that must pass). A 5% fault is not reliably
+caught in bf16 (qwen2 0.074 passes, llama 0.081 fails by 1%, qwen3 0.065 fails on the floor);
+smaller bf16-only errors are left to the f32 end-to-end checks and the per-op bf16 checks. The
+GPU's own bf16 error against `cpu-f32acc` is NOT_TESTED: a cap too tight for it shows as a bf16
+logits / grad FAIL with `dev_err` just above the cap while everything else passes.
 
 Calibration (TESTED on CPU, `make test`): two host test devices over `cpu-f32acc`. `jitter`
 perturbs every GEMM output element by a deterministic pseudo-random factor up to ±k·2⁻²⁴ (the
@@ -1366,7 +1405,7 @@ PASS; at the full GPU sizes its largest f32 errors were 1.9e-5 (logits), 1.1e-6 
 grad errors are about 1.4e-3, ≈ 5× the floor (10 failing checks at the quick size, 12 at the full
 size: grads 1.2e-3–1.4e-3, grad norms 2.7e-4, params 8.3e-4–1.1e-3 against 8e-4); forward checks
 pass (the fault is backward-only), and in bf16 the fault is below the bf16 noise, so the f32 checks
-are the ones that catch it. On kc-emu (CPU arithmetic, tree reductions, shuffled item order) the
+are the ones that catch it (the bf16 checks catch a 10% fault of the same op, above). On kc-emu (CPU arithmetic, tree reductions, shuffled item order) the
 whole set passes with dev_err ≈ ref_err. HOST-ONLY: the tiny qwen3 f32 + bf16 set passes through
 the real backend on the fake runtime (`make test` with `CUDA_HOME`). TF32 (`--tf32`)
 replaces the f32 floors by the bf16 ones / 8. The work directory (`--e2e-dir`, default `$TMPDIR`)
@@ -1391,8 +1430,17 @@ max abs / max rel / worst error over tolerance, GEMM path per dtype combination,
 and ladder level, kernel-fallback examples, failing cases), and `e2e` (every item with `dev_err`,
 `ref_err`, `tol`, `pass`, `detail`; in the CUDA build also `model_gemm_tally`: the device's GEMM
 calls and computed FLOPs per dtype combination and ladder level during the end-to-end runs, with
-the kernel-fallback FLOP share printed loudly, the h2d and stream-synchronize counts, and
-`model_gemm_census`: every distinct GEMM geometry of the model with its path). The file is
+the kernel-fallback FLOP share printed loudly, the h2d and stream-synchronize counts, the staging
+ring that ran (`staging_bytes`, `staging_slots`, `h2d_direct`), and `model_gemm_census`: every
+distinct GEMM geometry of the model with its path), and in the CUDA build `h2d_staging` (the
+requested ring size and the one the backend actually set up, `rrc_cuda_stats.staging_bytes`: 0 if
+disabled or if the pinned allocation failed; the `options:` line prints the same) and
+`h2d_ring_pass` (the small-ring pass: a 4 KiB ring in 4 slots, odd-sized uploads and one of about
+1 MiB in 1025 chunks from one host array reused at once, downloaded and compared bit for bit,
+with the chunk / slot-wait counters checked; the multi-chunk path of `memcpy_h2d` that a real
+weight load takes and that the default 32 MiB ring never splits at the selftest's sizes;
+`--only h2d_ring` runs it alone; HOST-ONLY on the fake runtime in `make test`, NOT_TESTED on a
+GPU). The file is
 rewritten atomically after every stage and after every end-to-end family × dtype case (with
 `complete: false`, and `e2e.result` INCOMPLETE while that stage runs), and on the fatal path (e.g.
 the backend cannot be created), so a crash or hang leaves the finished stages on disk; stdout is
@@ -1471,7 +1519,11 @@ use. `local_files_only=True`, `HF_HUB_OFFLINE=1`, never `trust_remote_code`. Smo
 sets of the two tools, and the same tokens per step and trainable parameter count for the same
 configuration (the LoRA layouts agree). Known workload differences (by design): rrc synchronizes
 once per micro-batch (loss) and once per step (gradient norm for clipping), its attention is
-chunked GEMM + softmax (no fused flash kernel), and its AdamW is the `foreach=False` arithmetic.
+chunked GEMM + softmax (no fused flash kernel), and its AdamW is the `foreach=False` arithmetic;
+rrc computes the LM head and cross-entropy in `ce_chunk`-row chunks, while transformers
+materialises the full [B, T, V] logits (bf16, plus an f32 upcast in its loss), so the peak-memory
+figures are not like-for-like; rrc uploads each micro-batch's token ids / labels / positions /
+document ids inside the timed step, while the baseline's batches are on the device before timing.
 
 ### 15.5 The run, and what each outcome tells
 

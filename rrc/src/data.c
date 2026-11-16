@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "rrc/backend.h" /* RRC_IGNORE_INDEX */
+#include "rrc/fileio.h"
 
 /* ---- dataset ---------------------------------------------------------------------------------- */
 
@@ -122,9 +123,8 @@ rrc_status rrc_dataset_open(const char *path, int64_t model_vocab, rrc_dataset *
     unsigned char first;
     memcpy(&first, &one, 1);
     RRC_REQUIRE(first == 1, RRC_ERR_UNSUPPORTED, ".rrcbin reading needs a little-endian host");
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return RRC_ERROR(errno == ENOENT ? RRC_ERR_NOT_FOUND : RRC_ERR_IO, "cannot open %s: %s", path,
-                                 strerror(errno));
+    int fd = -1;
+    RRC_CHECK(rrc_open_regular(path, &fd));
     struct stat sb;
     if (fstat(fd, &sb) != 0) {
         rrc_status st = RRC_ERROR(RRC_ERR_IO, "fstat %s: %s", path, strerror(errno));

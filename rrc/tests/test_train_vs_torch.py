@@ -776,7 +776,7 @@ def test_resume_refusals(setup_fp32, train_exe, tmp_path):
         write_cfg(tmp_path / "d.json", **common, output_dir=str(out), max_steps=4),
         expect_ok=False,
     )
-    assert p.returncode == 2 and "already exists" in p.stderr
+    assert p.returncode == 2 and "already holds a run" in p.stderr
     # corrupted optimizer state and a swapped adapter are detected
     bad = tmp_path / "bad"
     bad.mkdir()
@@ -827,6 +827,42 @@ def test_init_adapter_config_must_match_lora_settings(setup_fp32, train_exe, tmp
         assert p.returncode == 2 and msg in p.stderr, (lora, p.stderr)
     # the matching settings train
     run_train(train_exe, write_cfg(tmp_path / "ok.json", **common, output_dir=str(tmp_path / "ok")))
+
+
+def test_init_adapter_with_peft_patterns_is_refused(setup_fp32, train_exe, tmp_path):
+    """A PEFT-saved adapter with alpha_pattern (review finding: ignored, so the adapter computed with
+    lora_alpha everywhere and the pattern was dropped on save), rank_pattern or modules_to_save is
+    refused before training; the same adapter without them trains."""
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    s = setup_fp32
+    variants = {
+        "plain": {},
+        "alpha_pattern": dict(alpha_pattern={"q_proj": 64}),
+        "rank_pattern": dict(rank_pattern={"v_proj": 2}),
+        "modules_to_save": dict(modules_to_save=["lm_head"]),
+    }
+    for name, extra in variants.items():
+        base = AutoModelForCausalLM.from_pretrained(s["model"], dtype=torch.float32)
+        pm = get_peft_model(
+            base, LoraConfig(r=4, lora_alpha=8, target_modules=list(MODS), lora_dropout=0.0,
+                             init_lora_weights=False, **extra)
+        )
+        ad = tmp_path / f"ad_{name}"
+        pm.save_pretrained(str(ad))
+        cfg = json.loads((ad / "adapter_config.json").read_text())
+        for k in extra:
+            assert cfg[k], (k, cfg[k])  # PEFT wrote the field
+        p = run_train(
+            train_exe,
+            write_cfg(tmp_path / f"{name}.json", model_dir=str(s["model"]), data_path=str(s["data"]),
+                      init_adapter=str(ad), max_steps=1, output_dir=str(tmp_path / f"o_{name}"),
+                      lora=dict(r=4, alpha=8, target_modules="all-linear")),
+            expect_ok=name == "plain",
+        )
+        if name != "plain":
+            assert p.returncode == 2 and f'"{name}" is set' in p.stderr, (name, p.stderr)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1093,6 +1129,59 @@ def test_prepare_sft_round_trip(data_exe, tmp_path):
         text=True,
     )
     assert p.returncode != 0 and "needs 'messages'" in p.stderr
+
+
+# Qwen3's stock template in miniature: an empty think block only in assistant turns after the last
+# user message, so a multi-turn conversation's prefixes are not prefixes of the full rendering.
+THINK_TEMPLATE = (
+    "{%- set ns = namespace(last=-1) -%}"
+    "{%- for m in messages -%}{%- if m['role'] == 'user' -%}{%- set ns.last = loop.index0 -%}{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- for m in messages -%}<|{{ m['role'] }}|> "
+    "{%- if m['role'] == 'assistant' and loop.index0 > ns.last %} <|system|> <|end|>{% endif %}"
+    " {{ m['content'] }} <|end|> {% endfor -%}"
+    "{%- if add_generation_prompt %}<|assistant|> {% endif -%}"
+)
+
+
+def test_prepare_sft_multi_turn_with_think_template(tmp_path):
+    """Review finding: one multi-turn conversation under a Qwen3-style template aborted the whole
+    conversion with a traceback. Now: exit 2 with a clean message naming the fix, nothing written;
+    --skip-refused converts the rest and counts the refused ones; single-turn still works."""
+    build_tokenizer(tmp_path / "tok")
+    (tmp_path / "think.jinja").write_text(THINK_TEMPLATE)
+    single = {"messages": [{"role": "user", "content": "hello there"}, {"role": "assistant", "content": "i am fine"}]}
+    multi = {
+        "messages": [
+            {"role": "user", "content": "hello there"},
+            {"role": "assistant", "content": "i am fine thanks"},
+            {"role": "user", "content": "translate cat to french"},
+            {"role": "assistant", "content": "chat"},
+        ]
+    }
+    src = tmp_path / "in.jsonl"
+    src.write_text("\n".join(json.dumps(e) for e in (single, multi, single)) + "\n")
+
+    def run(*extra):
+        return subprocess.run(
+            [sys.executable, str(RRC_DIR / "tools/prepare_sft.py"), "--tokenizer", str(tmp_path / "tok"),
+             "--input", str(src), "--output", str(tmp_path / "o.rrcbin"), "--chat-template",
+             str(tmp_path / "think.jinja"), *extra],
+            capture_output=True, text=True,
+        )
+
+    p = run()
+    assert p.returncode == 2, (p.returncode, p.stderr)
+    assert "Traceback" not in p.stderr and "prepare_sft: error: example 1:" in p.stderr, p.stderr
+    assert "prefix-stable" in p.stderr and "qwen3_training.jinja" in p.stderr and "--skip-refused" in p.stderr
+    assert not (tmp_path / "o.rrcbin").exists() and not (tmp_path / "o.rrcbin.tmp").exists()
+    p = run("--skip-refused")
+    assert p.returncode == 0, p.stderr
+    stats = json.loads(p.stdout)
+    assert stats["num_docs"] == 2 and stats["skipped_refused"] == 1, stats
+    assert "skipped 1 example" in p.stderr
+    _, docs = prepare_sft.read_rrcbin(str(tmp_path / "o.rrcbin"))
+    assert len(docs) == 2 and docs[0] == docs[1]
 
 
 def _hdr(n, vocab, total, magic=b"RRCBIN01"):

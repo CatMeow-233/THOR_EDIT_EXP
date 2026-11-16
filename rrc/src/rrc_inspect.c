@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
             while (*s && n_pos < 64) {
                 char *end;
                 long long v = strtoll(s, &end, 10);
-                if (end == s || v < 0) {
+                /* a RoPE table row index: the table has maxp + 1 rows, at most 2^31 - 1 (the model's limit) */
+                if (end == s || v < 0 || v >= INT32_MAX) {
                     usage();
                     return 1;
                 }
@@ -158,11 +159,25 @@ int main(int argc, char **argv) {
     if (n_pos > 0) {
         int64_t maxp = 0;
         for (int i = 0; i < n_pos; i++) maxp = positions[i] > maxp ? positions[i] : maxp;
-        float *cs = (float *)malloc((size_t)((maxp + 1) * half) * sizeof(float));
-        float *sn = (float *)malloc((size_t)((maxp + 1) * half) * sizeof(float));
-        if (!cs || !sn) return fail(RRC_ERROR(RRC_ERR_OOM, "rope tables"));
+        int64_t elems = 0;
+        size_t bytes = 0;
+        if (__builtin_mul_overflow(maxp + 1, half, &elems) ||
+            __builtin_mul_overflow((size_t)elems, sizeof(float), &bytes))
+            return fail(RRC_ERROR(RRC_ERR_UNSUPPORTED, "RoPE tables for %lld positions x %lld overflow",
+                                  (long long)(maxp + 1), (long long)half));
+        float *cs = (float *)malloc(bytes);
+        float *sn = (float *)malloc(bytes);
+        if (!cs || !sn) {
+            free(cs);
+            free(sn);
+            return fail(RRC_ERROR(RRC_ERR_OOM, "rope tables"));
+        }
         st = rrc_rope_tables(&c, maxp + 1, cs, sn);
-        if (st != RRC_OK) return fail(st);
+        if (st != RRC_OK) {
+            free(cs);
+            free(sn);
+            return fail(st);
+        }
         rrc_jw_key(&w, "rope");
         rrc_jw_obj_begin(&w);
         rrc_jw_key(&w, "positions");

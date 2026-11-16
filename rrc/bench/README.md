@@ -27,9 +27,10 @@ R=../rrc                                    # path of the rrc/ directory from he
 ## 1. Record the machine and the source revision
 
 ```sh
+set -o pipefail                            # a pipeline reports its failing command (make): recorded as exit=N below
 git -C $R log -1 --format='%H %s' > env.txt
 nvidia-smi >> env.txt
-nvcc --version >> env.txt
+"$CUDA_HOME/bin/nvcc" --version >> env.txt 2>&1   # CUDA_HOME/bin need not be on PATH
 gcc --version | head -1 >> env.txt
 python3 -c "import torch, transformers, peft; print(torch.__version__, torch.version.cuda, transformers.__version__, peft.__version__)" >> env.txt
 ```
@@ -39,7 +40,9 @@ python3 -c "import torch, transformers, peft; print(torch.__version__, torch.ver
 ```sh
 make -C $R clean
 make -C $R cpu test 2>&1 | tail -n 30 > build_cpu_test.log              # CPU tests: must end without an error
+echo "exit=$?" >> build_cpu_test.log                                     # (pipefail: make's status)
 make -C $R cuda CUDA_HOME=$CUDA_HOME CUDA_ARCH=sm_120 2>&1 | tail -n 20 > build_cuda.log
+echo "exit=$?" >> build_cuda.log
 ls -la $R/build/rrc_selftest $R/build/rrc_bench $R/build/rrc_train_cuda >> build_cuda.log
 ```
 
@@ -52,7 +55,10 @@ $R/build/rrc_selftest --report selftest.json 2>&1 | tee selftest.log
 The last line is `rrc_selftest: PASS` or `rrc_selftest: FAIL`. It runs, in this order: every op
 of the CUDA backend against the CPU backend (random inputs, tolerances per op class), the GEMM
 path of every dtype combination (the dense aligned cases must reach cuBLASLt), a pass with a tiny
-GEMM scratch cap and a pass with a 3-block grid, then the end-to-end checks: tiny llama, qwen2 and
+GEMM scratch cap and a pass with a 3-block grid, a pass with a 4 KiB h2d staging ring (odd-sized
+uploads and one of about 1 MiB split over 1025 slots, compared bit for bit: the chunked upload path
+a real weight load takes, which the default 32 MiB ring never splits at the selftest's sizes;
+`h2d_ring_pass` in the report), then the end-to-end checks: tiny llama, qwen2 and
 qwen3 checkpoints written by the program itself, f32 and bf16, logits, loss, every LoRA gradient,
 a 20-step training run through the trainer, and bit-for-bit determinism. The end-to-end CPU
 references run on the CPU of the machine (a few minutes; the duration has not been measured).
@@ -129,7 +135,19 @@ device name, numbers); the model directory path appears in the benchmark files.
   time can go. The peak memory measures differ by tool and are labelled in the files.
 * Known differences of the workloads (by design, not measured): rrc synchronizes the host once per
   micro-batch (loss) and once per step (gradient norm for clipping); rrc's attention is chunked
-  GEMM + softmax, not a fused flash kernel; torch uses fused AdamW.
+  GEMM + softmax, not a fused flash kernel; torch uses fused AdamW; rrc computes the LM head and
+  the cross-entropy in `ce_chunk`-row chunks, while transformers materialises the full [B, T, V]
+  logits (bf16, plus an f32 upcast inside its loss), so the peak-memory figures are not
+  like-for-like (at T = 4096 and V = 151936 that is about 1.2 GB + 2.5 GB, computed from the
+  shapes, not measured); rrc uploads the token ids / labels / positions / document ids of every
+  micro-batch inside the timed step (host arrays passed to the step, a few host-to-device copies
+  of a few hundred KB per step, counted in `gemm.h2d_calls_per_step`), while the baseline's batches
+  are on the device before timing starts.
+* `selftest.json` `h2d_staging`: the ring the backend actually set up (`active_bytes`, 0 if
+  disabled or if the pinned allocation failed) next to the requested size; `e2e.items[]` `tol` of
+  the bf16 logits / grad checks is capped (`e2e.tolerances`, DESIGN.md §15.1): a bf16 FAIL with
+  `dev_err` just above the cap, and every other check passing, points at the cap's host-only
+  calibration first.
 
 ## Smoke tests without a GPU (what CI runs)
 

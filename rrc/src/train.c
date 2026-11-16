@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "rrc/census.h"
+#include "rrc/fileio.h"
 #include "rrc/json.h"
 #include "rrc/offdev.h"
 #include "rrc/safetensors.h"
@@ -459,9 +460,8 @@ done:
 
 rrc_status rrc_train_config_load(const char *path, rrc_train_config *out) {
     RRC_REQUIRE(path && out, RRC_ERR_INVALID_ARG, "null argument");
-    FILE *f = fopen(path, "rb");
-    if (!f) return RRC_ERROR(errno == ENOENT ? RRC_ERR_NOT_FOUND : RRC_ERR_IO, "cannot open %s: %s", path,
-                             strerror(errno));
+    FILE *f = NULL;
+    RRC_CHECK(rrc_fopen_regular(path, &f));
     char *buf = NULL;
     size_t len = 0, cap = 0;
     rrc_status st = RRC_OK;
@@ -680,7 +680,7 @@ rrc_status rrc_train_config_fingerprint(const rrc_train_config *c, char **out) {
 /* ---- file helpers ------------------------------------------------------------------------------- */
 
 static rrc_status fsync_path(const char *path) {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return RRC_ERROR(RRC_ERR_IO, "open %s for fsync: %s", path, strerror(errno));
     int r = fsync(fd);
     int e = errno;
@@ -725,8 +725,8 @@ static rrc_status write_atomic_fsync(const char *path, const void *data, size_t 
     char tmp[RRC_PATH_MAX + 8];
     RRC_REQUIRE(strlen(path) < RRC_PATH_MAX, RRC_ERR_INVALID_ARG, "path too long");
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) return RRC_ERROR(RRC_ERR_IO, "cannot create %s: %s", tmp, strerror(errno));
+    FILE *f = NULL;
+    RRC_CHECK(rrc_create_new_file(tmp, &f)); /* never through a planted symlink */
     int ok = (len == 0 || fwrite(data, 1, len, f) == len) && fflush(f) == 0 && fsync(fileno(f)) == 0;
     ok = (fclose(f) == 0) && ok;
     if (!ok) {
@@ -802,13 +802,13 @@ void rrc_train_state_free(rrc_train_state *s) {
 rrc_status rrc_train_state_read(const char *path, rrc_train_state *out) {
     RRC_REQUIRE(path && out, RRC_ERR_INVALID_ARG, "null argument");
     memset(out, 0, sizeof *out);
-    FILE *f = fopen(path, "rb");
-    if (!f) return RRC_ERROR(errno == ENOENT ? RRC_ERR_NOT_FOUND : RRC_ERR_IO, "cannot open %s: %s", path,
-                             strerror(errno));
+    FILE *f = NULL;
+    RRC_CHECK(rrc_fopen_regular(path, &f));
     struct stat sb;
-    if (fstat(fileno(f), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+    if (fstat(fileno(f), &sb) != 0) {
+        rrc_status s = RRC_ERROR(RRC_ERR_IO, "fstat %s: %s", path, strerror(errno));
         fclose(f);
-        return RRC_ERROR(RRC_ERR_IO, "%s is not a regular file", path);
+        return s;
     }
     const size_t size = (size_t)sb.st_size;
     if (size < STATE_FIXED + 8) {
@@ -933,8 +933,32 @@ rrc_status rrc_peft_adapter_config_json(const rrc_lora_config *lc, const char *b
     return rrc_jw_finish(&w, out, &n);
 }
 
+/* PEFT LoraConfig fields whose non-empty value changes what the adapter computes (per-module alpha or
+ * rank, extra trained modules or tokens, excluded / replicated layers, bias or parameter targets,
+ * activated / routed / quantization-aware variants), which rrc does not implement. "Empty" is
+ * absent, null, false, "", {} or [] (PEFT writes {} for alpha_pattern / rank_pattern and null or
+ * false for the rest). */
+static const char *const k_peft_unsupported_fields[] = {
+    "alpha_pattern",   "rank_pattern",      "layers_pattern",          "exclude_modules",
+    "layer_replication", "modules_to_save", "trainable_token_indices", "target_parameters",
+    "lora_bias",       "fan_in_fan_out",    "alora_invocation_tokens", "arrow_config",
+    "use_qalora",      "use_bdlora",
+};
+static int json_is_empty(const rrc_json *v) {
+    if (!v) return 1;
+    switch (v->type) {
+    case RRC_JSON_NULL: return 1;
+    case RRC_JSON_BOOL: return !v->u.boolean;
+    case RRC_JSON_STRING: return rrc_json_str(v)[0] == '\0';
+    case RRC_JSON_OBJECT: return rrc_json_obj_count(v) == 0;
+    case RRC_JSON_ARRAY: return rrc_json_arr_count(v) == 0;
+    default: return 0;
+    }
+}
+
 /* If dir/adapter_config.json exists, refuse values that would silently change the adapter's
- * function (alpha, rslora, r, dropout, bias, target set, layers). */
+ * function (alpha, rslora, r, dropout, bias, target set, layers, peft_type, and the PEFT fields of
+ * k_peft_unsupported_fields when not empty). */
 static rrc_status check_adapter_config(const char *dir, const rrc_lora_config *lc) {
     char p[RRC_PATH_MAX + 32];
     snprintf(p, sizeof p, "%s/adapter_config.json", dir);
@@ -956,6 +980,22 @@ static rrc_status check_adapter_config(const char *dir, const rrc_lora_config *l
         const rrc_json *v;
         double d;
         int b;
+        for (size_t i = 0; i < sizeof k_peft_unsupported_fields / sizeof k_peft_unsupported_fields[0]; i++)
+            if (!json_is_empty(rrc_json_get(r, k_peft_unsupported_fields[i]))) {
+                st = RRC_ERROR(RRC_ERR_INVALID_ARG,
+                               "%s: \"%s\" is set; rrc does not implement it (it changes the adapter's function, and "
+                               "rrc would drop it on save): refused",
+                               p, k_peft_unsupported_fields[i]);
+                goto done;
+            }
+        /* initialisations that also rewrite the base weights (PiSSA / OLoRA / CorDA / LoftQ): such an
+         * adapter belongs to a modified base model unless PEFT converted it on save; refused */
+        if ((v = rrc_json_get(r, "init_lora_weights")) && v->type == RRC_JSON_STRING &&
+            (!strncmp(rrc_json_str(v), "pissa", 5) || !strcmp(rrc_json_str(v), "olora") ||
+             !strcmp(rrc_json_str(v), "corda") || !strcmp(rrc_json_str(v), "loftq")))
+            MISMATCH("init_lora_weights (an initialisation that modifies the base weights)");
+        if ((v = rrc_json_get(r, "peft_type")) && (!rrc_json_str(v) || strcmp(rrc_json_str(v), "LORA")))
+            MISMATCH("peft_type (only \"LORA\" is supported)");
         if ((v = rrc_json_get(r, "r")) && (v->type != RRC_JSON_INT || v->u.i != lc->r)) MISMATCH("r");
         if ((v = rrc_json_get(r, "lora_alpha")) && (rrc_json_as_number(v, "lora_alpha", &d) != RRC_OK || d != lc->alpha))
             MISMATCH("lora_alpha");
@@ -1047,16 +1087,41 @@ static rrc_status adapter_file_of(const char *path, char *dst, size_t cap) {
     return RRC_OK;
 }
 
-/* Remove a checkpoint directory written by this trainer (its known files, then the directory). */
+/* What a checkpoint path inside output_dir is, without following a symlink (lstat). */
+enum { CK_ABSENT = 0, CK_DIR = 1, CK_OTHER = 2 };
+static int ckpt_kind(const char *p) {
+    struct stat sb;
+    if (lstat(p, &sb) != 0) return errno == ENOENT ? CK_ABSENT : CK_OTHER;
+    return S_ISDIR(sb.st_mode) ? CK_DIR : CK_OTHER;
+}
+static rrc_status require_ckpt_dir_or_absent(const char *p) {
+    RRC_REQUIRE(ckpt_kind(p) != CK_OTHER, RRC_ERR_IO,
+                "%s exists and is not a directory (a symlink or a file?): refusing to replace or remove anything "
+                "through it; remove it by hand",
+                p);
+    return RRC_OK;
+}
+
+/* Remove a checkpoint directory written by this trainer (its known files, then the directory). The
+ * directory is opened with O_NOFOLLOW and the files are unlinked relative to it, so nothing outside
+ * output_dir is removed through a symlinked checkpoint path. */
 static rrc_status remove_ckpt_dir(const char *dir) {
     static const char *const files[] = {"adapter_model.safetensors", "adapter_config.json", "rrc_state.bin",
                                         "adapter_model.safetensors.tmp", "adapter_config.json.tmp",
                                         "rrc_state.bin.tmp"};
-    char p[RRC_PATH_MAX + 64];
+    const int kind = ckpt_kind(dir);
+    if (kind == CK_ABSENT) return RRC_OK;
+    RRC_CHECK(require_ckpt_dir_or_absent(dir));
+    const int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) return RRC_ERROR(RRC_ERR_IO, "open %s: %s", dir, strerror(errno));
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
-        snprintf(p, sizeof p, "%s/%s", dir, files[i]);
-        if (remove(p) != 0 && errno != ENOENT) return RRC_ERROR(RRC_ERR_IO, "remove %s: %s", p, strerror(errno));
+        if (unlinkat(dfd, files[i], 0) != 0 && errno != ENOENT) {
+            rrc_status st = RRC_ERROR(RRC_ERR_IO, "remove %s/%s: %s", dir, files[i], strerror(errno));
+            close(dfd);
+            return st;
+        }
     }
+    close(dfd);
     if (rmdir(dir) != 0 && errno != ENOENT)
         return RRC_ERROR(RRC_ERR_IO, "rmdir %s: %s (unexpected files in a checkpoint directory?)", dir, strerror(errno));
     return RRC_OK;
@@ -1071,10 +1136,15 @@ static rrc_status save_checkpoint(trainer *t, int64_t step) {
     RRC_CHECK(join(tmp, sizeof tmp, c->output_dir, name));
     snprintf(name, sizeof name, ".checkpoint-%lld.old", (long long)step);
     RRC_CHECK(join(old, sizeof old, c->output_dir, name));
+    /* every checkpoint path is checked with lstat first: a symlink or a file there is refused before
+     * anything is renamed or removed */
+    RRC_CHECK(require_ckpt_dir_or_absent(dir));
+    RRC_CHECK(require_ckpt_dir_or_absent(tmp));
+    RRC_CHECK(require_ckpt_dir_or_absent(old));
     RRC_CHECK(remove_ckpt_dir(tmp));
     /* checkpoint-<step> missing but .checkpoint-<step>.old present: an earlier replace of this step
      * stopped between its two renames. Put the old copy back instead of deleting the only one. */
-    if (!path_exists(dir) && is_dir(old)) {
+    if (ckpt_kind(dir) == CK_ABSENT && ckpt_kind(old) == CK_DIR) {
         if (rename(old, dir) != 0)
             return RRC_ERROR(RRC_ERR_IO, "restore %s -> %s: %s", old, dir, strerror(errno));
         rrc_log(RRC_LOG_WARN, "restored %s from %s (an earlier save of step %lld was interrupted)", dir, old,
@@ -1123,7 +1193,8 @@ static rrc_status save_checkpoint(trainer *t, int64_t step) {
     RRC_CHECK(st);
     RRC_CHECK(fsync_path(tmp));
     /* publish: an existing checkpoint-<step> is moved aside first, then removed */
-    const int replacing = path_exists(dir);
+    RRC_CHECK(require_ckpt_dir_or_absent(dir));
+    const int replacing = ckpt_kind(dir) == CK_DIR;
     if (replacing && rename(dir, old) != 0)
         return RRC_ERROR(RRC_ERR_IO, "rename %s -> %s: %s", dir, old, strerror(errno));
     if (rename(tmp, dir) != 0) {
@@ -1144,11 +1215,13 @@ static rrc_status save_checkpoint(trainer *t, int64_t step) {
 /* On resume: keep the metrics lines of steps <= `step` (a crash may have left later lines or a
  * partial last line), rewrite the file atomically. */
 static rrc_status truncate_metrics(const char *path, int64_t step) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        if (errno == ENOENT) return RRC_OK;
-        return RRC_ERROR(RRC_ERR_IO, "open %s: %s", path, strerror(errno));
+    FILE *f = NULL;
+    const rrc_status os = rrc_fopen_regular(path, &f);
+    if (os == RRC_ERR_NOT_FOUND) {
+        rrc_clear_error();
+        return RRC_OK;
     }
+    RRC_CHECK(os);
     sbuf keep = {NULL, 0, 0, 0};
     char *line = NULL;
     size_t cap = 0;
@@ -1259,9 +1332,11 @@ static int is_parent_of(const char *dir, const char *path) {
     return stat(dir, &a) == 0 && stat(p, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
-/* 1 if output_dir holds a metrics.jsonl or a checkpoint-* entry (a run's outputs). */
+/* 1 if output_dir holds a metrics.jsonl or a checkpoint-* entry (a run's outputs; lstat: a dangling
+ * symlink counts). */
 static int holds_run(const char *dir, const char *mpath) {
-    if (path_exists(mpath)) return 1;
+    struct stat sb;
+    if (lstat(mpath, &sb) == 0) return 1;
     DIR *d = opendir(dir);
     if (!d) return 0;
     int found = 0;
@@ -1433,14 +1508,14 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, uint64
          * directory: only an empty one (or overwrite_output_dir), whose metrics start afresh. */
         if (is_parent_of(c->output_dir, c->resume_from)) {
             RRC_CHECK(truncate_metrics(mpath, *start_step));
-            t->metrics = fopen(mpath, "ab");
+            RRC_CHECK(rrc_fopen_output_nofollow(mpath, 1, &t->metrics));
         } else {
             RRC_REQUIRE(c->overwrite_output_dir || !holds_run(c->output_dir, mpath), RRC_ERR_INVALID_ARG,
                         "%s already holds another run (metrics.jsonl or checkpoint-*) and is not the directory of "
                         "resume_from %s: resume into that directory or an empty one, or set "
                         "\"overwrite_output_dir\": true",
                         c->output_dir, c->resume_from);
-            t->metrics = fopen(mpath, "wb");
+            RRC_CHECK(rrc_fopen_output_nofollow(mpath, 0, &t->metrics));
         }
     } else {
         if (c->init_adapter[0]) {
@@ -1449,11 +1524,15 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, uint64
             if (is_dir(c->init_adapter)) RRC_CHECK(check_adapter_config(c->init_adapter, &c->lora));
             RRC_CHECK_CTX(rrc_lora_load_safetensors(t->lora, p), "init_adapter");
         }
-        RRC_REQUIRE(c->overwrite_output_dir || !path_exists(mpath), RRC_ERR_INVALID_ARG,
-                    "%s already exists: set \"overwrite_output_dir\": true, or \"resume_from\" a checkpoint", mpath);
-        t->metrics = fopen(mpath, "wb");
+        /* the same test as a resume into another directory: a checkpoint-* of another run would be
+         * replaced by this run's save of that step */
+        RRC_REQUIRE(c->overwrite_output_dir || !holds_run(c->output_dir, mpath), RRC_ERR_INVALID_ARG,
+                    "%s already holds a run (%s or a checkpoint-* entry) and the run would replace it: set "
+                    "\"overwrite_output_dir\": true, or \"resume_from\" a checkpoint (an output directory that "
+                    "already exists and holds a run is refused)",
+                    c->output_dir, mpath);
+        RRC_CHECK(rrc_fopen_output_nofollow(mpath, 0, &t->metrics));
     }
-    if (!t->metrics) return RRC_ERROR(RRC_ERR_IO, "cannot open %s: %s", mpath, strerror(errno));
     rrc_loader_opts lo;
     memset(&lo, 0, sizeof lo);
     lo.seq_len = c->seq_len;

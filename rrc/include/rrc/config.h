@@ -32,7 +32,7 @@
  *   (qwen2/qwen3: use_sliding_window with a non-null sliding_window and max_window_layers <
  *   num_hidden_layers, or any layer_types entry != "full_attention"), other rope types,
  *   partial_rotary_factor != 1, quantization_config, odd head_dim, num_attention_heads not a
- *   multiple of num_key_value_heads, non-positive sizes or eps.
+ *   multiple of num_key_value_heads, non-positive sizes or eps, sizes above the upper bounds below.
  * Unknown top-level keys are refused (RRC_ERR_UNSUPPORTED) unless they are on the documented
  *   ignore list (metadata, token ids, generation parameters, ...), because an unknown key may
  *   carry semantics the engine does not implement; RRC_CONFIG_ALLOW_UNKNOWN_KEYS turns this into a
@@ -55,6 +55,16 @@ typedef enum rrc_family { RRC_FAMILY_LLAMA = 0, RRC_FAMILY_QWEN2 = 1, RRC_FAMILY
 typedef enum rrc_rope_type { RRC_ROPE_DEFAULT = 0, RRC_ROPE_LLAMA3 = 1 } rrc_rope_type;
 
 #define RRC_CONFIG_ALLOW_UNKNOWN_KEYS 1u
+
+/* Upper bounds rrc_config_from_json enforces (RRC_ERR_UNSUPPORTED; config.json is untrusted input):
+ * vocab_size, hidden_size, intermediate_size, num_attention_heads, num_key_value_heads and head_dim
+ * at most RRC_CONFIG_MAX_DIM; num_hidden_layers at most RRC_CONFIG_MAX_LAYERS (the LoRA layer
+ * table, RRC_LORA_MAX_LAYERS); the base model's weight element count (every product checked) at
+ * most RRC_CONFIG_MAX_WEIGHT_ELEMS. max_position_embeddings bounds no tensor and is not limited
+ * here (the model refuses a RoPE table above 2^31 - 1 rows unless max_positions bounds it). */
+#define RRC_CONFIG_MAX_DIM ((int64_t)2147483647)
+#define RRC_CONFIG_MAX_LAYERS 1024
+#define RRC_CONFIG_MAX_WEIGHT_ELEMS ((int64_t)1 << 40)
 
 typedef struct rrc_model_config {
     rrc_family family;

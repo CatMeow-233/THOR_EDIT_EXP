@@ -611,13 +611,14 @@ RT_TEST(model_load_refuses_huge_rope_table) {
     const char *values[] = {"4611686018427387904", "2147483648", "9223372036854775807", "2147483647"};
     for (int i = 0; i < 4; i++) {
         char cfg[1024];
-        /* the last case: 2^31 - 1 positions with head_dim 2^60 (the tensor check would refuse the
-         * head_dim later; the table size must not overflow first) */
+        /* the last case: 2^31 - 1 positions with head_dim 2^31 - 2 (the largest head_dim the config
+         * parser accepts; the table byte size overflows int64; the tensor check would refuse the
+         * head_dim later, the table size must not overflow first) */
         snprintf(cfg, sizeof cfg,
                  "{\"model_type\": \"qwen2\", \"vocab_size\": 24, \"hidden_size\": 16, \"intermediate_size\": 16, "
                  "\"num_hidden_layers\": 2, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, "
                  "\"max_position_embeddings\": %s, \"rms_norm_eps\": 1e-6, \"tie_word_embeddings\": false%s}",
-                 values[i], i == 3 ? ", \"head_dim\": 1152921504606846976" : "");
+                 values[i], i == 3 ? ", \"head_dim\": 2147483646" : "");
         RT_OK(rrc_write_file_atomic(file, cfg, strlen(cfg)));
         rrc_model *m = NULL;
         rrc_model_opts mo;

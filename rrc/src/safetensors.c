@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "rrc/fileio.h"
 #include "rrc/json.h"
 
 static const char *const k_st_names[RRC_ST_DTYPE_COUNT_] = {"F32", "BF16", "F16", "I32", "I64"};
@@ -112,13 +113,13 @@ static rrc_status load_file(rrc_st_set *set, const char *path) {
     f->path = strdup(path);
     if (!f->path) return RRC_ERROR(RRC_ERR_OOM, "path");
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return RRC_ERROR(errno == ENOENT ? RRC_ERR_NOT_FOUND : RRC_ERR_IO, "cannot open %s: %s", path, strerror(errno));
+    int fd = -1;
+    RRC_CHECK(rrc_open_regular(path, &fd));
     struct stat stt;
-    if (fstat(fd, &stt) != 0 || !S_ISREG(stt.st_mode)) {
+    if (fstat(fd, &stt) != 0) {
+        rrc_status s = RRC_ERROR(RRC_ERR_IO, "fstat %s: %s", path, strerror(errno));
         close(fd);
-        return RRC_ERROR(RRC_ERR_IO, "%s is not a regular file", path);
+        return s;
     }
     uint64_t fsize = (uint64_t)stt.st_size;
     if (fsize < 8) {
@@ -315,6 +316,16 @@ static char *join_path(const char *dir, const char *name) {
     return p;
 }
 
+typedef struct shard_ref {
+    const char *name;
+    size_t index;
+} shard_ref;
+static int shard_ref_cmp(const void *pa, const void *pb) {
+    const shard_ref *a = (const shard_ref *)pa, *b = (const shard_ref *)pb;
+    const int c = strcmp(a->name, b->name);
+    return c ? c : (a->index < b->index ? -1 : a->index > b->index);
+}
+
 static rrc_status open_index(const char *index_path, const char *dir, rrc_st_set **out) {
     rrc_json_doc *doc = NULL;
     RRC_CHECK(rrc_json_parse_file(index_path, 0, &doc));
@@ -341,9 +352,28 @@ static rrc_status open_index(const char *index_path, const char *dir, rrc_st_set
                            rrc_json_obj_key(wm, i));
             goto done;
         }
-        size_t k = 0;
-        while (k < n_shards && strcmp(shards[k], fn)) k++;
-        if (k == n_shards) shards[n_shards++] = fn;
+    }
+    /* distinct shard names in order of first appearance: sort (name, index), O(n log n) */
+    {
+        shard_ref *r = (shard_ref *)malloc((n ? n : 1) * sizeof(shard_ref));
+        unsigned char *first = (unsigned char *)calloc(n ? n : 1, 1);
+        if (!r || !first) {
+            free(r);
+            free(first);
+            st = RRC_ERROR(RRC_ERR_OOM, "shard list");
+            goto done;
+        }
+        for (size_t i = 0; i < n; i++) {
+            r[i].name = rrc_json_str(rrc_json_obj_val(wm, i));
+            r[i].index = i;
+        }
+        qsort(r, n, sizeof(shard_ref), shard_ref_cmp);
+        for (size_t i = 0; i < n; i++)
+            if (i == 0 || strcmp(r[i].name, r[i - 1].name)) first[r[i].index] = 1;
+        for (size_t i = 0; i < n; i++)
+            if (first[i]) shards[n_shards++] = rrc_json_str(rrc_json_obj_val(wm, i));
+        free(r);
+        free(first);
     }
     set = (rrc_st_set *)calloc(1, sizeof *set);
     if (!set) {

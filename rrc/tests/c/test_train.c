@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "ops_util.h"
 #include "rrc/offdev.h"
@@ -605,6 +606,179 @@ RT_TEST(train_init_adapter_config_roots) {
     RT_OK(run_cfg(json));
 }
 
+/* PEFT adapter_config.json fields rrc does not implement (review finding: an alpha_pattern changed
+ * the adapter's function, was ignored, and was dropped on save): refused when not empty; the empty
+ * spellings PEFT writes (null, false, {}, []) are accepted. */
+#define ALL7 "[\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\", \"gate_proj\", \"up_proj\", \"down_proj\"]"
+RT_TEST(train_init_adapter_refuses_peft_patterns) {
+    char model[1200], data[1200], out[1200], ad[1200], json[8192], p[1400], q[1400];
+    snprintf(model, sizeof model, "%s", rt_path("pp_model"));
+    snprintf(data, sizeof data, "%s", rt_path("pp.rrcbin"));
+    snprintf(out, sizeof out, "%s", rt_path("pp_out"));
+    snprintf(ad, sizeof ad, "%s", rt_path("pp_adapter"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    const char *common = "\"dtype\": \"f32\", \"seq_len\": 12, \"max_steps\": 1, \"prefetch\": false, "
+                         "\"overwrite_output_dir\": true, \"lora\": {\"r\": 2, \"alpha\": 4}";
+    snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s}", model,
+             data, out, common);
+    RT_OK(run_cfg(json));
+    mkdir(ad, 0755);
+    snprintf(p, sizeof p, "%s/checkpoint-1/adapter_model.safetensors", out);
+    snprintf(q, sizeof q, "%s/adapter_model.safetensors", ad);
+    RT_OK(copy_file(p, q));
+    snprintf(q, sizeof q, "%s/adapter_config.json", ad);
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"init_adapter\": \"%s\", %s}",
+             model, data, out, ad, common);
+    /* the fields of a stock PEFT LoraConfig, all empty, as PEFT writes them */
+    const char *base = "\"r\": 2, \"lora_alpha\": 4, \"peft_type\": \"LORA\", \"bias\": \"none\", "
+                       "\"init_lora_weights\": true, \"target_modules\": " ALL7 "";
+    char cfgtxt[2048];
+    snprintf(cfgtxt, sizeof cfgtxt,
+             "{%s, \"alpha_pattern\": {}, \"rank_pattern\": {}, \"layers_pattern\": null, \"exclude_modules\": null, "
+             "\"layer_replication\": null, \"modules_to_save\": null, \"trainable_token_indices\": null, "
+             "\"target_parameters\": null, \"lora_bias\": false, \"fan_in_fan_out\": false, "
+             "\"alora_invocation_tokens\": null, \"arrow_config\": null, \"use_qalora\": false, \"use_bdlora\": null, "
+             "\"loftq_config\": {}, \"megatron_config\": null}",
+             base);
+    RT_OK(rrc_write_file_atomic(q, cfgtxt, strlen(cfgtxt)));
+    RT_OK(run_cfg(json));
+    const char *bad[][2] = {
+        {"\"alpha_pattern\": {\"q_proj\": 64}", "alpha_pattern"},
+        {"\"rank_pattern\": {\"v_proj\": 4}", "rank_pattern"},
+        {"\"layers_pattern\": \"layers\"", "layers_pattern"},
+        {"\"exclude_modules\": [\"model.layers.0.self_attn.q_proj\"]", "exclude_modules"},
+        {"\"layer_replication\": [[0, 2]]", "layer_replication"},
+        {"\"modules_to_save\": [\"lm_head\"]", "modules_to_save"},
+        {"\"trainable_token_indices\": [1, 2]", "trainable_token_indices"},
+        {"\"target_parameters\": [\"mlp.experts.gate_up_proj\"]", "target_parameters"},
+        {"\"lora_bias\": true", "lora_bias"},
+        {"\"fan_in_fan_out\": true", "fan_in_fan_out"},
+        {"\"alora_invocation_tokens\": [5]", "alora_invocation_tokens"},
+        {"\"use_qalora\": true", "use_qalora"},
+        {"\"init_lora_weights\": \"pissa_niter_4\"", "init_lora_weights"},
+        {"\"init_lora_weights\": \"olora\"", "init_lora_weights"},
+        {"\"peft_type\": \"IA3\"", "peft_type"},
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        /* the bad field last: a duplicate key is a parse error, so build without the base's copy */
+        const char *b2 = strstr(bad[i][0], "init_lora_weights")
+                             ? "\"r\": 2, \"lora_alpha\": 4, \"target_modules\": " ALL7 ""
+                             : strstr(bad[i][0], "peft_type") ? "\"r\": 2, \"lora_alpha\": 4, \"target_modules\": " ALL7 ""
+                                                              : base;
+        snprintf(cfgtxt, sizeof cfgtxt, "{%s, %s}", b2, bad[i][0]);
+        RT_OK(rrc_write_file_atomic(q, cfgtxt, strlen(cfgtxt)));
+        RT_STATUS(run_cfg(json), RRC_ERR_INVALID_ARG);
+        RT_EXPECT(strstr(rrc_last_error(), bad[i][1]) != NULL, "%s: %s", bad[i][0], rrc_last_error());
+    }
+}
+
+/* Checkpoint publishing never removes or writes through a symlink inside output_dir (review
+ * findings: remove_ckpt_dir() deleted a symlinked checkpoint-N's target files; metrics.jsonl.tmp
+ * planted as a symlink redirected the resume's metrics rewrite and later appends), and a fresh run
+ * refuses an output_dir holding another run's checkpoint-* even without metrics.jsonl. */
+#undef ALL7
+
+static int victim_intact(const char *dir) {
+    static const char *const files[] = {"adapter_model.safetensors", "adapter_config.json", "rrc_state.bin"};
+    for (int i = 0; i < 3; i++) {
+        char p[1400], buf[16] = {0};
+        snprintf(p, sizeof p, "%s/%s", dir, files[i]);
+        FILE *f = fopen(p, "rb");
+        if (!f) return 0;
+        const size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (n != 8 || memcmp(buf, "precious", 8)) return 0;
+    }
+    return 1;
+}
+static rrc_status make_victim(const char *dir) {
+    static const char *const files[] = {"adapter_model.safetensors", "adapter_config.json", "rrc_state.bin"};
+    mkdir(dir, 0755);
+    for (int i = 0; i < 3; i++) {
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", dir, files[i]);
+        RRC_CHECK(rrc_write_file_atomic(p, "precious", 8));
+    }
+    return RRC_OK;
+}
+
+RT_TEST(train_checkpoint_paths_do_not_follow_symlinks) {
+    char model[1200], data[1200], out[1200], victim[1200], json[8192], p[1400], q[1400];
+    snprintf(model, sizeof model, "%s", rt_path("sl_model"));
+    snprintf(data, sizeof data, "%s", rt_path("sl.rrcbin"));
+    snprintf(victim, sizeof victim, "%s", rt_path("sl_victim"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    RT_OK(make_victim(victim));
+    const char *common = "\"dtype\": \"f32\", \"seq_len\": 12, \"max_steps\": 2, \"prefetch\": false, "
+                         "\"lora\": {\"r\": 2}";
+#define RUN_TO(dir, extra)                                                                                             \
+    (snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s%s}",     \
+              model, data, dir, common, extra),                                                                       \
+     run_cfg(json))
+    /* a symlink at checkpoint-2, .checkpoint-2.tmp or .checkpoint-2.old (overwrite_output_dir set, so
+     * only the symlink check stands between the run and the victim's files) */
+    const char *names[] = {"checkpoint-2", ".checkpoint-2.tmp", ".checkpoint-2.old"};
+    for (int k = 0; k < 3; k++) {
+        snprintf(out, sizeof out, "%s%d", rt_path("sl_out"), k);
+        mkdir(out, 0755);
+        snprintf(p, sizeof p, "%s/%s", out, names[k]);
+        unlink(p);
+        RT_ASSERT(symlink(victim, p) == 0, "symlink");
+        RT_STATUS(RUN_TO(out, ", \"overwrite_output_dir\": true"), RRC_ERR_IO);
+        RT_EXPECT(strstr(rrc_last_error(), "not a directory") != NULL, "%s: %s", names[k], rrc_last_error());
+        RT_EXPECT(victim_intact(victim), "%s: files outside output_dir were removed", names[k]);
+        struct stat sb;
+        RT_EXPECT(lstat(p, &sb) == 0 && S_ISLNK(sb.st_mode), "%s: the symlink was moved", names[k]);
+    }
+    /* a fresh run into a directory with another run's checkpoint-2 and no metrics.jsonl: refused */
+    snprintf(out, sizeof out, "%s", rt_path("sl_foreign"));
+    mkdir(out, 0755);
+    snprintf(p, sizeof p, "%s/checkpoint-2", out);
+    RT_OK(make_victim(p));
+    RT_STATUS(RUN_TO(out, ""), RRC_ERR_INVALID_ARG);
+    RT_EXPECT(strstr(rrc_last_error(), "already holds a run") && strstr(rrc_last_error(), "overwrite_output_dir"),
+              "%s", rrc_last_error());
+    RT_EXPECT(victim_intact(p), "the other run's checkpoint-2 was replaced");
+    /* a dangling metrics.jsonl symlink counts as a run's output as well */
+    snprintf(out, sizeof out, "%s", rt_path("sl_dangling"));
+    mkdir(out, 0755);
+    snprintf(p, sizeof p, "%s/metrics.jsonl", out);
+    snprintf(q, sizeof q, "%s", rt_path("sl_dangling_target.txt"));
+    unlink(p);
+    unlink(q);
+    RT_ASSERT(symlink(q, p) == 0, "symlink");
+    RT_STATUS(RUN_TO(out, ""), RRC_ERR_INVALID_ARG);
+    /* ... and with overwrite_output_dir, the symlinked metrics.jsonl is not written through */
+    RT_STATUS(RUN_TO(out, ", \"overwrite_output_dir\": true"), RRC_ERR_IO);
+    struct stat sb;
+    RT_EXPECT(lstat(q, &sb) != 0, "a file was created through the metrics.jsonl symlink");
+    /* resume: a planted metrics.jsonl.tmp symlink does not redirect the metrics rewrite */
+    snprintf(out, sizeof out, "%s", rt_path("sl_resume"));
+    RT_OK(RUN_TO(out, ", \"stop_after_step\": 1, \"overwrite_output_dir\": true"));
+    snprintf(p, sizeof p, "%s/metrics.jsonl.tmp", out);
+    snprintf(q, sizeof q, "%s", rt_path("sl_metrics_victim.txt"));
+    RT_OK(rrc_write_file_atomic(q, "precious", 8));
+    unlink(p);
+    RT_ASSERT(symlink(q, p) == 0, "symlink");
+    char extra[2000];
+    snprintf(extra, sizeof extra, ", \"resume_from\": \"%s/checkpoint-1\"", out);
+    RT_OK(RUN_TO(out, extra));
+    {
+        char buf[16] = {0};
+        FILE *f = fopen(q, "rb");
+        RT_ASSERT(f, "victim");
+        const size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        RT_EXPECT(n == 8 && !memcmp(buf, "precious", 8), "the metrics rewrite went through the symlink: '%s'", buf);
+    }
+    snprintf(p, sizeof p, "%s/metrics.jsonl", out);
+    RT_EXPECT(lstat(p, &sb) == 0 && S_ISREG(sb.st_mode), "metrics.jsonl is a regular file after the resume");
+#undef RUN_TO
+}
+
 /* ---- memory pre-flight (DESIGN.md §13) --------------------------------------------------------- */
 
 RT_TEST(train_memory_preflight) {
@@ -816,6 +990,7 @@ const rt_case rt_suite_train[] = {
     RT_CASE(train_end_to_end_stop_and_resume_bit_identical), RT_CASE(train_state_counter_bounds),
     RT_CASE(train_checkpoint_replace_is_failure_safe), RT_CASE(train_resume_output_dir_guard),
     RT_CASE(train_init_adapter_config_roots),         RT_CASE(train_memory_preflight),
-    RT_CASE(train_offdev_bit_identical),
+    RT_CASE(train_offdev_bit_identical),       RT_CASE(train_init_adapter_refuses_peft_patterns),
+    RT_CASE(train_checkpoint_paths_do_not_follow_symlinks),
 };
 const size_t rt_suite_train_n = sizeof rt_suite_train / sizeof rt_suite_train[0];

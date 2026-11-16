@@ -132,10 +132,13 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   tokens per step and trainable parameter count as rrc_bench). Not benchmarks.
 * `make test` also runs the end-to-end checks of `rrc_selftest_host` (kc-emu, tiny llama / qwen2 /
   qwen3 models written in C, logits, loss, LoRA grads, a 20-step trainer run, determinism; JSON
-  report in `build/test_tmp/selftest_host_report.json`) and their two controls: the `jitter`
+  report in `build/test_tmp/selftest_host_report.json`) and their controls: the `jitter`
   device (correct, rounds differently) must PASS, the `fault` device (attention backward off by
-  1e-3) must FAIL. With `CUDA_HOME` the HOST-ONLY part adds the staging-ring tests, the end-to-end
-  checks through the real `cuda/*.cu` (tiny qwen3) and `rrc_bench`'s CUDA main on the fake runtime.
+  1e-3) must FAIL the f32 checks, and at the full GPU size in bf16 (where the anchored tolerance is
+  capped, DESIGN.md §15.1) the jitter device must PASS and a 10% fault must FAIL the grad check of
+  every family. With `CUDA_HOME` the HOST-ONLY part adds the staging-ring tests, the small-ring pass
+  of `rrc_selftest` (`--only h2d_ring`), the end-to-end checks through the real `cuda/*.cu` (tiny
+  qwen3) and `rrc_bench`'s CUDA main on the fake runtime.
 * `make -C rrc asan` — `make test` under AddressSanitizer + UBSan (build/asan): the C tests,
   `rrc_selftest_host` and its negative checks, and with `CUDA_HOME` the HOST-ONLY `cuda-host-test`.
 * `make -C rrc tsan` — the `data` and `train` C suites (prefetch thread next to the training loop)
@@ -146,12 +149,18 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   assembles the compile-only toolkit with `tools/fetch_cuda_toolkit.sh` (package downloads cached,
   every file sha256-checked), then `make cuda-objs cuda` (COMPILED-ONLY) and `make test CUDA_HOME=...`
   (nvcc header check + HOST-ONLY `cuda-host-test`). No CI job has a GPU.
+* Run the test commands one at a time (serially). The CPU backend uses OpenMP with one thread per
+  core by default; two OpenMP processes sharing the cores oversubscribe them and slow down by far
+  more than 2x (measured on a 4-core machine: one `rrc_selftest_host --only e2e --e2e-filter
+  qwen3/f32` 2.3 s alone, two concurrent ones 139 s; with `OMP_NUM_THREADS=2` each, 2.5 s). When
+  something else runs next to a CPU-backend job (another test run, `rrc_train` on the CPU backend,
+  `pytest -n`), give each process its share with `OMP_NUM_THREADS`.
 
 ## Tools
 
 * `build/rrc_inspect [--config-only] [--allow-unknown-keys] [--positions p0,p1,...] <model_dir>`
   prints the derived config, RoPE frequencies/tables, expected tensors, checkpoint tensors and
-  the tensor-set check as JSON.
+  the tensor-set check as JSON (positions are table rows: each < 2³¹ − 1, else a usage error).
 * `build/rrc_fwdbwd --model DIR --batch FILE --out FILE [--lora adapter_model.safetensors] [--dtype f32|bf16]
   [--backend cpu|cpu-f32acc] [--r N --alpha X --targets q_proj,... --layers 0,1] [--attn-chunk N]
   [--ce-chunk N] [--reduction window_tokens|microbatch_mean] [--logits] [--hidden]` runs forward +
@@ -205,7 +214,25 @@ rrc/build/rrc_train --print-default-config                 # every field with it
 including the end-of-turn marker the template puts inside the turn, are targets; the template must
 be prefix-stable or the example is refused) or `{"prompt": str, "completion": str}` (prompt with the
 tokenizer's special tokens, completion without, then EOS unless `--no-eos`; completion + EOS are the
-targets). Other keys are refused. `--vocab-size` overrides the header's `len(tokenizer)`.
+targets). Other keys are refused. `--vocab-size` overrides the header's `len(tokenizer)`. A refused
+example stops the conversion (exit status 2, a one-line `prepare_sft: error: example N: ...`, no
+output file); `--skip-refused` instead skips the conversations the template cannot mask, counts
+them (`skipped_refused` in the summary) and warns once.
+
+Chat templates of the target families (checked offline against TRL's `assistant_only_loss`
+masks, `return_assistant_tokens_mask=True` with TRL's training templates):
+
+* Qwen3: the stock template is **not** prefix-stable for multi-turn conversations: it writes an
+  empty `<think>\n\n</think>\n\n` block only into assistant turns after the last user message, so
+  every [user, assistant, user, assistant] conversation is refused. Pass a prefix-preserving
+  training template, e.g. TRL's `trl/chat_templates/qwen3_training.jinja`, with `--chat-template`
+  (its masks equal TRL's exactly on single-turn, multi-turn and thinking conversations).
+  Single-turn conversations work with the stock template.
+* Llama-3 / 3.1 and Qwen2.5: the stock templates are prefix-stable. Qwen2.5's masks differ from
+  TRL's `qwen2_5_training.jinja` by one token per assistant turn: TRL also labels the `\n` right
+  after `<|im_start|>assistant`, rrc does not (it is part of the generation prompt); the token ids
+  are identical and the `\n` after `<|im_end|>` is labelled by both. The effect on training is one
+  label per turn; no change is planned.
 
 `.rrcbin` (little-endian, no padding): bytes 0–7 `RRCBIN01`, 8–15 u64 `num_docs` (≥ 1), 16–23 u64
 `vocab_size` (1 … 2³¹−1), 24–31 u64 `total_tokens`, then per document u32 `len` (≥ 1), u32
@@ -272,9 +299,9 @@ out-of-range values. Required: `model_dir`, `data_path`, `output_dir`, `seq_len`
 | `model_dir` | required | HF checkpoint directory (config.json + safetensors, single or sharded) |
 | `data_path` | required | `.rrcbin` file from `prepare_sft.py` |
 | `output_dir` | required | metrics, checkpoints (created if missing) |
-| `init_adapter` | null | start from these LoRA weights: an `adapter_model.safetensors` file or a PEFT adapter directory (its `adapter_config.json` must agree with `lora`); null: rrc's seeded init (A uniform, B = 0) |
+| `init_adapter` | null | start from these LoRA weights: an `adapter_model.safetensors` file or a PEFT adapter directory (its `adapter_config.json` must agree with `lora`, and PEFT fields rrc does not implement must be empty: `alpha_pattern`, `rank_pattern`, `layers_pattern`, `exclude_modules`, `layer_replication`, `modules_to_save`, `trainable_token_indices`, `target_parameters`, `lora_bias`, `fan_in_fan_out`, `alora_invocation_tokens`, `arrow_config`, `use_qalora`, `use_bdlora`; `peft_type` LORA; no base-rewriting `init_lora_weights` such as `pissa` / `olora` / `corda` / `loftq`); null: rrc's seeded init (A uniform, B = 0) |
 | `resume_from` | null | a `checkpoint-<K>` directory to continue from (exclusive with `init_adapter`); `output_dir` must be that checkpoint's directory, an empty one, or `overwrite_output_dir` must be set |
-| `overwrite_output_dir` | false | allow a fresh run where `metrics.jsonl` already exists (it is truncated), or a resume into a directory holding another run's `metrics.jsonl` / `checkpoint-*` (metrics start afresh); checkpoints the run does not write are kept |
+| `overwrite_output_dir` | false | allow a fresh run, or a resume into another directory, where `output_dir` already holds a run (`metrics.jsonl`, or any `checkpoint-*` entry, even without metrics): `metrics.jsonl` is truncated (metrics start afresh) and a `checkpoint-N` of a step this run saves is replaced; checkpoints the run does not write are kept. Without it such a directory is refused. Checkpoint paths inside `output_dir` (`checkpoint-N`, `.checkpoint-N.tmp`, `.checkpoint-N.old`) that are symlinks or files are refused before anything is renamed or removed, and `metrics.jsonl` and every temporary file are created without following a symlink |
 | `dtype` | `"bf16"` | base weights / activations: `"bf16"` or `"f32"` (LoRA, grads, AdamW are always fp32) |
 | `backend` | `"cpu"` | `"cpu"` (double accumulation), `"cpu-f32acc"` (fp32 accumulation) or `"cuda"` (only in `build/rrc_train_cuda` from `make cuda`; `build/rrc_train` refuses it before creating anything). Part of the resume fingerprint: a checkpoint resumes only on the backend it was written with |
 | `seq_len` | required | tokens per packed row (≤ the model's positions) |

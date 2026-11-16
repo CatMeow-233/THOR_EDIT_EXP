@@ -961,3 +961,59 @@ def test_offdev_backend_other_paths(case, tiny, fwdbwd, tmp_path):
         assert rest == pa.stderr.splitlines()
     else:
         assert a is not None and a == b
+
+
+# --------------------------------------------------------------------------------------------
+# a transformers-4.x-style config.json (top-level rope_theta, rope_scaling llama3 dict, torch_dtype,
+# eos_token_id list) loaded by both sides and compared past original_max_position_embeddings
+# (review finding: only 5.x-saved configs, which carry rope_parameters / dtype, were run end to end)
+# --------------------------------------------------------------------------------------------
+
+
+def test_llama3_rope_4x_style_config_matches_hf_past_original_max_positions(tiny, fwdbwd, tmp_path):
+    import shutil
+
+    from transformers import AutoModelForCausalLM
+
+    src = tiny("llama3_rope")
+    cfg5 = json.loads((src / "config.json").read_text())
+    rp = cfg5["rope_parameters"]
+    assert rp["rope_type"] == "llama3"
+    omp = rp["original_max_position_embeddings"]
+    cfg4 = {k: v for k, v in cfg5.items() if k not in ("rope_parameters", "dtype", "transformers_version")}
+    cfg4.update(
+        rope_theta=rp["rope_theta"],
+        rope_scaling=dict(factor=rp["factor"], low_freq_factor=rp["low_freq_factor"],
+                          high_freq_factor=rp["high_freq_factor"], original_max_position_embeddings=omp,
+                          rope_type="llama3"),
+        torch_dtype="float32",
+        eos_token_id=[1, 2],
+        transformers_version="4.43.0",
+    )
+    d4 = tmp_path / "llama3_4x"
+    shutil.copytree(src, d4)
+    (d4 / "config.json").write_text(json.dumps(cfg4))
+    # the same weights with default RoPE: the llama3 scaling must matter at these positions
+    d_def = tmp_path / "llama3_4x_default_rope"
+    shutil.copytree(src, d_def)
+    cfg_def = {k: v for k, v in cfg4.items() if k != "rope_scaling"}
+    (d_def / "config.json").write_text(json.dumps(cfg_def))
+
+    t_len = 200  # positions 0..199, past omp / low_freq_factor = 64
+    assert t_len > omp / rp["low_freq_factor"] and t_len <= cfg5["max_position_embeddings"]
+    hf = AutoModelForCausalLM.from_pretrained(d4, dtype=torch.float32, attn_implementation="eager").eval()
+    assert hf.config.rope_parameters["rope_type"] == "llama3", hf.config.rope_parameters
+    g = torch.Generator().manual_seed(11)
+    ids = torch.randint(0, VOCAB, (1, t_len), generator=g)
+    with torch.no_grad():
+        ref = hf(input_ids=ids).logits
+    safetensors_torch.save_file({"tokens": ids.to(torch.int32), "labels": ids.to(torch.int32)}, str(tmp_path / "b"))
+    out, _ = run_rrc(fwdbwd, d4, tmp_path / "b", tmp_path / "o", lora="none")
+    got = out["logits"][0].reshape(1, t_len, VOCAB)
+    tail = slice(omp, t_len)
+    err = (got[:, tail] - ref[:, tail]).abs().max().item()
+    assert err < 5e-5, err
+    assert (got - ref).abs().max().item() < 5e-5
+    out_def, _ = run_rrc(fwdbwd, d_def, tmp_path / "b", tmp_path / "o_def", lora="none")
+    diff_def = (out_def["logits"][0].reshape(1, t_len, VOCAB)[:, tail] - ref[:, tail]).abs().max().item()
+    assert diff_def > 100 * max(err, 1e-6), (diff_def, err)

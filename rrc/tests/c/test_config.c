@@ -370,9 +370,86 @@ RT_TEST(config_load_file) {
     RT_EXPECT(strstr(rrc_last_error(), "config.json") != NULL, "path in message: %s", rrc_last_error());
 }
 
+/* Upper bounds on untrusted sizes (review finding: a num_hidden_layers of 11^-1 mod 2^64 wrapped the
+ * size_t spec count of rrc_config_expected_tensors to 4 and the layer loop wrote past the array;
+ * dims of 2^62 overflowed the signed weight-size products). */
+RT_TEST(config_upper_bounds) {
+    typedef struct {
+        const char *json;
+        const char *needle;
+    } bound_case;
+#define Q3 "\"model_type\": \"qwen3\", \"vocab_size\": 128, \"hidden_size\": 64, \"intermediate_size\": 128, " \
+           "\"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"head_dim\": 16"
+    static const bound_case cases[] = {
+        {"{" Q3 ", \"num_hidden_layers\": 3353953467947191203}", "num_hidden_layers"}, /* 1 + L*11 + 2 wraps to 4 */
+        {"{" Q3 ", \"num_hidden_layers\": 1025}", "num_hidden_layers"},
+        {"{\"model_type\": \"qwen3\", \"hidden_size\": 4611686018427387904, \"num_hidden_layers\": 2}", "hidden_size"},
+        {"{\"model_type\": \"qwen3\", \"vocab_size\": 2147483648, \"num_hidden_layers\": 2}", "vocab_size"},
+        {"{\"model_type\": \"qwen3\", \"intermediate_size\": 9223372036854775807, \"num_hidden_layers\": 2}",
+         "intermediate_size"},
+        {"{\"model_type\": \"qwen3\", \"head_dim\": 4611686018427387904, \"num_hidden_layers\": 2}", "head_dim"},
+        {"{\"model_type\": \"llama\", \"num_attention_heads\": 4294967296, \"num_key_value_heads\": 1}",
+         "num_attention_heads"},
+        {"{\"model_type\": \"llama\", \"num_key_value_heads\": 4294967296}", "num_key_value_heads"},
+        /* every dim in range, the products not: 2^31-1 heads x 2^31-2 head_dim, and a 2^41-element model */
+        {"{\"model_type\": \"qwen3\", \"num_attention_heads\": 2147483647, \"num_key_value_heads\": 1, "
+         "\"head_dim\": 2147483646, \"num_hidden_layers\": 2}",
+         "weight element count"},
+        {"{\"model_type\": \"qwen3\", \"vocab_size\": 2147483647, \"hidden_size\": 1048576, \"num_hidden_layers\": 1, "
+         "\"intermediate_size\": 16, \"num_attention_heads\": 1, \"num_key_value_heads\": 1, \"head_dim\": 16}",
+         "weight elements"},
+    };
+#undef Q3
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        rrc_model_config c;
+        rrc_clear_error();
+        rrc_status s = parse_cfg(cases[i].json, 0, &c);
+        RT_EXPECT(s == RRC_ERR_UNSUPPORTED || s == RRC_ERR_SHAPE, "case %zu: got %s (%s)", i, rrc_status_str(s),
+                  rrc_last_error());
+        RT_EXPECT(strstr(rrc_last_error(), cases[i].needle) != NULL, "case %zu: message lacks '%s': %s", i,
+                  cases[i].needle, rrc_last_error());
+    }
+    /* the limits themselves are accepted */
+    rrc_model_config c;
+    RT_OK(parse_cfg("{\"model_type\": \"qwen3\", \"vocab_size\": 128, \"hidden_size\": 64, \"intermediate_size\": 128, "
+                    "\"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"head_dim\": 16, \"num_hidden_layers\": 1024}",
+                    0, &c));
+    RT_EXPECT(c.num_layers == RRC_CONFIG_MAX_LAYERS, "1024 layers");
+    /* rrc_config_expected_tensors bounds a config that did not come from the parser */
+    rrc_tensor_spec *specs = NULL;
+    size_t n = 0;
+    rrc_model_config h = c;
+    h.num_layers = (int64_t)3353953467947191203LL;
+    RT_STATUS(rrc_config_expected_tensors(&h, &specs, &n), RRC_ERR_SHAPE);
+    RT_EXPECT(specs == NULL, "no specs");
+    h = c;
+    h.num_layers = 2;
+    h.hidden_size = (int64_t)1 << 62;
+    RT_STATUS(rrc_config_expected_tensors(&h, &specs, &n), RRC_ERR_SHAPE);
+    h = c;
+    h.num_layers = 2;
+    h.num_heads = 4;
+    h.head_dim = (int64_t)1 << 62; /* num_heads * head_dim overflows */
+    RT_STATUS(rrc_config_expected_tensors(&h, &specs, &n), RRC_ERR_SHAPE);
+}
+
+/* qwen2 use_mrope (review finding: refused as an unknown key, so a no-op "use_mrope": false made
+ * rrc_train refuse the checkpoint): false / null are accepted, true is refused. */
+RT_TEST(config_qwen2_use_mrope) {
+    rrc_model_config c;
+    RT_OK(parse_cfg("{\"model_type\": \"qwen2\", \"use_mrope\": false, " TINY "}", 0, &c));
+    RT_OK(parse_cfg("{\"model_type\": \"qwen2\", \"use_mrope\": null, " TINY "}", 0, &c));
+    RT_STATUS(parse_cfg("{\"model_type\": \"qwen2\", \"use_mrope\": true, " TINY "}", 0, &c), RRC_ERR_UNSUPPORTED);
+    RT_EXPECT(strstr(rrc_last_error(), "use_mrope") != NULL, "%s", rrc_last_error());
+    RT_STATUS(parse_cfg("{\"model_type\": \"qwen2\", \"use_mrope\": 1, " TINY "}", 0, &c), RRC_ERR_PARSE);
+    /* other families still refuse it as unknown */
+    RT_STATUS(parse_cfg("{\"model_type\": \"qwen3\", \"use_mrope\": false, " TINY "}", 0, &c), RRC_ERR_UNSUPPORTED);
+    RT_EXPECT(strstr(rrc_last_error(), "unknown key") != NULL, "%s", rrc_last_error());
+}
+
 const rt_case rt_suite_config[] = {
     RT_CASE(config_llama_defaults), RT_CASE(config_qwen_defaults),    RT_CASE(config_rope_spellings),
     RT_CASE(config_refusals),       RT_CASE(config_inv_freq),         RT_CASE(config_expected_tensors),
-    RT_CASE(config_load_file),
+    RT_CASE(config_load_file),      RT_CASE(config_upper_bounds),     RT_CASE(config_qwen2_use_mrope),
 };
 const size_t rt_suite_config_n = sizeof rt_suite_config / sizeof rt_suite_config[0];

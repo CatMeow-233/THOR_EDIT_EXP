@@ -1,5 +1,6 @@
 /* rrc/src/json.c — strict JSON parser (DOM in an arena) and writer. See json.h for the rules. */
 #include "rrc/json.h"
+#include "rrc/fileio.h"
 
 #include <errno.h>
 #include <math.h>
@@ -408,10 +409,49 @@ done:
     return st;
 }
 
+/* Duplicate keys: objects with up to DUP_LINEAR_MAX keys are checked as each key is read (linear
+ * scan); a larger object (a safetensors header holds one key per tensor) is checked once at its end
+ * by sorting (key, position), O(n log n) instead of O(n^2). Both report the earliest repeated
+ * occurrence, at its offset. */
+#define DUP_LINEAR_MAX 16
+typedef struct key_ref {
+    const char *key;
+    size_t len;
+    const unsigned char *at; /* position of the key in the input */
+} key_ref;
+static int key_ref_cmp(const void *pa, const void *pb) {
+    const key_ref *a = (const key_ref *)pa, *b = (const key_ref *)pb;
+    const size_t n = a->len < b->len ? a->len : b->len;
+    const int c = memcmp(a->key, b->key, n);
+    if (c) return c;
+    if (a->len != b->len) return a->len < b->len ? -1 : 1;
+    return a->at < b->at ? -1 : a->at > b->at;
+}
+static rrc_status check_dup_sorted(parser *ps, const pvec *keys, const pvec *lens, const pvec *ats) {
+    key_ref *r = (key_ref *)malloc(keys->n * sizeof(key_ref));
+    if (!r) return RRC_ERROR(RRC_ERR_OOM, "JSON object");
+    for (size_t i = 0; i < keys->n; i++) {
+        r[i].key = (const char *)keys->items[i];
+        r[i].len = (size_t)(uintptr_t)lens->items[i];
+        r[i].at = (const unsigned char *)ats->items[i];
+    }
+    qsort(r, keys->n, sizeof(key_ref), key_ref_cmp);
+    const key_ref *first = NULL; /* the earliest second occurrence of any key */
+    for (size_t i = 1; i < keys->n; i++)
+        if (r[i].len == r[i - 1].len && !memcmp(r[i].key, r[i - 1].key, r[i].len) &&
+            (i < 2 || r[i - 1].len != r[i - 2].len || memcmp(r[i - 1].key, r[i - 2].key, r[i].len)) &&
+            (!first || r[i].at < first->at))
+            first = &r[i];
+    rrc_status st = RRC_OK;
+    if (first) st = PERR(ps, first->at, "duplicate key \"%s\"", first->key);
+    free(r);
+    return st;
+}
+
 static rrc_status parse_object(parser *ps, rrc_json **out) {
     const unsigned char *start = ps->p;
     ps->p++;
-    pvec keys = {0}, lens = {0}, vals = {0};
+    pvec keys = {0}, lens = {0}, vals = {0}, ats = {0};
     rrc_status st = RRC_OK;
     skip_ws(ps);
     if (ps->p < ps->end && *ps->p == '}') {
@@ -428,7 +468,7 @@ static rrc_status parse_object(parser *ps, rrc_json **out) {
             const char *key;
             size_t klen;
             if ((st = parse_string(ps, &key, &klen)) != RRC_OK) goto done;
-            for (size_t i = 0; i < keys.n; i++) {
+            for (size_t i = 0; keys.n < DUP_LINEAR_MAX && i < keys.n; i++) {
                 if ((size_t)(uintptr_t)lens.items[i] == klen && memcmp(keys.items[i], key, klen) == 0) {
                     st = PERR(ps, key_at, "duplicate key \"%s\"", key);
                     goto done;
@@ -444,7 +484,7 @@ static rrc_status parse_object(parser *ps, rrc_json **out) {
             rrc_json *val = NULL;
             if ((st = parse_value(ps, &val)) != RRC_OK) goto done;
             if (!pvec_push(&keys, (void *)key) || !pvec_push(&lens, (void *)(uintptr_t)klen) ||
-                !pvec_push(&vals, val)) {
+                !pvec_push(&vals, val) || !pvec_push(&ats, (void *)(uintptr_t)key_at)) {
                 st = RRC_ERROR(RRC_ERR_OOM, "JSON object");
                 goto done;
             }
@@ -465,6 +505,7 @@ static rrc_status parse_object(parser *ps, rrc_json **out) {
             goto done;
         }
     }
+    if (keys.n > DUP_LINEAR_MAX && (st = check_dup_sorted(ps, &keys, &lens, &ats)) != RRC_OK) goto done;
     {
         rrc_json *node = new_node(ps, RRC_JSON_OBJECT);
         if (!node) {
@@ -493,6 +534,7 @@ done:
     free(keys.items);
     free(lens.items);
     free(vals.items);
+    free(ats.items);
     return st;
 }
 
@@ -594,12 +636,13 @@ rrc_status rrc_json_parse_file(const char *path, size_t max_bytes, rrc_json_doc 
     RRC_REQUIRE(path && out, RRC_ERR_INVALID_ARG, "null argument");
     *out = NULL;
     if (max_bytes == 0) max_bytes = (size_t)256 << 20;
-    FILE *f = fopen(path, "rb");
-    if (!f) return RRC_ERROR(errno == ENOENT ? RRC_ERR_NOT_FOUND : RRC_ERR_IO, "cannot open %s: %s", path, strerror(errno));
+    FILE *f = NULL;
+    RRC_CHECK(rrc_fopen_regular(path, &f));
     struct stat stt;
-    if (fstat(fileno(f), &stt) != 0 || !S_ISREG(stt.st_mode)) {
+    if (fstat(fileno(f), &stt) != 0) {
+        rrc_status s = RRC_ERROR(RRC_ERR_IO, "fstat %s: %s", path, strerror(errno));
         fclose(f);
-        return RRC_ERROR(RRC_ERR_IO, "%s is not a regular file", path);
+        return s;
     }
     if ((uint64_t)stt.st_size > (uint64_t)max_bytes) {
         fclose(f);
@@ -896,11 +939,11 @@ rrc_status rrc_write_file_atomic(const char *path, const void *data, size_t len)
     if (!tmp) return RRC_ERROR(RRC_ERR_OOM, "path");
     memcpy(tmp, path, pl);
     memcpy(tmp + pl, ".tmp", 5);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) {
-        rrc_status st = RRC_ERROR(RRC_ERR_IO, "cannot create %s: %s", tmp, strerror(errno));
+    FILE *f = NULL;
+    rrc_status cs = rrc_create_new_file(tmp, &f);
+    if (cs != RRC_OK) {
         free(tmp);
-        return st;
+        return cs;
     }
     size_t w = len ? fwrite(data, 1, len, f) : 0;
     int ok = (w == len) && fflush(f) == 0;

@@ -5,9 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include "rrc/config.h"
+#include "rrc/data.h"
+#include "rrc/fileio.h"
 #include "rrc/json.h"
 #include "rrc/safetensors.h"
+#include "rrc/train.h"
 #include "rt.h"
 
 /* Write a raw safetensors file: 8-byte length (or `hlen_override` if >= 0), header, data. */
@@ -431,8 +436,75 @@ RT_TEST(st_python_interop) {
     RT_EXPECT(system(cmd) == 0, "python could not read the rrc-written file (%s)", cmd);
 }
 
+/* Input files that are FIFOs (review finding: open() ran before the regular-file check, so a FIFO
+ * named model.safetensors or config.json blocked the program forever). alarm(): a regression fails
+ * the run instead of hanging it. */
+RT_TEST(inputs_refuse_fifo_without_blocking) {
+    const char *dir = rt_path("fifo_dir");
+    mkdir(dir, 0755);
+    char fifo[1400], cfgp[1400];
+    snprintf(fifo, sizeof fifo, "%s/model.safetensors", dir);
+    snprintf(cfgp, sizeof cfgp, "%s/config.json", dir);
+    unlink(fifo);
+    unlink(cfgp);
+    RT_ASSERT(mkfifo(fifo, 0644) == 0 && mkfifo(cfgp, 0644) == 0, "mkfifo");
+    alarm(60);
+    rrc_st_set *set = NULL;
+    RT_STATUS(rrc_st_open_file(fifo, &set), RRC_ERR_IO);
+    RT_EXPECT(strstr(rrc_last_error(), "not a regular file") != NULL, "%s", rrc_last_error());
+    RT_STATUS(rrc_st_open_checkpoint(dir, &set), RRC_ERR_IO);
+    rrc_json_doc *doc = NULL;
+    RT_STATUS(rrc_json_parse_file(cfgp, 0, &doc), RRC_ERR_IO);
+    rrc_model_config c;
+    RT_STATUS(rrc_config_load(dir, 0, &c), RRC_ERR_IO);
+    rrc_dataset *d = NULL;
+    RT_STATUS(rrc_dataset_open(fifo, 24, &d), RRC_ERR_IO);
+    rrc_train_state ts;
+    RT_STATUS(rrc_train_state_read(fifo, &ts), RRC_ERR_IO);
+    static rrc_train_config tc;
+    RT_STATUS(rrc_train_config_load(cfgp, &tc), RRC_ERR_IO);
+    RT_EXPECT(strstr(rrc_last_error(), "not a regular file") != NULL, "%s", rrc_last_error());
+    alarm(0);
+    /* a missing file is still NOT_FOUND */
+    RT_STATUS(rrc_json_parse_file(rt_path("fifo_dir_missing.json"), 0, &doc), RRC_ERR_NOT_FOUND);
+    unlink(fifo);
+    unlink(cfgp);
+}
+
+/* Temporary files of atomic writes are created fresh (review finding: fopen(path.tmp, "wb") followed
+ * a planted symlink and overwrote its target). */
+RT_TEST(atomic_write_does_not_follow_tmp_symlink) {
+    const char *victim = rt_path("symlink_victim.txt");
+    const char *target = rt_path("symlink_target.json");
+    char tmp[1400];
+    snprintf(tmp, sizeof tmp, "%s.tmp", target);
+    RT_OK(rrc_write_file_atomic(victim, "precious", 8));
+    unlink(tmp);
+    RT_ASSERT(symlink(victim, tmp) == 0, "symlink");
+    RT_OK(rrc_write_file_atomic(target, "{}", 2));
+    char buf[32] = {0};
+    FILE *f = fopen(victim, "rb");
+    RT_ASSERT(f, "victim");
+    const size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    RT_EXPECT(n == 8 && !memcmp(buf, "precious", 8), "the symlink target was overwritten: '%s'", buf);
+    struct stat sb;
+    RT_EXPECT(lstat(target, &sb) == 0 && S_ISREG(sb.st_mode), "target is a regular file");
+    RT_EXPECT(lstat(tmp, &sb) != 0, "no .tmp left");
+    /* rrc_fopen_output_nofollow refuses a symlink, rrc_create_new_file replaces it */
+    RT_ASSERT(symlink(victim, tmp) == 0, "symlink");
+    FILE *o = NULL;
+    RT_STATUS(rrc_fopen_output_nofollow(tmp, 0, &o), RRC_ERR_IO);
+    RT_STATUS(rrc_fopen_output_nofollow(tmp, 1, &o), RRC_ERR_IO);
+    RT_OK(rrc_create_new_file(tmp, &o));
+    fclose(o);
+    RT_EXPECT(lstat(tmp, &sb) == 0 && S_ISREG(sb.st_mode), "created as a regular file");
+    unlink(tmp);
+}
+
 const rt_case rt_suite_safetensors[] = {
     RT_CASE(st_roundtrip),     RT_CASE(st_rejects_malformed),     RT_CASE(st_sharded),
     RT_CASE(st_f16_exhaustive), RT_CASE(st_i64_and_f16_conversion), RT_CASE(st_python_interop),
+    RT_CASE(inputs_refuse_fifo_without_blocking), RT_CASE(atomic_write_does_not_follow_tmp_symlink),
 };
 const size_t rt_suite_safetensors_n = sizeof rt_suite_safetensors / sizeof rt_suite_safetensors[0];

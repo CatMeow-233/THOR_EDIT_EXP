@@ -1,6 +1,8 @@
 /* Tests for the strict JSON parser and the writer. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "rrc/json.h"
 #include "rt.h"
@@ -332,9 +334,90 @@ RT_TEST(json_file_io) {
     RT_EXPECT(strstr(rrc_last_error(), "j.json") != NULL, "file name in message: %s", rrc_last_error());
 }
 
+static double mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+/* Builds {"k0000000": i, ...} with n keys; key `dup_of` (>= 0) is repeated as the key at `dup_at`. */
+static char *big_object(size_t n, long dup_at, long dup_of, size_t *len) {
+    char *b = (char *)malloc(n * 16 + 16);
+    if (!b) return NULL;
+    size_t k = 0;
+    b[k++] = '{';
+    for (size_t i = 0; i < n; i++) {
+        const size_t key = (long)i == dup_at ? (size_t)dup_of : i;
+        k += (size_t)sprintf(b + k, "%s\"k%07zu\":%zu", i ? "," : "", key, i % 10);
+    }
+    b[k++] = '}';
+    b[k] = '\0';
+    *len = k;
+    return b;
+}
+
+/* Duplicate keys in large objects (review finding: the per-key linear scan made a 200k-entry
+ * safetensors header take minutes): detected at the same key and offset as before, and the parse is
+ * near-linear. */
+RT_TEST(json_duplicate_keys_large_objects) {
+    rrc_json_doc *doc = NULL;
+    /* small objects: the first repeated occurrence, at its offset */
+    RT_STATUS(parse_cstr("{\"a\": 1, \"b\": 2, \"a\": 3}", &doc), RRC_ERR_PARSE);
+    RT_EXPECT(strstr(rrc_last_error(), "duplicate key \"a\"") && strstr(rrc_last_error(), "1:18:"), "%s",
+              rrc_last_error());
+    /* sizes around the linear / sorted switch, duplicate early, late, and several (earliest reported) */
+    const size_t sizes[] = {15, 16, 17, 18, 100, 5000};
+    for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+        const size_t n = sizes[si];
+        size_t len = 0;
+        char *b = big_object(n, -1, -1, &len);
+        RT_ASSERT(b, "oom");
+        RT_OK(rrc_json_parse(b, len, &doc));
+        RT_EXPECT(rrc_json_obj_count(rrc_json_root(doc)) == n, "count");
+        rrc_json_doc_free(doc);
+        free(b);
+        const long at[][2] = {{1, 0}, {(long)n - 1, 0}, {(long)n - 1, (long)n - 2}, {(long)n / 2, 1}};
+        for (int c = 0; c < 4; c++) {
+            b = big_object(n, at[c][0], at[c][1], &len);
+            RT_ASSERT(b, "oom");
+            char want[64];
+            snprintf(want, sizeof want, "duplicate key \"k%07ld\"", at[c][1]);
+            /* key i starts at byte 1 + 13 i (strlen("\"k0000000\":d,") = 13): line 1, column 2 + 13 i */
+            char off[64];
+            snprintf(off, sizeof off, "1:%ld:", 2 + 13 * at[c][0]);
+            RT_STATUS(rrc_json_parse(b, len, &doc), RRC_ERR_PARSE);
+            RT_EXPECT(strstr(rrc_last_error(), want) && strstr(rrc_last_error(), off), "n %zu case %d: want %s at %s: %s",
+                      n, c, want, off, rrc_last_error());
+            free(b);
+        }
+    }
+    {
+        /* two different repeated keys: the one repeated first in the input is reported */
+        size_t len = 0;
+        char *b = big_object(40, 30, 3, &len);
+        RT_ASSERT(b, "oom");
+        memcpy(b + 1 + 13 * 20 + 2, "0000007", 7); /* key 20 -> k0000007 (repeats earlier than key 30) */
+        RT_STATUS(rrc_json_parse(b, len, &doc), RRC_ERR_PARSE);
+        RT_EXPECT(strstr(rrc_last_error(), "duplicate key \"k0000007\"") != NULL, "%s", rrc_last_error());
+        free(b);
+    }
+    /* 300k keys (about 3.6 MB, a safetensors header is allowed up to 100 MB): with the quadratic scan
+     * this took minutes; the bound is generous for sanitizer builds */
+    size_t len = 0;
+    char *b = big_object(300000, -1, -1, &len);
+    RT_ASSERT(b, "oom");
+    const double t0 = mono_s();
+    RT_OK(rrc_json_parse(b, len, &doc));
+    const double dt = mono_s() - t0;
+    rrc_json_doc_free(doc);
+    free(b);
+    RT_EXPECT(dt < 20.0, "300k-key object took %.1f s to parse", dt);
+}
+
 const rt_case rt_suite_json[] = {
     RT_CASE(json_basic_types),   RT_CASE(json_embedded_nul_and_escapes), RT_CASE(json_rejects_malformed),
     RT_CASE(json_error_position), RT_CASE(json_depth_limit),             RT_CASE(json_mutation_fuzz),
     RT_CASE(json_writer_roundtrip), RT_CASE(json_writer_misuse),         RT_CASE(json_file_io),
+    RT_CASE(json_duplicate_keys_large_objects),
 };
 const size_t rt_suite_json_n = sizeof rt_suite_json / sizeof rt_suite_json[0];

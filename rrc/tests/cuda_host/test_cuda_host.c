@@ -40,9 +40,20 @@ static int g_fail = 0, g_checks = 0;
         }                                                                                               \
     } while (0)
 
+/* rrc_cuda_options_default reads RRC_CUDA_SYNC_EACH_OP, RRC_CUDA_ALLOW_TF32 and
+ * RRC_CUDA_H2D_STAGING_BYTES: the tests pin every such option, so the caller's environment cannot
+ * change what they measure (review finding: RRC_CUDA_SYNC_EACH_OP=1 failed the deferred-error test). */
+static void pin_env_options(rrc_cuda_options *o) {
+    o->sync_each_op = 0;
+    o->allow_tf32 = 0;
+    o->h2d_staging_bytes = (size_t)32 << 20;
+    o->h2d_staging_slots = 4;
+}
+
 static const rrc_backend *make_be(unsigned max_grid, int64_t scratch_cap) {
     rrc_cuda_options o;
     rrc_cuda_options_default(&o);
+    pin_env_options(&o);
     o.max_grid_blocks = max_grid;
     if (scratch_cap > 0) o.gemm_scratch_cap_elems = scratch_cap;
     const rrc_backend *be = NULL;
@@ -238,6 +249,7 @@ static void t_harness_through_backend(void) {
 static const rrc_backend *make_be_staging(size_t bytes, int slots, int sync_each) {
     rrc_cuda_options o;
     rrc_cuda_options_default(&o);
+    pin_env_options(&o);
     o.h2d_staging_bytes = bytes;
     o.h2d_staging_slots = slots;
     o.sync_each_op = sync_each;
