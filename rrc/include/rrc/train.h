@@ -120,7 +120,16 @@ typedef struct rrc_train_config {
     int64_t save_steps;      /* 0: only the final checkpoint */
     int64_t stop_after_step; /* 0: run to max_steps; else checkpoint and stop after this step */
     int dump_batches;        /* write output_dir/batches/step-N.safetensors (tests, debugging) */
+    /* Memory pre-flight budget in bytes (DESIGN.md §13): -1 (JSON null, the default) = automatic:
+     * device total memory minus RRC_TRAIN_CUDA_MEMORY_MARGIN on "cuda" (no check when the total is
+     * unknown), unlimited on the CPU backends; 0 = no check; > 0 = refuse a run whose computed peak
+     * exceeds it. Not part of the resume fingerprint. */
+    int64_t memory_budget_bytes;
 } rrc_train_config;
+
+/* Margin left free on a CUDA device by the automatic budget: the CUDA context, allocator rounding
+ * and fragmentation, which the dry run does not see. An assumption (NOT_TESTED on a GPU). */
+#define RRC_TRAIN_CUDA_MEMORY_MARGIN ((int64_t)1 << 30)
 
 void rrc_train_config_default(rrc_train_config *c);
 /* Parse a JSON object onto the defaults. Unknown keys, wrong types, out-of-range values and
@@ -192,6 +201,30 @@ rrc_status rrc_train_run(const rrc_train_config *c);
  * backend comes from c->backend, and "cuda" is refused with RRC_ERR_UNSUPPORTED before anything is
  * created or loaded. A non-NULL device_be with a CPU c->backend is RRC_ERR_INVALID_ARG. */
 rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be);
+/* rrc_train_run_on with the device's total memory in bytes (0 = unknown), which sets the automatic
+ * memory budget of a "cuda" run (build/rrc_train_cuda passes cudaMemGetInfo's total). */
+rrc_status rrc_train_run_on_device(const rrc_train_config *c, const rrc_backend *device_be, uint64_t device_total_bytes);
+
+/* ---- memory pre-flight (DESIGN.md §13) ---------------------------------------------------------------
+ *
+ * Before the trainer allocates anything on its backend, it runs one training step of the config's
+ * shapes on the dry-run backend (rrc_census_run: shape-only model from model_dir/config.json, the
+ * real LoRA / optimizer constructors, a micro-batch of micro_batch_size x seq_len tokens) and
+ * compares the computed peak (op-table allocations, plus the CUDA backend's GEMM scratch, cuBLASLt
+ * workspace and partial buffers on "cuda") with the budget. Over budget: RRC_ERR_OOM with the
+ * breakdown, before the model is loaded or output_dir is created. */
+typedef struct rrc_train_preflight {
+    uint64_t peak_bytes;     /* computed peak (rrc_census_result.peak_total_bytes) */
+    uint64_t budget_bytes;   /* 0: no budget applied */
+    uint64_t weights_bytes, lora_bytes, adam_bytes, workspace_bytes, internal_bytes; /* breakdown */
+    char budget_source[160]; /* "memory_budget_bytes", "device total - margin", "none (...)" */
+} rrc_train_preflight;
+
+/* Compute the pre-flight for config `c` and model config `mc` (cuda: the CUDA target; device_total:
+ * as rrc_train_run_on_device). Returns RRC_ERR_OOM (message with the breakdown) when the peak
+ * exceeds the budget; `out` (may be NULL) is filled in either case. */
+rrc_status rrc_train_memory_preflight(const rrc_train_config *c, const rrc_model_config *mc, int cuda,
+                                      uint64_t device_total_bytes, rrc_train_preflight *out);
 
 #ifdef __cplusplus
 }

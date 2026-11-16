@@ -1,6 +1,6 @@
 /* rrc/cuda/gemm_plan.h — pure host translation of a row-major rrc_gemm into column-major
- * cuBLASLt calls (DESIGN.md §11.2). Compiled by gcc (CPU tests, host emulation backend) and
- * linked into librrc_cuda; no CUDA dependency.
+ * cuBLASLt calls (DESIGN.md §11.2). Compiled by gcc into librrc.a (used by the CPU tests, the host
+ * emulation backend, the dry-run backend of DESIGN.md §13 and librrc_cuda); no CUDA dependency.
  *
  * Row-major X (r x c, ld) is column-major X^T (c x r, ld), so C = op(A) op(B) is computed as the
  * column-major C^T = op(B)^T op(A)^T: cuBLASLt's A is rrc's B (transa = trans_b), cuBLASLt's B is

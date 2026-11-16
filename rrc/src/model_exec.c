@@ -572,8 +572,21 @@ static rrc_status layer_bwd(exec *e, int64_t l, rrc_buf x, const rrc_layer_cache
         RRC_CHECK(rrc_rmsnorm_bwd(be, N * e->Hkv, hd, hd, c->k_raw, wt->kn, e->eps, w->dk, w->dk, 0));
     }
     RRC_CHECK(linear_bwd(e, w->dq, Q, Q, wt->wq, w->dxn, H, H, 0.0f));
-    RRC_CHECK(linear_bwd(e, w->dk, KV, KV, wt->wk, w->dxn, H, H, 1.0f));
-    RRC_CHECK(linear_bwd(e, w->dv, KV, KV, wt->wv, w->dxn, H, H, 1.0f));
+    if (e->adt == RRC_F32) {
+        RRC_CHECK(linear_bwd(e, w->dk, KV, KV, wt->wk, w->dxn, H, H, 1.0f));
+        RRC_CHECK(linear_bwd(e, w->dv, KV, KV, wt->wv, w->dxn, H, H, 1.0f));
+    } else {
+        /* dK / dV are f32 accumulators (DESIGN.md §10 item 3). The input gradient through the frozen
+         * k_proj / v_proj weights reads a copy rounded once to the model dtype (in w->dob, which
+         * nothing reads after attn_bwd; Q >= KV), so these GEMMs are bf16 x bf16 -> f32 like every
+         * other base-weight GEMM instead of promoting the weight to f32 (§13). The LoRA backward
+         * below keeps the f32 dK / dV. */
+        rrc_buf dkv = rrc_view(w->dob, 0, N * KV);
+        RRC_CHECK(rrc_convert(be, N * KV, w->dk, dkv));
+        RRC_CHECK(linear_bwd(e, dkv, KV, KV, wt->wk, w->dxn, H, H, 1.0f));
+        RRC_CHECK(rrc_convert(be, N * KV, w->dv, dkv));
+        RRC_CHECK(linear_bwd(e, dkv, KV, KV, wt->wv, w->dxn, H, H, 1.0f));
+    }
     RRC_CHECK(lora_bwd(e, l, RRC_LORA_Q, w->dq, Q, c->xn1, H, c->t[RRC_LORA_Q], w->dxn, H));
     RRC_CHECK(lora_bwd(e, l, RRC_LORA_K, w->dk, KV, c->xn1, H, c->t[RRC_LORA_K], w->dxn, H));
     RRC_CHECK(lora_bwd(e, l, RRC_LORA_V, w->dv, KV, c->xn1, H, c->t[RRC_LORA_V], w->dxn, H));

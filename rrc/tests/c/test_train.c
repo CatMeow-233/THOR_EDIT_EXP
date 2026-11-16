@@ -599,12 +599,103 @@ RT_TEST(train_init_adapter_config_roots) {
     RT_OK(run_cfg(json));
 }
 
+/* ---- memory pre-flight (DESIGN.md §13) --------------------------------------------------------- */
+
+RT_TEST(train_memory_preflight) {
+    char model[1200], data[1200], out[1200], json[8192];
+    snprintf(model, sizeof model, "%s", rt_path("pf_model"));
+    snprintf(data, sizeof data, "%s", rt_path("pf.rrcbin"));
+    snprintf(out, sizeof out, "%s", rt_path("pf_out"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    const char *common = "\"dtype\": \"bf16\", \"seq_len\": 12, \"micro_batch_size\": 2, \"max_steps\": 1, "
+                         "\"lora\": {\"r\": 2, \"alpha\": 4}, \"attn_chunk\": 5, \"ce_chunk\": 3";
+    /* config field: null = automatic (-1), 0 = no check, > 0 bytes; negative refused; not in the fingerprint */
+    rrc_train_config c, c2;
+    RT_OK(parse_with("", &c));
+    RT_EXPECT(c.memory_budget_bytes == -1, "default %lld", (long long)c.memory_budget_bytes);
+    RT_OK(parse_with(", \"memory_budget_bytes\": null", &c));
+    RT_EXPECT(c.memory_budget_bytes == -1, "null");
+    RT_OK(parse_with(", \"memory_budget_bytes\": 0", &c));
+    RT_EXPECT(c.memory_budget_bytes == 0, "0");
+    RT_OK(parse_with(", \"memory_budget_bytes\": 123456789", &c2));
+    RT_EXPECT(c2.memory_budget_bytes == 123456789, "bytes");
+    RT_STATUS(parse_with(", \"memory_budget_bytes\": -5", &c), RRC_ERR_INVALID_ARG);
+    RT_STATUS(parse_with(", \"memory_budget_bytes\": 1.5", &c), RRC_ERR_PARSE);
+    RT_OK(parse_with("", &c));
+    char *f1 = NULL, *f2 = NULL;
+    RT_OK(rrc_train_config_fingerprint(&c, &f1));
+    RT_OK(rrc_train_config_fingerprint(&c2, &f2));
+    RT_EXPECT(!strcmp(f1, f2), "memory_budget_bytes must not be in the resume fingerprint");
+    free(f1);
+    free(f2);
+    char *js = NULL;
+    RT_OK(rrc_train_config_to_json(&c2, &js));
+    RT_EXPECT(strstr(js, "\"memory_budget_bytes\": 123456789") != NULL, "to_json: %s", js);
+    free(js);
+
+    /* the computed peak of this config, and the budget rules */
+    snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s}", model,
+             data, out, common);
+    RT_OK(rrc_train_config_parse(json, strlen(json), &c));
+    rrc_model_config mc;
+    RT_OK(rrc_config_load(model, 0, &mc));
+    rrc_train_preflight pf;
+    RT_OK(rrc_train_memory_preflight(&c, &mc, 0, 0, &pf)); /* CPU, automatic: unlimited */
+    RT_EXPECT(pf.peak_bytes > 0 && pf.budget_bytes == 0 && strstr(pf.budget_source, "CPU"), "cpu auto: %s",
+              pf.budget_source);
+    RT_EXPECT(pf.peak_bytes == pf.weights_bytes + pf.lora_bytes + pf.adam_bytes + pf.workspace_bytes &&
+                  pf.internal_bytes == 0,
+              "cpu breakdown");
+    const uint64_t peak = pf.peak_bytes;
+    c.memory_budget_bytes = (int64_t)peak; /* exactly enough */
+    RT_OK(rrc_train_memory_preflight(&c, &mc, 0, 0, &pf));
+    c.memory_budget_bytes = (int64_t)peak - 1;
+    RT_STATUS(rrc_train_memory_preflight(&c, &mc, 0, 0, &pf), RRC_ERR_OOM);
+    RT_EXPECT(strstr(rrc_last_error(), "memory pre-flight") && strstr(rrc_last_error(), "memory_budget_bytes"), "%s",
+              rrc_last_error());
+    /* CUDA target: + GEMM scratch, cuBLASLt workspace, partials; automatic budget = total - margin */
+    c.memory_budget_bytes = -1;
+    RT_OK(rrc_train_memory_preflight(&c, &mc, 1, 0, &pf)); /* total unknown: no budget */
+    RT_EXPECT(pf.budget_bytes == 0 && strstr(pf.budget_source, "unknown") && pf.internal_bytes >= (32u << 20) &&
+                  pf.peak_bytes == peak + pf.internal_bytes,
+              "cuda unknown total: %s, internal %llu", pf.budget_source, (unsigned long long)pf.internal_bytes);
+    const uint64_t margin = (uint64_t)RRC_TRAIN_CUDA_MEMORY_MARGIN;
+    RT_OK(rrc_train_memory_preflight(&c, &mc, 1, margin + pf.peak_bytes, &pf));
+    RT_EXPECT(pf.budget_bytes == pf.peak_bytes && strstr(pf.budget_source, "device total"), "cuda budget %s",
+              pf.budget_source);
+    RT_STATUS(rrc_train_memory_preflight(&c, &mc, 1, margin + pf.peak_bytes - 1, &pf), RRC_ERR_OOM);
+    c.memory_budget_bytes = 0; /* disabled */
+    RT_OK(rrc_train_memory_preflight(&c, &mc, 1, margin + 1, &pf));
+
+    /* the trainer refuses over budget before it creates output_dir or loads anything */
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"memory_budget_bytes\": "
+             "%llu, %s}",
+             model, data, out, (unsigned long long)(peak - 1), common);
+    RT_STATUS(run_cfg(json), RRC_ERR_OOM);
+    struct stat sb;
+    RT_EXPECT(stat(out, &sb) != 0, "output_dir was created by a refused run");
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"memory_budget_bytes\": "
+             "%llu, %s}",
+             model, data, out, (unsigned long long)peak, common);
+    RT_OK(run_cfg(json));
+    /* a seq_len beyond the positions keeps its own error (not a pre-flight one) */
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"seq_len\": 65, "
+             "\"max_steps\": 1, \"overwrite_output_dir\": true}",
+             model, data, out);
+    RT_STATUS(run_cfg(json), RRC_ERR_INVALID_ARG);
+    RT_EXPECT(strstr(rrc_last_error(), "exceeds the model's positions") != NULL, "%s", rrc_last_error());
+}
+
 const rt_case rt_suite_train[] = {
     RT_CASE(train_lr_schedule_values),         RT_CASE(train_clip_coef),
     RT_CASE(train_optimizer_step_matches_kernel), RT_CASE(train_config_parse_and_round_trip),
     RT_CASE(train_state_round_trip_and_corruption), RT_CASE(train_adapter_config_json),
     RT_CASE(train_end_to_end_stop_and_resume_bit_identical), RT_CASE(train_state_counter_bounds),
     RT_CASE(train_checkpoint_replace_is_failure_safe), RT_CASE(train_resume_output_dir_guard),
-    RT_CASE(train_init_adapter_config_roots),
+    RT_CASE(train_init_adapter_config_roots),         RT_CASE(train_memory_preflight),
 };
 const size_t rt_suite_train_n = sizeof rt_suite_train / sizeof rt_suite_train[0];
