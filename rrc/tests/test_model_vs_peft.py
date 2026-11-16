@@ -26,9 +26,8 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 peft = pytest.importorskip("peft")
 safetensors_torch = pytest.importorskip("safetensors.torch")
-from safetensors import safe_open  # noqa: E402
-
 import make_tiny_model as mtm  # noqa: E402  (rrc/tools, put on sys.path by conftest)
+from safetensors import safe_open  # noqa: E402
 
 VOCAB = 128
 T = 23  # prime: no attention chunk divides it
@@ -142,7 +141,9 @@ MAIN_LAYOUT: list[list[list[tuple[int, int] | int]]] = [
 ]
 
 
-def peft_model(mdir: pathlib.Path, dtype, targets, r=4, alpha=8.0, rslora=False, layers=None, seed=0, round_bf16=False):
+def peft_model(
+    mdir: pathlib.Path, dtype, targets, r=4, alpha=8.0, rslora=False, layers=None, seed=0, round_bf16=False
+):
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM
 
@@ -204,7 +205,9 @@ def reference(pm, w: Window, reduction: str = "window_tokens"):
         lab = torch.tensor(d.labels[1:], dtype=torch.long)
         n = int((lab != -100).sum())
         if n:
-            sums[d.mb] = sums[d.mb] + F.cross_entropy(lg[:-1].float(), lab, ignore_index=-100, reduction="sum")
+            sums[d.mb] = sums[d.mb] + F.cross_entropy(
+                lg[:-1].float(), lab, ignore_index=-100, reduction="sum"
+            )
             counts[d.mb] += n
     total = sum(counts)
     if reduction == "window_tokens":
@@ -217,12 +220,46 @@ def reference(pm, w: Window, reduction: str = "window_tokens"):
     return float(loss), counts, logits, grads
 
 
-def run_rrc(exe, mdir, batch, out, *, lora=None, dtype="f32", backend="cpu", targets=None, r=4, alpha=8.0,
-            rslora=False, layers=None, attn_chunk=ATTN_CHUNK, ce_chunk=CE_CHUNK, reduction="window_tokens",
-            logits=True, extra=(), expect_ok=True):
-    cmd = [str(exe), "--model", str(mdir), "--batch", str(batch), "--out", str(out), "--dtype", dtype,
-           "--backend", backend, "--attn-chunk", str(attn_chunk), "--ce-chunk", str(ce_chunk),
-           "--reduction", reduction]
+def run_rrc(
+    exe,
+    mdir,
+    batch,
+    out,
+    *,
+    lora=None,
+    dtype="f32",
+    backend="cpu",
+    targets=None,
+    r=4,
+    alpha=8.0,
+    rslora=False,
+    layers=None,
+    attn_chunk=ATTN_CHUNK,
+    ce_chunk=CE_CHUNK,
+    reduction="window_tokens",
+    logits=True,
+    extra=(),
+    expect_ok=True,
+):
+    cmd = [
+        str(exe),
+        "--model",
+        str(mdir),
+        "--batch",
+        str(batch),
+        "--out",
+        str(out),
+        "--dtype",
+        dtype,
+        "--backend",
+        backend,
+        "--attn-chunk",
+        str(attn_chunk),
+        "--ce-chunk",
+        str(ce_chunk),
+        "--reduction",
+        reduction,
+    ]
     if lora == "none":
         cmd.append("--no-lora")
     else:
@@ -265,7 +302,9 @@ def check_logits(w: Window, out: dict[str, Any], ref_logits, atol: float, rtol: 
 
 def check_grads(out: dict[str, Any], ref: dict[str, Any], rtol: float) -> dict[str, float]:
     got = {k[len("grad.") :]: v for k, v in out.items() if k.startswith("grad.")}
-    assert set(got) == set(ref), f"grad name sets differ: rrc-only {set(got) - set(ref)}, peft-only {set(ref) - set(got)}"
+    assert set(got) == set(ref), (
+        f"grad name sets differ: rrc-only {set(got) - set(ref)}, peft-only {set(ref) - set(got)}"
+    )
     errs = {}
     for k, v in ref.items():
         assert v.norm() > 0, f"reference grad {k} is zero: the test cannot detect errors in it"
@@ -287,7 +326,9 @@ def assert_window_preconditions(w: Window, counts: list[int]) -> None:
     assert T > ATTN_CHUNK and T % ATTN_CHUNK != 0
     assert all(c > CE_CHUNK for c in counts if c), counts
     # a document crosses an attention chunk boundary and rows hold >= 2 documents
-    crosses = [d for d in w.docs if d.start // ATTN_CHUNK != (d.start + d.length - 1) // ATTN_CHUNK and d.start > 0]
+    crosses = [
+        d for d in w.docs if d.start // ATTN_CHUNK != (d.start + d.length - 1) // ATTN_CHUNK and d.start > 0
+    ]
     assert crosses
     per_row: dict[tuple[int, int], int] = {}
     for d in w.docs:
@@ -317,7 +358,9 @@ def test_base_model_matches_hf_including_hf_loss(variant, tiny, fwdbwd, tmp_path
     labels[1, 10:14] = -100
     with torch.no_grad():
         ref = hf(input_ids=ids, labels=labels, output_hidden_states=True)
-    safetensors_torch.save_file({"tokens": ids.to(torch.int32), "labels": labels.to(torch.int32)}, str(tmp_path / "b"))
+    safetensors_torch.save_file(
+        {"tokens": ids.to(torch.int32), "labels": labels.to(torch.int32)}, str(tmp_path / "b")
+    )
     out, meta = run_rrc(fwdbwd, mdir, tmp_path / "b", tmp_path / "o", lora="none", extra=["--hidden"])
     assert (out["logits"][0].reshape(2, T, VOCAB) - ref.logits).abs().max().item() < 2e-5
     hid = out["hidden"][0]
@@ -326,8 +369,9 @@ def test_base_model_matches_hf_including_hf_loss(variant, tiny, fwdbwd, tmp_path
         assert (hid[i].reshape(2, T, -1) - h).abs().max().item() < 2e-5, f"hidden state {i}"
     assert abs(float(meta["loss"]) - ref.loss.item()) < 2e-6 * max(1.0, ref.loss.item())
     # one row = one micro-batch-mean with M = 1 gives the same value
-    out2, meta2 = run_rrc(fwdbwd, mdir, tmp_path / "b", tmp_path / "o2", lora="none", reduction="microbatch_mean",
-                          logits=False)
+    _, meta2 = run_rrc(
+        fwdbwd, mdir, tmp_path / "b", tmp_path / "o2", lora="none", reduction="microbatch_mean", logits=False
+    )
     assert abs(float(meta2["loss"]) - ref.loss.item()) < 2e-6 * max(1.0, ref.loss.item())
 
 
@@ -354,7 +398,9 @@ def test_lora_fp32_matches_peft(variant, targets, rslora, backend, tiny, fwdbwd,
     cfg = json.loads((mdir / "config.json").read_text())
     pm = peft_model(mdir, torch.float32, targets, rslora=rslora, alpha=8.0)
     hd = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
-    assert cfg["num_attention_heads"] // cfg["num_key_value_heads"] > 1 and cfg["num_key_value_heads"] > 1  # GQA
+    assert (
+        cfg["num_attention_heads"] // cfg["num_key_value_heads"] > 1 and cfg["num_key_value_heads"] > 1
+    )  # GQA
     if variant.startswith("qwen3_hd32"):
         assert hd != cfg["hidden_size"] // cfg["num_attention_heads"]
     adapter = write_adapter(pm, tmp_path / "adapter")
@@ -363,8 +409,16 @@ def test_lora_fp32_matches_peft(variant, targets, rslora, backend, tiny, fwdbwd,
     assert_window_preconditions(w, counts)
     assert counts[0] != counts[1]
     save_batch(w, tmp_path / "batch")
-    out, meta = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, backend=backend,
-                        targets=targets, rslora=rslora)
+    out, meta = run_rrc(
+        fwdbwd,
+        mdir,
+        tmp_path / "batch",
+        tmp_path / "out",
+        lora=adapter,
+        backend=backend,
+        targets=targets,
+        rslora=rslora,
+    )
     assert out["n_tokens"].tolist() == counts
     tol = 2e-5 if backend == "cpu" else 1e-4
     check_logits(w, out, ref_logits, atol=tol, rtol=tol)
@@ -391,17 +445,27 @@ def test_reductions_window_tokens_vs_microbatch_mean(tiny, fwdbwd, tmp_path):
     save_batch(w, tmp_path / "batch")
     results = {}
     for red in ["window_tokens", "microbatch_mean"]:
-        loss, counts, ref_logits, ref_grads = reference(pm, w, red)
+        loss, counts, _, ref_grads = reference(pm, w, red)
         assert counts == [32, 3]
-        out, meta = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / f"out_{red}", lora=adapter,
-                            reduction=red, logits=False)
+        out, meta = run_rrc(
+            fwdbwd,
+            mdir,
+            tmp_path / "batch",
+            tmp_path / f"out_{red}",
+            lora=adapter,
+            reduction=red,
+            logits=False,
+        )
         assert abs(float(meta["loss"]) - loss) <= 2e-6 * loss
         check_grads(out, ref_grads, rtol=5e-5)
         results[red] = (loss, ref_grads)
     # the two reductions really differ on this window (unequal labelled counts)
     # (per-token losses of a random tiny model are all close to log(vocab), so the loss values differ
     # little; still by > 100x the tolerance used above)
-    assert abs(results["window_tokens"][0] - results["microbatch_mean"][0]) > 100 * 2e-6 * results["window_tokens"][0]
+    assert (
+        abs(results["window_tokens"][0] - results["microbatch_mean"][0])
+        > 100 * 2e-6 * results["window_tokens"][0]
+    )
     for k in results["window_tokens"][1]:
         assert rel_err(results["window_tokens"][1][k], results["microbatch_mean"][1][k]) > 1e-2, k
 
@@ -456,10 +520,11 @@ def test_upper_layers_only_vs_all_layers(layers, tiny, fwdbwd, tmp_path):
     pm = peft_model(mdir, torch.float32, targets, layers=layers)
     adapter = write_adapter(pm, tmp_path / "adapter")
     w = build_window(MAIN_LAYOUT, seed=5)
-    loss, counts, ref_logits, ref_grads = reference(pm, w)
+    loss, _, ref_logits, ref_grads = reference(pm, w)
     save_batch(w, tmp_path / "batch")
-    out, meta = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, targets=targets,
-                        layers=layers)
+    out, meta = run_rrc(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, targets=targets, layers=layers
+    )
     got_layers = {int(k.split(".layers.")[1].split(".")[0]) for k in out if k.startswith("grad.")}
     assert got_layers == (set(layers) if layers else {0, 1, 2})
     check_logits(w, out, ref_logits, atol=2e-5, rtol=2e-5)
@@ -488,8 +553,9 @@ def test_lora_bf16_matches_peft(variant, backend, tiny, fwdbwd, tmp_path):
     adapter = write_adapter(pm16, tmp_path / "adapter")
     l16, counts16, lg16, g16 = reference(pm16, w)
     assert counts16 == counts
-    out, meta = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, dtype="bf16",
-                        backend=backend)
+    out, meta = run_rrc(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, dtype="bf16", backend=backend
+    )
     got = {k[len("grad.") :]: v for k, v in out.items() if k.startswith("grad.")}
     assert set(got) == set(g16) == set(g32)
     # logits: rrc-bf16 vs fp32 truth no worse than (2x HF-bf16 vs fp32 truth + small slack)
@@ -523,7 +589,9 @@ def test_chunking_recompute_and_batch_derivation_invariance(tiny, fwdbwd, tmp_pa
     save_batch(w, tmp_path / "full")
     save_batch(w, tmp_path / "nopos", with_pos=False)
     save_batch(w, tmp_path / "nodoc", with_doc=False)
-    base, _ = run_rrc(fwdbwd, mdir, tmp_path / "full", tmp_path / "o0", lora=adapter, attn_chunk=1024, ce_chunk=4096)
+    base, _ = run_rrc(
+        fwdbwd, mdir, tmp_path / "full", tmp_path / "o0", lora=adapter, attn_chunk=1024, ce_chunk=4096
+    )
     runs = {
         "small_chunks": dict(attn_chunk=3, ce_chunk=2),
         "chunk_1": dict(attn_chunk=1, ce_chunk=1),
@@ -538,8 +606,15 @@ def test_chunking_recompute_and_batch_derivation_invariance(tiny, fwdbwd, tmp_pa
                 assert rel_err(out[k], v) < 1e-5, (name, k)
     # position_ids derived from doc_ids, and doc_ids derived from position_ids: bit-identical
     for name in ["nopos", "nodoc"]:
-        out, _ = run_rrc(fwdbwd, mdir, tmp_path / name, tmp_path / f"o_{name}", lora=adapter, attn_chunk=1024,
-                         ce_chunk=4096)
+        out, _ = run_rrc(
+            fwdbwd,
+            mdir,
+            tmp_path / name,
+            tmp_path / f"o_{name}",
+            lora=adapter,
+            attn_chunk=1024,
+            ce_chunk=4096,
+        )
         for k, v in base.items():
             assert torch.equal(out[k], v), f"{name}: {k}"
 
@@ -581,18 +656,37 @@ def test_refusals(tiny, fwdbwd, tmp_path):
     save_batch(w, tmp_path / "batch")
     p = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", extra=["--dropout", "0.1"], expect_ok=False)
     assert p.returncode == 2 and "lora_dropout" in p.stderr
-    p = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", targets=["q_proj", "lm_head"], expect_ok=False)
+    p = run_rrc(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", targets=["q_proj", "lm_head"], expect_ok=False
+    )
     assert p.returncode == 2 and "lm_head" in p.stderr
     # adapter with a different target set than requested: exact tensor-set check
     pm = peft_model(mdir, torch.float32, ["q_proj", "v_proj"])
     adapter = write_adapter(pm, tmp_path / "adapter")
-    p = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", lora=adapter, targets=["q_proj"], expect_ok=False)
+    p = run_rrc(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", lora=adapter, targets=["q_proj"], expect_ok=False
+    )
     assert p.returncode == 2 and "not part of this adapter" in p.stderr
-    p = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", lora=adapter, targets=["q_proj", "v_proj", "k_proj"],
-                expect_ok=False)
+    p = run_rrc(
+        fwdbwd,
+        mdir,
+        tmp_path / "batch",
+        tmp_path / "o",
+        lora=adapter,
+        targets=["q_proj", "v_proj", "k_proj"],
+        expect_ok=False,
+    )
     assert p.returncode == 2 and "missing" in p.stderr
-    p = run_rrc(fwdbwd, mdir, tmp_path / "batch", tmp_path / "o", lora=adapter, targets=["q_proj", "v_proj"], r=8,
-                expect_ok=False)
+    p = run_rrc(
+        fwdbwd,
+        mdir,
+        tmp_path / "batch",
+        tmp_path / "o",
+        lora=adapter,
+        targets=["q_proj", "v_proj"],
+        r=8,
+        expect_ok=False,
+    )
     assert p.returncode == 2 and "shape" in p.stderr
     # non-contiguous documents in a row are refused
     bad = build_window(MAIN_LAYOUT, seed=10)

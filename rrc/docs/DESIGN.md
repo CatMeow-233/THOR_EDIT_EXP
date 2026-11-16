@@ -387,3 +387,116 @@ left open or a place where the implementation differs from the text above, and w
     including index 0, contributes 0 and its gradient is 0, as in torch. Before this rule a leading
     -inf produced `exp(-inf - (-inf)) = NaN` for the whole row. A row of only -inf logits gives
     NaN (torch does the same).
+
+## 10. Stage B model line: decisions and deviations
+
+Step 1 of the model line: model loading, LoRA, and the decoder forward / backward on the CPU
+backend, verified against transformers + PEFT. Code: `include/rrc/{model,lora}.h`,
+`src/{model,model_exec,lora}.c`, `src/model_internal.h`, `src/rrc_fwdbwd.c` (test CLI),
+`tests/c/test_model.c`, `tests/test_model_vs_peft.py`. Status: **TESTED (CPU)** on tiny random
+models for both CPU backends; nothing here has run on a GPU and no performance figure exists
+(NOT_TESTED). No change to the op table or its wrappers was needed.
+
+1. **Separate q/k/v GEMMs** (three projections into three contiguous buffers `[N, Q]`, `[N, KV]`,
+   `[N, KV]`) instead of one fused `[Q + 2KV, H]` GEMM. With contiguous Q and K, Qwen3's per-head
+   `q_norm`/`k_norm` is one `rmsnorm_fwd/bwd` call on the `[N·heads, head_dim]` view and RoPE /
+   attention see uniform strides; a fused output would need one rmsnorm call per head. Cost: three
+   GEMM launches instead of one per layer (forward and backward). **gate/up are fused**: the
+   checkpoint's `gate_proj` and `up_proj` are stored adjacently in the weight allocation, so
+   `[W_gate; W_up]` is one `[2I, H]` matrix: one forward GEMM into a `[N, 2I]` buffer, `swiglu` on
+   its column blocks, and one backward GEMM with `k = 2I` (§9 item 15).
+2. **Weights**: all base tensors (norm weights and biases included) live in one backend allocation
+   in the model dtype (bf16 default, f32 for tests), converted on the host by `rrc_st_to_f32/bf16`
+   (RNE for an fp32 checkpoint loaded as bf16, the same rounding as torch's `.to(bfloat16)`), in the
+   order of `rrc_config_expected_tensors`, after the exact tensor-set check of stage A. Tied models
+   use the embedding as the LM head.
+3. **Precision of intermediates**: activations, the residual stream and its gradient are in the
+   model dtype (as in HF). fp32 regardless of the model dtype: attention scores, probabilities and
+   dP/dS (HF rounds P to bf16; rrc does not), the LoRA `t = x Aᵀ` and `dt`, the per-token losses,
+   and three gradient accumulators: dK and dV (accumulated with `beta = 1` over `2·G` calls per query
+   chunk, so a bf16 accumulator would round at every call) and `dxn`, the input gradient of a norm
+   (sum of the three q/k/v — or the two gate/up — input gradients plus their LoRA terms). dQ is
+   written once per chunk and stays in the model dtype. The LoRA branch follows PEFT: the bf16
+   input is widened exactly to fp32 by the GEMM (`t` is fp32), and `y += s · t Bᵀ` is one GEMM with
+   `alpha = s`, `beta = 1` into the base output, rounded once (PEFT: fp32 sum of the bf16 base result
+   and the fp32 LoRA term, then one cast). Biases are added after the base GEMM and before LoRA.
+4. **GEMM dtype combinations issued** (A, B, C), recorded by `model.model_gemm_dtype_combinations`:
+   f32 model: only (f32, f32, f32); bf16 model: (bf16, bf16, bf16) base linears, LM head and its
+   input gradient, dact/dob; (bf16, bf16, f32) scores, dP, input gradients into `dxn`; (bf16, f32,
+   f32) LoRA `t`, `dB`, `dt` from a bf16 dy; (f32, bf16, bf16) P·V and dQ; (f32, bf16, f32) dK, dV,
+   input gradients of dK/dV into `dxn`, `dA`; (f32, f32, bf16) LoRA `y += s t Bᵀ`, LoRA `dx` into a
+   bf16 gradient; (f32, f32, f32) the rest of the LoRA backward. (bf16, f32, bf16) is never used.
+5. **Attention key range**: a query chunk `[q0, q0 + R)` of a packed row reads keys
+   `[k0, q0 + R)` where `k0` is the start of the document of query `q0` (keys before it are masked
+   for every query of the chunk), via `row_offset = q0 − k0` and a doc-id view starting at `k0`.
+   This is exact only for contiguous documents, so a row in which a document id reappears after a
+   different one is refused (`RRC_ERR_INVALID_ARG`). Packed rows then cost about the attention FLOPs
+   of their documents rather than of the whole row (the saving is not measured: NOT_TESTED).
+6. **Recompute / activation cache**: a layer's forward writes into an `rrc_layer_cache` (xn1, q_raw
+   / k_raw for q/k norm, post-rope q, k, v, attention output, h, xn2, [gate | up], act, the LoRA `t`
+   of every adapted module). `RRC_RECOMPUTE_FULL` (default) has one scratch cache: the forward saves
+   only each layer's input (`xs[l]`), the backward recomputes the layer into the scratch cache
+   (skipping the down projection and residual, whose outputs it does not need; the top layer's
+   cache is still valid from the forward and is not recomputed). `RRC_RECOMPUTE_NONE` has one
+   persistent cache per layer and no recompute; this is the switch for a later "store activations
+   when they fit" policy. Both give bit-identical results (tested).
+7. **Backward stops at the lowest adapted layer**: no layer below it is recomputed or
+   back-propagated, and that layer skips its final `rmsnorm_bwd` (the input gradient). No finer
+   pruning inside a layer yet (e.g. the attention backward of a lowest layer whose adapters are all
+   in the MLP).
+8. **Workspace**: one backend allocation per model, laid out by a single function run twice
+   (first only summing offsets — no pointer is formed — then binding 256-byte-aligned typed views
+   of the allocation). It is sized from `N = B·T` (the labelled-row buffers are bounded by `N`) and
+   reallocated only when a step needs more (one allocation for repeated steps: tested). It is not
+   zeroed between steps: the dK/dV accumulators and the zero row of the LM-head scatter table are
+   zeroed explicitly every step. Per-step host allocations are the O(N) int32 batch-preparation
+   arrays and the per-token loss download; there are no per-op allocations besides the backend's
+   internal GEMM scratch.
+9. **Batch semantics** (`rrc_batch`): HF-style unshifted labels; the engine's target for token t is
+   `labels[t + 1]` if t + 1 is in the same document (same row and doc id), else ignored, so the
+   first label of a document is never a target and nothing leaks across documents or rows.
+   `doc_ids` and `position_ids` may each be omitted (positions restart at every document; documents
+   start where `position_ids == 0`; one document per row if both are absent). Padding is a document
+   whose labels are all -100. Tokens, labels and positions are range-checked on the host.
+10. **Loss reductions and zero labelled tokens**: `window_tokens` scales by `1 / window_tokens`
+    (the caller sums `rrc_batch_count_labels` over the window first; a micro-batch with more
+    labelled tokens than `window_tokens` is an error); `microbatch_mean` by `1 / (n_mb · M)`. The
+    scale is folded into the cross entropy (`grad_scale`), so dlogits are already scaled. A
+    micro-batch with zero labelled tokens contributes loss 0 and gradient 0 under both reductions
+    (it still counts in M for `microbatch_mean`; HF's per-micro-batch mean would be NaN there), and
+    a window with `window_tokens = 0` gives loss 0 and zero gradients. Per-token losses (f32) are
+    summed in double on the host, one `memcpy_d2h` per micro-batch.
+11. **LoRA**: `rrc_lora` is an object separate from the model (an adapter for a model shape on a
+    backend; the forward accepts `NULL` for the base model, e.g. a phase-2 reference policy). A, B,
+    dA, dB are fp32 in one contiguous parameter and one gradient buffer (layer-major, modules in the
+    order q, k, v, o, gate, up, down, A before B), so AdamW and the gradient norm are single op
+    calls. Names are PEFT's saved-adapter keys (`base_model.model.model.layers.{l}.{self_attn|mlp}.
+    {m}.lora_{A|B}.weight`, taken from a file PEFT wrote). `layers_to_transform` is supported.
+    Initialisation: A uniform in ±1/√in from the splitmix64 scheme documented in `lora.h` (not
+    torch's RNG), B = 0. `lora_dropout != 0`, unknown targets and adapter files whose tensor set or
+    shapes differ are refused. `rrc_fwdbwd` takes the LoRA hyper-parameters as flags; reading
+    PEFT's `adapter_config.json` is left to the trainer step.
+12. **HF hidden-state convention** (`rrc_model_forward_logits(..., hidden_out)`): entries 0..L−1
+    are the embedding output and the outputs of layers 0..L−2, the last entry is the final-norm
+    output, exactly as transformers' `output_hidden_states` (verified by the test).
+13. **Tests** (`tests/test_model_vs_peft.py`): LoRA A and B are randomized and non-zero (A within
+    the kaiming bound, B with std 0.05 so that `s·BA` is comparable to the base weights; with a
+    LoRA delta about ten times the base weights the tiny models' attention saturates and bf16
+    rounding of the base weights alone moved gradients by over 10 %, which would make any bf16
+    comparison meaningless). fp32 base: logits within 2e-5 (cpu) / 1e-4 (cpu-f32acc), loss within
+    the same relative tolerance, every LoRA gradient within a per-tensor relative L2 error of 5e-5
+    / 5e-4; gradient name sets must equal PEFT's and every reference gradient must be non-zero.
+    bf16 base: rrc's error against an fp32 run on the same bf16-rounded weights must be at most
+    twice HF-bf16's own error (+0.005), per logit block and per gradient tensor. The packing
+    reference runs every document separately through HF/PEFT. Required traps covered: attention
+    chunk 5 < T = 23 (not a divisor), LM-head chunk 7 < labelled rows, ≥ 2 documents per row with a
+    document crossing chunk boundaries, unequal labelled counts per micro-batch (the two reductions
+    are asserted to differ), an empty micro-batch inside a window and a fully empty window, GQA with
+    G = 2 and Hkv = 2, Qwen3 with head_dim ≠ hidden/heads, llama3 rope, tied heads, Qwen2 biases,
+    upper-layers-only adapters vs all layers on a 3-layer model, both CPU backends. HF's own
+    `model(..., labels=...).loss` pins the label shift. `tests/c/test_model.c` adds directional
+    finite differences of the loss (fp32 model, double-accumulation backend), chunking / recompute /
+    backend invariance, batch validation, and runs under `make asan`.
+14. **Sanitizers**: `make asan` builds the library, binaries and C tests with
+    `-fsanitize=address,undefined -fno-sanitize-recover=all` into `build/asan/` and runs the tests
+    with leak detection (the `--wrap=malloc` test link works with ASan).

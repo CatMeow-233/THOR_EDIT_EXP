@@ -63,12 +63,24 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   presence, exact tensor set and shapes, per-tensor sums, RoPE inv_freq and cos/sin tables; a
   table of config.json variants checks precedence/default rules and every refusal.
   `rrc/tests/conftest.py` builds the C code once per session (`make -C rrc cpu`).
+* `rrc/tests/test_model_vs_peft.py` (stage B) — `build/rrc_fwdbwd` against transformers + PEFT:
+  base logits / hidden states / HF's own loss for every tiny variant; logits, loss and every LoRA
+  gradient with randomized non-zero A and B, fp32 (tight) and bf16 (tolerance anchored to HF's own
+  bf16 error), both CPU backends, packed rows checked against per-document HF runs, small attention
+  and LM-head chunks, both loss reductions, empty micro-batches and windows, upper-layer-only
+  adapters, init, refusals. The C suite `model` adds finite-difference gradient checks.
+* `make -C rrc asan` — the C tests under AddressSanitizer + UBSan (build/asan).
 
 ## Tools
 
 * `build/rrc_inspect [--config-only] [--allow-unknown-keys] [--positions p0,p1,...] <model_dir>`
   prints the derived config, RoPE frequencies/tables, expected tensors, checkpoint tensors and
   the tensor-set check as JSON.
+* `build/rrc_fwdbwd --model DIR --batch FILE --out FILE [--lora adapter_model.safetensors] [--dtype f32|bf16]
+  [--backend cpu|cpu-f32acc] [--r N --alpha X --targets q_proj,... --layers 0,1] [--attn-chunk N]
+  [--ce-chunk N] [--reduction window_tokens|microbatch_mean] [--logits] [--hidden]` runs forward +
+  backward of the micro-batches in FILE (`tokens`/`labels`/`position_ids`/`doc_ids`, [M, B, T]) and
+  writes logits, the window loss (metadata) and every LoRA gradient with PEFT key names.
 * `python rrc/tools/make_tiny_model.py --variant qwen3 --out DIR` (or `--family llama --tied
   --llama3-rope`) writes a tiny random fp32 checkpoint with `save_pretrained`.
 
@@ -85,3 +97,6 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
 | `kernels_common/rrc_kc*.h` | per-element / per-row math shared by gcc and nvcc |
 | `src/cpu_backend.c` | CPU reference backend (OpenMP) |
 | `tests/cuda/headers_check.cu` | nvcc compile check of all headers and every `RRC_HD` function |
+| `include/rrc/model.h`, `src/model.c`, `src/model_exec.c` | model loading; decoder forward / backward with LoRA (stage B, DESIGN.md §10) |
+| `include/rrc/lora.h`, `src/lora.c` | LoRA adapter: layout, PEFT names, seeded init, safetensors I/O |
+| `src/rrc_fwdbwd.c` | `build/rrc_fwdbwd`: one forward/backward window -> safetensors (used by the pytest comparison) |
