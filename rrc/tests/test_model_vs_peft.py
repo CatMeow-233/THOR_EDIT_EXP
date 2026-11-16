@@ -87,9 +87,10 @@ class Window:
     docs: list[Doc]
 
 
-def build_window(layout: list[list[list[tuple[int, int] | int]]], seed: int = 0) -> Window:
+def build_window(layout: list[list[list[tuple[int, int] | int]]], seed: int = 0, t_len: int = T) -> Window:
     """layout[m][row] = list of documents; a document is (length, prompt_len) or an int length
-    for padding (all labels -100). Rows are filled to T exactly."""
+    for padding (all labels -100). Rows are filled to t_len (default T) exactly."""
+    T = t_len
     g = torch.Generator().manual_seed(1000 + seed)
     M, B = len(layout), len(layout[0])
     tok = torch.zeros(M, B, T, dtype=torch.int32)
@@ -290,6 +291,7 @@ def rel_err(a, b) -> float:
 
 
 def check_logits(w: Window, out: dict[str, Any], ref_logits, atol: float, rtol: float) -> float:
+    T = w.tokens.shape[2]
     worst = 0.0
     for d in w.docs:
         got = out["logits"][d.mb, d.row * T + d.start : d.row * T + d.start + d.length]
@@ -382,6 +384,8 @@ def test_base_model_matches_hf_including_hf_loss(variant, tiny, fwdbwd, tmp_path
 # (variant, targets, rslora): attention-only, MLP-only and mixed target sets across families
 LORA_CASES = [
     ("llama", ALL_TARGETS, False),
+    ("llama_mha", ALL_TARGETS, False),
+    ("llama_mqa", ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj"], True),
     ("llama3_rope", ["q_proj", "v_proj", "down_proj"], False),
     ("llama_tied", ["k_proj", "o_proj", "gate_proj"], True),
     ("qwen2", ALL_TARGETS, False),
@@ -398,9 +402,13 @@ def test_lora_fp32_matches_peft(variant, targets, rslora, backend, tiny, fwdbwd,
     cfg = json.loads((mdir / "config.json").read_text())
     pm = peft_model(mdir, torch.float32, targets, rslora=rslora, alpha=8.0)
     hd = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
-    assert (
-        cfg["num_attention_heads"] // cfg["num_key_value_heads"] > 1 and cfg["num_key_value_heads"] > 1
-    )  # GQA
+    hq, hkv = cfg["num_attention_heads"], cfg["num_key_value_heads"]
+    if variant == "llama_mha":
+        assert hkv == hq  # G = 1
+    elif variant == "llama_mqa":
+        assert hkv == 1 and hq > 1  # G = Hq
+    else:
+        assert hq // hkv > 1 and hkv > 1  # GQA
     if variant.startswith("qwen3_hd32"):
         assert hd != cfg["hidden_size"] // cfg["num_attention_heads"]
     adapter = write_adapter(pm, tmp_path / "adapter")
@@ -505,16 +513,37 @@ def test_fully_unlabelled_window_is_zero_not_nan(reduction, tiny, fwdbwd, tmp_pa
     assert grads and all(torch.isfinite(g).all() and (g == 0).all() for g in grads)
 
 
+@pytest.mark.parametrize("shape", [(0, 2**32, 2**32), (0, 2, 3), (1, 0, 5), (2, 3, 0), (0, 7)], ids=str)
+@pytest.mark.parametrize("logits", [False, True], ids=["no_logits", "logits"])
+def test_fwdbwd_refuses_empty_batch_shapes(shape, logits, tiny, fwdbwd, tmp_path):
+    """A batch file is untrusted input: an empty dimension is a shape error, not an empty output file
+    (or, with huge other dimensions, a signed overflow in B * T)."""
+    # numel is 0, so the file is just the header (torch cannot build the [0, 2^32, 2^32] tensor)
+    hdr = {k: {"dtype": "I32", "shape": list(shape), "data_offsets": [0, 0]} for k in ("tokens", "labels")}
+    raw = json.dumps(hdr).encode()
+    (tmp_path / "b").write_bytes(len(raw).to_bytes(8, "little") + raw)
+    proc = run_rrc(
+        fwdbwd, tiny("llama"), tmp_path / "b", tmp_path / "o", lora="none", logits=logits, expect_ok=False
+    )
+    assert proc.returncode != 0 and proc.returncode > 0, (proc.returncode, proc.stderr)
+    assert not (tmp_path / "o").exists()
+
+
 # --------------------------------------------------------------------------------------------
 # input-gradient path: LoRA on upper layers only vs on all layers
 # --------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("layers", [[1, 2], [2], None], ids=["upper2", "top", "all"])
+@pytest.mark.parametrize(
+    "layers",
+    [[1, 2], [2], None, [1], [0], [0, 2]],
+    ids=["upper2", "top", "all", "middle", "bottom", "gap"],
+)
 def test_upper_layers_only_vs_all_layers(layers, tiny, fwdbwd, tmp_path):
     """With LoRA only on upper layers the backward stops at the lowest adapted layer; with all layers
     the lower layers' grads require the input gradient propagated through every upper layer
-    (non-zero B there)."""
+    (non-zero B there). [1]: the backward stops at a middle layer below an unadapted one; [0]: the
+    input gradient crosses two unadapted layers; [0, 2]: it crosses the unadapted gap layer 1."""
     mdir = tiny("llama_3layers")
     targets = ["q_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
     pm = peft_model(mdir, torch.float32, targets, layers=layers)
@@ -530,6 +559,102 @@ def test_upper_layers_only_vs_all_layers(layers, tiny, fwdbwd, tmp_path):
     check_logits(w, out, ref_logits, atol=2e-5, rtol=2e-5)
     assert abs(float(meta["loss"]) - loss) <= 2e-5 * loss
     check_grads(out, ref_grads, rtol=5e-5)
+
+
+# --------------------------------------------------------------------------------------------
+# attention layouts at the ends of GQA, single-token documents, T = 1
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("attn_chunk", [1, 6, T], ids=lambda c: f"chunk{c}")
+@pytest.mark.parametrize("variant", ["llama_mha", "llama_mqa"])
+def test_mha_mqa_attention_chunks(variant, attn_chunk, tiny, fwdbwd, tmp_path):
+    """MHA (G = 1) and MQA (Hkv = 1) are the extreme strides of the batched dK / dV GEMMs; chunks of 1
+    and 6 (< T) exercise the chunked attention against the unchunked one (T)."""
+    mdir = tiny(variant)
+    cfg = json.loads((mdir / "config.json").read_text())
+    assert cfg["num_key_value_heads"] == (cfg["num_attention_heads"] if variant == "llama_mha" else 1)
+    pm = peft_model(mdir, torch.float32, ALL_TARGETS, seed=7)
+    adapter = write_adapter(pm, tmp_path / "adapter")
+    w = build_window(MAIN_LAYOUT, seed=7)
+    loss, counts, ref_logits, ref_grads = reference(pm, w)
+    save_batch(w, tmp_path / "batch")
+    out, meta = run_rrc(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path / "out", lora=adapter, attn_chunk=attn_chunk, ce_chunk=3
+    )
+    assert out["n_tokens"].tolist() == counts
+    check_logits(w, out, ref_logits, atol=2e-5, rtol=2e-5)
+    assert abs(float(meta["loss"]) - loss) <= 2e-5 * loss
+    check_grads(out, ref_grads, rtol=5e-5)
+
+
+# runs of length-1 documents (k0 == q0, a key chunk of one row, the shifted label always ignored),
+# one starting exactly on each attention chunk boundary 5, 10, 15 (ATTN_CHUNK = 5) and a length-2
+# document starting on 10; micro-batch 1 keeps both micro-batches labelled
+SINGLE_TOKEN_LAYOUT: list[list[list[tuple[int, int] | int]]] = [
+    [
+        [(1, 1), (1, 1), (1, 1), (1, 1), (1, 1), (1, 1), (4, 2), (1, 1), (2, 1), (2, 1), (1, 1), (7, 2)],
+        [(9, 3), (1, 1), (2, 1), (11, 4)],
+    ],
+    MAIN_LAYOUT[1],
+]
+
+
+@pytest.mark.parametrize("attn_chunk", [1, 2, ATTN_CHUNK, T], ids=lambda c: f"chunk{c}")
+def test_single_token_documents(attn_chunk, tiny, fwdbwd, tmp_path):
+    mdir = tiny("qwen2")
+    pm = peft_model(mdir, torch.float32, ALL_TARGETS, seed=8)
+    adapter = write_adapter(pm, tmp_path / "adapter")
+    w = build_window(SINGLE_TOKEN_LAYOUT, seed=8)
+    ones = [d for d in w.docs if d.length == 1]
+    assert len(ones) >= 8
+    assert {d.start for d in ones if d.mb == 0 and d.row == 0} >= {0, 1, 2, 3, 4, 5, 10, 15}
+    assert any(d.length == 2 and d.start == 10 for d in w.docs)
+    loss, counts, ref_logits, ref_grads = reference(pm, w)
+    assert all(counts)
+    save_batch(w, tmp_path / "batch")
+    for ce_chunk in (1, CE_CHUNK):
+        out, meta = run_rrc(
+            fwdbwd,
+            mdir,
+            tmp_path / "batch",
+            tmp_path / f"out{ce_chunk}",
+            lora=adapter,
+            attn_chunk=attn_chunk,
+            ce_chunk=ce_chunk,
+        )
+        assert out["n_tokens"].tolist() == counts
+        check_logits(w, out, ref_logits, atol=2e-5, rtol=2e-5)
+        assert abs(float(meta["loss"]) - loss) <= 2e-5 * loss
+        check_grads(out, ref_grads, rtol=5e-5)
+
+
+@pytest.mark.parametrize("attn_chunk", [1, ATTN_CHUNK])
+def test_rows_of_one_token(attn_chunk, tiny, fwdbwd, tmp_path):
+    """T = 1: every row is a single document whose only label is shifted away. Logits match HF, the
+    counts are 0, the loss is 0 and every gradient is exactly 0 (not NaN)."""
+    mdir = tiny("llama")
+    pm = peft_model(mdir, torch.float32, ALL_TARGETS, seed=9)
+    adapter = write_adapter(pm, tmp_path / "adapter")
+    w = build_window([[[(1, 1)], [(1, 1)], [(1, 1)]], [[(1, 1)], [(1, 1)], [(1, 1)]]], seed=9, t_len=1)
+    _, counts, ref_logits, _ = reference(pm, w)
+    assert counts == [0, 0]
+    save_batch(w, tmp_path / "batch")
+    for red in ("window_tokens", "microbatch_mean"):
+        out, meta = run_rrc(
+            fwdbwd,
+            mdir,
+            tmp_path / "batch",
+            tmp_path / f"out_{red}",
+            lora=adapter,
+            attn_chunk=attn_chunk,
+            reduction=red,
+        )
+        assert out["n_tokens"].tolist() == [0, 0]
+        assert float(meta["loss"]) == 0.0
+        check_logits(w, out, ref_logits, atol=2e-5, rtol=2e-5)
+        grads = [v for k, v in out.items() if k.startswith("grad.")]
+        assert grads and all((g == 0).all() for g in grads)
 
 
 # --------------------------------------------------------------------------------------------

@@ -78,8 +78,9 @@ $(BINS): $(BUILD)/%: $(BUILD)/obj/src/%.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # --wrap=malloc: tests/c/test_contracts.c counts the allocation sizes of library code.
+# --wrap=rename: tests/c/test_train.c injects rename failures into checkpoint publishing.
 $(TEST_BIN): $(TEST_OBJS) $(LIB)
-	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ -Wl,--wrap=malloc $(LDLIBS)
+	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ -Wl,--wrap=malloc -Wl,--wrap=rename $(LDLIBS)
 
 # The C tests use python3 (if present) to produce a safetensors file with the reference package;
 # that sub-test is skipped with a message when python3 / safetensors / torch are unavailable.

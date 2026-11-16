@@ -105,6 +105,21 @@ rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_mode
     RRC_CHECK_GOTO(st, rrc_config_load(dir, o.config_flags, &m->cfg), fail);
     const rrc_model_config *cfg = &m->cfg;
     m->n_pos = o.max_positions > 0 ? o.max_positions : cfg->max_position_embeddings;
+    /* config.json's max_position_embeddings is bounded by no tensor: the RoPE tables (2 * n_pos *
+     * head_dim / 2 floats) are refused before any allocation when the count leaves the range that
+     * max_positions has (<= 2^31 - 1) or the byte size overflows */
+    {
+        int64_t bytes = 0;
+        if (m->n_pos > INT32_MAX ||
+            __builtin_mul_overflow(m->n_pos, cfg->head_dim / 2 * 2 * (int64_t)sizeof(float), &bytes) ||
+            (uint64_t)bytes > (uint64_t)SIZE_MAX) {
+            st = RRC_ERROR(RRC_ERR_UNSUPPORTED,
+                           "RoPE tables for %lld positions (config.json max_position_embeddings) x head_dim %lld: "
+                           "at most 2^31 - 1 positions; set max_positions to bound the tables",
+                           (long long)m->n_pos, (long long)cfg->head_dim);
+            goto fail;
+        }
+    }
     RRC_CHECK_GOTO(st, rrc_st_open_checkpoint(dir, &set), fail);
     RRC_CHECK_GOTO(st, rrc_config_check_tensors(cfg, set), fail);
     RRC_CHECK_GOTO(st, rrc_config_expected_tensors(cfg, &specs, &n_specs), fail);

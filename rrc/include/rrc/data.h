@@ -108,6 +108,11 @@ typedef struct rrc_loader_opts {
 
 /* Position in the document stream: the next document to place is entry `index` of epoch
  * `epoch`'s order (0 <= index <= usable docs; index == usable docs rolls over to the next epoch). */
+/* Upper bound of every cursor counter (epoch, micro_batches) accepted from outside (a start
+ * cursor, a checkpoint): far beyond any real run, and far enough below INT64_MAX that the loader's
+ * increments cannot overflow. */
+#define RRC_DATA_COUNTER_MAX ((int64_t)1 << 62)
+
 typedef struct rrc_data_cursor {
     int64_t epoch;
     int64_t index;

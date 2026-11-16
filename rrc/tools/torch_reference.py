@@ -117,6 +117,10 @@ class RefConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     loss_reduction: str = "window_tokens"
+    # rrc's documented behaviour for a window without labelled tokens (DESIGN.md section 10 item 21):
+    # the AdamW step still runs with g = 0. torch.optim skips parameters whose .grad is None, so the
+    # reference feeds explicit zero gradients when this is set.
+    zero_grad_if_empty: bool = False
 
 
 def split_documents(tokens: Any, labels: Any, doc_ids: Any) -> list[tuple[Any, Any]]:
@@ -184,6 +188,9 @@ def train_reference(
                 scale = 1.0 / total if cfg.loss_reduction == "window_tokens" else 1.0 / (counts[m] * M)
                 (s * scale).backward()
                 loss_val += float(s.detach()) * scale
+        if total == 0 and cfg.zero_grad_if_empty:
+            for p in params:
+                p.grad = torch.zeros_like(p)
         if cfg.max_grad_norm > 0:
             norm = torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
         else:

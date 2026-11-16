@@ -387,9 +387,113 @@ RT_TEST(data_loader_misuse_and_errors) {
     rrc_dataset_free(d);
 }
 
+/* data.h: release may happen in any order, and at most max_held batches are held at once. Holding
+ * one batch while more than a full turn of the ring passes through the second hold must neither
+ * fail (no prefetch) nor deadlock (prefetch), and the stream must stay the reference stream. */
+RT_TEST(data_loader_hold_across_ring_wrap) {
+    static bbuf b;
+    make_docs(&b, 13, 9, 4, 30);
+    const char *p = rt_path("wrap.rrcbin");
+    RT_ASSERT(write_file(p, b.b, b.n), "write");
+    rrc_dataset *d = NULL;
+    RT_OK(rrc_dataset_open(p, 30, &d));
+    rrc_loader_opts o;
+    memset(&o, 0, sizeof o);
+    o.seq_len = 8;
+    o.rows = 2;
+    o.seed = 5;
+    o.shuffle = 1;
+    o.pad_token_id = 1;
+    static packed ref;
+    const int N = 40;
+    rrc_data_cursor c0 = {0, 0, 0};
+    RT_OK(pack_n(d, o, c0, N, 1, &ref));
+    const int64_t sz = o.rows * o.seq_len;
+    for (int variant = 0; variant < 4; variant++) {
+        o.prefetch = variant & 1;
+        o.max_held = variant & 2 ? 3 : 2;
+        const int keep = (int)o.max_held - 1; /* batches held for the whole run */
+        rrc_loader *l = NULL;
+        RT_OK(rrc_loader_create(d, &o, NULL, &l));
+        const rrc_microbatch *held[4] = {NULL, NULL, NULL, NULL}, *mb = NULL;
+        int k = 0, ok = 1;
+        for (; k < keep && ok; k++) {
+            ok = rrc_loader_next(l, &held[k]) == RRC_OK;
+            ok = ok && !memcmp(held[k]->tokens, ref.tok + k * sz, (size_t)sz * 4);
+        }
+        RT_EXPECT(ok, "variant %d: first %d batches (%s)", variant, keep, rrc_last_error());
+        /* 8 * max_held further batches: four turns of the prefetch ring (2 * max_held slots) */
+        for (; ok && k < keep + 8 * (int)o.max_held && k < N; k++) {
+            rrc_status st = rrc_loader_next(l, &mb);
+            RT_EXPECT(st == RRC_OK, "variant %d: next() #%d with %d of %lld held failed: %s", variant, k, keep,
+                      (long long)o.max_held, rrc_last_error());
+            if (st != RRC_OK) {
+                ok = 0;
+                break;
+            }
+            RT_EXPECT(!memcmp(mb->tokens, ref.tok + k * sz, (size_t)sz * 4) &&
+                          !memcmp(mb->labels, ref.lab + k * sz, (size_t)sz * 4) &&
+                          !memcmp(mb->doc_ids, ref.did + k * sz, (size_t)sz * 4) && mb->end.index == ref.end[k].index &&
+                          mb->end.epoch == ref.end[k].epoch,
+                      "variant %d: batch %d is not the reference stream", variant, k);
+            RT_OK(rrc_loader_release(l, mb));
+        }
+        /* the long-held batches are still intact */
+        for (int j = 0; j < keep; j++)
+            if (held[j]) {
+                RT_EXPECT(!memcmp(held[j]->tokens, ref.tok + j * sz, (size_t)sz * 4), "variant %d: held batch %d was "
+                          "overwritten", variant, j);
+                RT_OK(rrc_loader_release(l, held[j]));
+            }
+        rrc_loader_free(l);
+    }
+    rrc_dataset_free(d);
+}
+
+/* Counters near INT64_MAX: the permutation of any epoch is defined (unsigned arithmetic), and the
+ * loader refuses a start cursor beyond RRC_DATA_COUNTER_MAX instead of overflowing. */
+RT_TEST(data_cursor_counter_bounds) {
+    int64_t perm[7];
+    rrc_data_permutation(9, INT64_MAX, 7, perm);
+    int seen = 0;
+    for (int i = 0; i < 7; i++) seen |= 1 << perm[i];
+    RT_EXPECT(seen == 0x7f, "permutation of epoch INT64_MAX");
+    static bbuf b;
+    make_docs(&b, 5, 6, 2, 20);
+    const char *p = rt_path("bounds.rrcbin");
+    RT_ASSERT(write_file(p, b.b, b.n), "write");
+    rrc_dataset *d = NULL;
+    RT_OK(rrc_dataset_open(p, 0, &d));
+    for (int pf = 0; pf < 2; pf++) {
+        rrc_loader_opts o;
+        memset(&o, 0, sizeof o);
+        o.seq_len = 8;
+        o.rows = 1;
+        o.max_held = 1;
+        o.shuffle = 1;
+        o.prefetch = pf;
+        rrc_loader *l = NULL;
+        const rrc_data_cursor bad[] = {{INT64_MAX, 5, 0}, {INT64_MAX, 0, 0}, {INT64_MAX - 1, 0, 0},
+                                       {0, 0, INT64_MAX}, {RRC_DATA_COUNTER_MAX + 1, 0, 0}};
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            RT_STATUS(rrc_loader_create(d, &o, &bad[i], &l), RRC_ERR_INVALID_ARG);
+            RT_EXPECT(l == NULL, "loader set on failure");
+        }
+        const rrc_data_cursor edge = {RRC_DATA_COUNTER_MAX, 5, RRC_DATA_COUNTER_MAX};
+        RT_OK(rrc_loader_create(d, &o, &edge, &l));
+        const rrc_microbatch *mb = NULL;
+        RT_OK(rrc_loader_next(l, &mb));
+        RT_EXPECT(mb->start.epoch == RRC_DATA_COUNTER_MAX + 1 && mb->start.index == 0, "edge cursor normalized");
+        RT_OK(rrc_loader_release(l, mb));
+        rrc_loader_free(l);
+    }
+    rrc_dataset_free(d);
+}
+
 const rt_case rt_suite_data[] = {
     RT_CASE(rrcbin_valid_and_doc_access), RT_CASE(rrcbin_malformed_cases), RT_CASE(rrcbin_truncation_and_corruption_fuzz),
     RT_CASE(data_permutation), RT_CASE(data_packing_invariants_and_prefetch_determinism),
-    RT_CASE(data_loader_misuse_and_errors),
+    RT_CASE(data_loader_misuse_and_errors), RT_CASE(data_loader_hold_across_ring_wrap),
+    RT_CASE(data_cursor_counter_bounds),
 };
 const size_t rt_suite_data_n = sizeof rt_suite_data / sizeof rt_suite_data[0];

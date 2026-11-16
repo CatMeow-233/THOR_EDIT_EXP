@@ -197,7 +197,8 @@ uint64_t rrc_splitmix64_next(uint64_t *s) {
 
 void rrc_data_permutation(uint64_t seed, int64_t epoch, int64_t n, int64_t *perm) {
     uint64_t s0 = seed;
-    uint64_t state = rrc_splitmix64_next(&s0) ^ (0xD1B54A32D192ED03ull * (uint64_t)(epoch + 1));
+    /* (uint64_t)epoch + 1: the same value as epoch + 1 for every valid epoch, defined for all */
+    uint64_t state = rrc_splitmix64_next(&s0) ^ (0xD1B54A32D192ED03ull * ((uint64_t)epoch + 1u));
     for (int64_t i = 0; i < n; i++) perm[i] = i;
     for (int64_t i = n - 1; i >= 1; i--) {
         const int64_t j = (int64_t)(rrc_splitmix64_next(&state) % (uint64_t)(i + 1));
@@ -214,6 +215,7 @@ enum { SLOT_FREE = 0, SLOT_BUSY = 1, SLOT_READY = 2, SLOT_HELD = 3 };
 typedef struct slot {
     rrc_microbatch mb; /* first member: a held rrc_microbatch pointer maps back to its slot */
     int state;
+    int64_t seq; /* stream position of the batch in a READY / HELD slot */
     rrc_status st;
     char err[RRC_ERROR_MSG_MAX];
 } slot;
@@ -228,7 +230,9 @@ struct rrc_loader {
     int64_t order_epoch; /* epoch `order` was built for (-1: none) */
     rrc_data_cursor cur;
     uint8_t *mask_tmp;
-    /* ring */
+    /* ring: slots are not used in a fixed order. The producer fills any FREE slot with stream
+     * position next_produce; the consumer takes the READY slot whose seq is next_consume. A batch
+     * held for a long time (release in any order, data.h) therefore never blocks the others. */
     slot *slots;
     int64_t cap;
     int64_t next_produce, next_consume, held;
@@ -304,17 +308,32 @@ static void slot_store_error(slot *s, rrc_status st) {
     snprintf(s->err, sizeof s->err, "%s", st == RRC_OK ? "" : rrc_last_error());
 }
 
+/* A FREE slot or NULL (caller holds the mutex when threaded). */
+static slot *find_free(rrc_loader *l) {
+    for (int64_t i = 0; i < l->cap; i++)
+        if (l->slots[i].state == SLOT_FREE) return &l->slots[i];
+    return NULL;
+}
+
+/* The READY slot at stream position `seq` or NULL (caller holds the mutex). */
+static slot *find_ready(rrc_loader *l, int64_t seq) {
+    for (int64_t i = 0; i < l->cap; i++)
+        if (l->slots[i].state == SLOT_READY && l->slots[i].seq == seq) return &l->slots[i];
+    return NULL;
+}
+
 static void *producer_main(void *arg) {
     rrc_loader *l = (rrc_loader *)arg;
     for (;;) {
-        slot *s = &l->slots[l->next_produce % l->cap];
+        slot *s = NULL;
         pthread_mutex_lock(&l->mu);
-        while (s->state != SLOT_FREE && !l->stop) pthread_cond_wait(&l->cv, &l->mu);
+        while (!l->stop && !(s = find_free(l))) pthread_cond_wait(&l->cv, &l->mu);
         if (l->stop) {
             pthread_mutex_unlock(&l->mu);
             break;
         }
         s->state = SLOT_BUSY;
+        s->seq = l->next_produce;
         pthread_mutex_unlock(&l->mu);
         rrc_status st = produce(l, &s->mb);
         pthread_mutex_lock(&l->mu);
@@ -365,6 +384,9 @@ rrc_status rrc_loader_create(const rrc_dataset *d, const rrc_loader_opts *o, con
                 "pad_token_id = %d outside the vocabulary [0, %lld)", (int)o->pad_token_id, (long long)d->vocab);
     RRC_REQUIRE(!start || (start->epoch >= 0 && start->index >= 0 && start->micro_batches >= 0), RRC_ERR_INVALID_ARG,
                 "negative data cursor");
+    RRC_REQUIRE(!start || (start->epoch <= RRC_DATA_COUNTER_MAX && start->micro_batches <= RRC_DATA_COUNTER_MAX),
+                RRC_ERR_INVALID_ARG, "data cursor out of range (epoch %lld, micro_batches %lld; at most 2^62)",
+                (long long)start->epoch, (long long)start->micro_batches);
     rrc_loader *l = (rrc_loader *)calloc(1, sizeof *l);
     if (!l) return RRC_ERROR(RRC_ERR_OOM, "rrc_loader");
     l->d = d;
@@ -448,14 +470,19 @@ rrc_status rrc_loader_next(rrc_loader *l, const rrc_microbatch **out) {
     *out = NULL;
     RRC_REQUIRE(l->held < l->o.max_held, RRC_ERR_INVALID_ARG,
                 "the consumer already holds %lld micro-batches (max_held): release one first", (long long)l->held);
-    slot *s = &l->slots[l->next_consume % l->cap];
+    slot *s = NULL;
     if (!l->threaded) {
-        RRC_REQUIRE(s->state == SLOT_FREE, RRC_ERR_INTERNAL, "loader slot not free");
+        s = find_free(l); /* cap == max_held > held */
+        RRC_REQUIRE(s, RRC_ERR_INTERNAL, "no free loader slot with %lld of %lld held", (long long)l->held,
+                    (long long)l->cap);
         RRC_CHECK_CTX(produce(l, &s->mb), "data loader");
+        s->seq = l->next_consume;
         s->state = SLOT_HELD;
     } else {
+        /* the producer fills slots in stream order and at most max_held - 1 of the 2 * max_held
+         * slots are held here, so the batch at next_consume is or will become READY */
         pthread_mutex_lock(&l->mu);
-        while (s->state != SLOT_READY) pthread_cond_wait(&l->cv, &l->mu);
+        while (!(s = find_ready(l, l->next_consume))) pthread_cond_wait(&l->cv, &l->mu);
         const rrc_status st = s->st;
         if (st == RRC_OK) s->state = SLOT_HELD;
         pthread_mutex_unlock(&l->mu);

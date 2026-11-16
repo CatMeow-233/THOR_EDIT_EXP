@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(mode, "pack") || !out || T < 1 || B < 1 || N < 1 || hold < 1 || pad < 0 || pad > INT32_MAX ||
-        N > INT32_MAX / (T * B)) {
+        T > INT32_MAX || B > INT32_MAX / T || N > INT32_MAX / (T * B)) {
         rrc_dataset_free(d);
         usage();
         return 1;

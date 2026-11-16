@@ -187,8 +187,8 @@ out-of-range values. Required: `model_dir`, `data_path`, `output_dir`, `seq_len`
 | `data_path` | required | `.rrcbin` file from `prepare_sft.py` |
 | `output_dir` | required | metrics, checkpoints (created if missing) |
 | `init_adapter` | null | start from these LoRA weights: an `adapter_model.safetensors` file or a PEFT adapter directory (its `adapter_config.json` must agree with `lora`); null: rrc's seeded init (A uniform, B = 0) |
-| `resume_from` | null | a `checkpoint-<K>` directory to continue from (exclusive with `init_adapter`) |
-| `overwrite_output_dir` | false | allow a fresh run where `metrics.jsonl` already exists (it is truncated) |
+| `resume_from` | null | a `checkpoint-<K>` directory to continue from (exclusive with `init_adapter`); `output_dir` must be that checkpoint's directory, an empty one, or `overwrite_output_dir` must be set |
+| `overwrite_output_dir` | false | allow a fresh run where `metrics.jsonl` already exists (it is truncated), or a resume into a directory holding another run's `metrics.jsonl` / `checkpoint-*` (metrics start afresh); checkpoints the run does not write are kept |
 | `dtype` | `"bf16"` | base weights / activations: `"bf16"` or `"f32"` (LoRA, grads, AdamW are always fp32) |
 | `backend` | `"cpu"` | `"cpu"` (double accumulation) or `"cpu-f32acc"` (fp32 accumulation) |
 | `seq_len` | required | tokens per packed row (≤ the model's positions) |

@@ -598,6 +598,36 @@ RT_TEST(model_zero_labels_and_loss_only) {
     RT_STATUS(rrc_model_load(be, dir, &mo, &m), RRC_ERR_INVALID_ARG);
 }
 
+/* config.json's max_position_embeddings is only checked > 0 by the config parser and bounds no
+ * tensor: the RoPE table size n_pos * head_dim must not overflow (it is refused before any
+ * allocation, so this also runs under ASan's default allocator limits). */
+RT_TEST(model_load_refuses_huge_rope_table) {
+    const rrc_backend *be = rrc_backend_cpu();
+    const char *dir;
+    RT_OK(write_ckpt("huge_pos", k_cfg_qwen2, 3, &dir));
+    char file[1400];
+    snprintf(file, sizeof file, "%s/config.json", dir);
+    const char *values[] = {"4611686018427387904", "2147483648", "9223372036854775807"};
+    for (int i = 0; i < 3; i++) {
+        char cfg[1024];
+        snprintf(cfg, sizeof cfg,
+                 "{\"model_type\": \"qwen2\", \"vocab_size\": 24, \"hidden_size\": 16, \"intermediate_size\": 16, "
+                 "\"num_hidden_layers\": 2, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, "
+                 "\"max_position_embeddings\": %s, \"rms_norm_eps\": 1e-6, \"tie_word_embeddings\": false}",
+                 values[i]);
+        RT_OK(rrc_write_file_atomic(file, cfg, strlen(cfg)));
+        rrc_model *m = NULL;
+        rrc_model_opts mo;
+        rrc_model_opts_default(&mo); /* max_positions 0: the table size comes from config.json */
+        RT_STATUS(rrc_model_load(be, dir, &mo, &m), RRC_ERR_UNSUPPORTED);
+        RT_EXPECT(m == NULL && strstr(rrc_last_error(), "max_position") != NULL, "%s", rrc_last_error());
+        /* an explicit max_positions bounds the table and the model loads */
+        mo.max_positions = 32;
+        RT_OK(rrc_model_load(be, dir, &mo, &m));
+        rrc_model_free(m);
+    }
+}
+
 /* ---- the GEMM dtype combinations the model issues (input for device backends) ---------------- */
 
 static rrc_backend g_rec_be;
@@ -653,5 +683,6 @@ RT_TEST(model_gemm_dtype_combinations) {
 const rt_case rt_suite_model[] = {
     RT_CASE(model_lora_layout_and_init), RT_CASE(model_batch_validation),      RT_CASE(model_grad_finite_differences),
     RT_CASE(model_invariances),          RT_CASE(model_zero_labels_and_loss_only), RT_CASE(model_gemm_dtype_combinations),
+    RT_CASE(model_load_refuses_huge_rope_table),
 };
 const size_t rt_suite_model_n = sizeof rt_suite_model / sizeof rt_suite_model[0];

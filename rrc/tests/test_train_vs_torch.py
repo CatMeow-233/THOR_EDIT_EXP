@@ -15,6 +15,7 @@ Nothing is downloaded (HF_HUB_OFFLINE=1); tiny models, adapters and tokenizers l
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import random
 import re
@@ -420,6 +421,193 @@ def test_trajectory_fp32_matches_torch_peft(backend, reduction, setup_fp32, trai
     assert merr < tol_mv and verr < tol_mv
     assert moved > 1e-3  # the parameters really moved (the comparison is not trivially satisfied)
     assert st["step"] == N and st["tokens_seen"] == sum(ref["tokens"])
+
+
+def make_edge_docs(n: int, seed: int, seq_len: int) -> list:
+    """Documents with every packing edge: length 1 (never a target), longer than seq_len (cut or
+    dropped), exactly seq_len and seq_len + 1, and ordinary ones with a prompt prefix."""
+    rng = random.Random(seed)
+    docs = []
+    for i in range(n):
+        ln = {3: 1, 4: 1, 8: seq_len + 7, 11: seq_len, 15: seq_len + 1, 17: 1}.get(i % 19, rng.randint(2, 9))
+        p = rng.randint(0, ln - 1)
+        docs.append(([rng.randrange(VOCAB) for _ in range(ln)], [0] * p + [1] * (ln - p)))
+    return docs
+
+
+def run_and_compare_trajectory(tiny, train_exe, tmp_path, docs, cfg_kw, ref_kw, tol, init_kw=None):
+    """rrc_train vs torch.optim.AdamW + PEFT on the windows rrc dumped (which are checked against the
+    Python packing spec first). Returns (metrics, reference, errors)."""
+    mdir = tiny("llama")
+    data = tmp_path / "data.rrcbin"
+    prepare_sft.write_rrcbin(str(data), docs, VOCAB)
+    init = make_init_adapter(mdir, tmp_path / "init", **(init_kw or {}))
+    out = tmp_path / "o"
+    cfg = write_cfg(
+        tmp_path / "c.json",
+        model_dir=str(mdir),
+        data_path=str(data),
+        output_dir=str(out),
+        init_adapter=str(init),
+        dump_batches=True,
+        **cfg_kw,
+    )
+    run_train(train_exe, cfg)
+    c = json.loads(cfg.read_text())
+    N, M, B, T = c["max_steps"], c["grad_accum_steps"], c["micro_batch_size"], c["seq_len"]
+    met = read_metrics(out)
+    assert [m["step"] for m in met] == list(range(1, N + 1))
+    windows = load_windows(out, N)
+    spec, _ = tref.pack_reference(
+        docs,
+        T,
+        B,
+        M * N,
+        seed=c["seed"],
+        shuffle=c.get("shuffle", True),
+        truncation=c.get("truncation", "truncate"),
+    )
+    for step, w in enumerate(windows):
+        for k in ("tokens", "labels", "position_ids", "doc_ids"):
+            assert w[k].tolist() == spec[k][M * step : M * step + M], (step, k)
+    ref = tref.train_reference(
+        str(mdir),
+        str(init),
+        windows,
+        tref.RefConfig(
+            learning_rate=c["learning_rate"],
+            lr_scheduler_type=c["lr_scheduler_type"],
+            # transformers 5: warmup_steps >= 1 is a step count, < 1 a ratio (DESIGN.md 10 item 19)
+            warmup_steps=int(wu) if (wu := c["warmup_steps"]) >= 1 else math.ceil(wu * N),
+            max_steps=N,
+            max_grad_norm=c["max_grad_norm"],
+            weight_decay=c["weight_decay"],
+            betas=(c.get("adam_beta1", 0.9), c.get("adam_beta2", 0.999)),
+            eps=c.get("adam_epsilon", 1e-8),
+            loss_reduction=c.get("loss_reduction", "window_tokens"),
+            **ref_kw,
+        ),
+    )
+    assert [m["lr"] for m in met] == ref["lr"]
+    assert [m["tokens"] for m in met] == ref["tokens"]
+    loss_err = max(abs(m["loss"] - r) / r if r else abs(m["loss"]) for m, r in zip(met, ref["loss"]))
+    norm_err = max(
+        abs(m["grad_norm"] - r) / r if r else abs(m["grad_norm"]) for m, r in zip(met, ref["grad_norm"])
+    )
+    final = safetensors_torch.load_file(str(out / f"checkpoint-{N}/adapter_model.safetensors"))
+    assert set(final) == set(ref["params"])
+    init_sd = safetensors_torch.load_file(str(init / "adapter_model.safetensors"))
+    perr = max(rel_err(final[k], v) for k, v in ref["params"].items())
+    moved = min(rel_err(ref["params"][k], init_sd[k]) for k in init_sd)
+    st = read_state(out / f"checkpoint-{N}/rrc_state.bin", final)
+    merr = max(rel_err(st["m"][k], ref["m"][k]) for k in final)
+    verr = max(rel_err(st["v"][k], ref["v"][k]) for k in final)
+    errs = dict(loss=loss_err, grad_norm=norm_err, params=perr, m=merr, v=verr, moved=moved)
+    print(f"trajectory {tmp_path.name}: " + ", ".join(f"{k} {v:.3g}" for k, v in errs.items()))
+    tol_loss, tol_norm, tol_param, tol_mv = tol
+    assert loss_err < tol_loss and norm_err < tol_norm
+    assert perr < tol_param and merr < tol_mv and verr < tol_mv
+    assert moved > 1e-3
+    assert st["step"] == N and st["tokens_seen"] == sum(ref["tokens"])
+    return met, ref, errs
+
+
+# id -> (rrc config overrides, data seed, tolerances (loss, grad_norm, params, m / v)). Each covers
+# settings the BASE_CFG trajectory does not: grad_accum_steps 3, micro_batch_size 1 / 2, non-default
+# betas / eps / weight decay, a warmup ratio with a linear schedule, constant without clipping, both
+# truncation policies with documents of length 1, seq_len, seq_len + 1 and longer. Tolerances are
+# about 10x the measured errors (printed; DESIGN.md section 10).
+TRAJ_EXTRA = {
+    "truncate_accum3_mbs1_betas_linear_ratio": (
+        dict(
+            seq_len=16,
+            micro_batch_size=1,
+            grad_accum_steps=3,
+            max_steps=7,
+            lr_scheduler_type="linear",
+            warmup_steps=0.3,
+            adam_beta1=0.8,
+            adam_beta2=0.95,
+            adam_epsilon=1e-6,
+            weight_decay=0.3,
+            max_grad_norm=0.95,
+            truncation="truncate",
+        ),
+        11,
+        (1e-6, 3e-6, 5e-6, 2e-5),
+    ),
+    "drop_accum3_mbmean_constant_noclip": (
+        dict(
+            seq_len=16,
+            micro_batch_size=2,
+            grad_accum_steps=3,
+            max_steps=6,
+            lr_scheduler_type="constant",
+            warmup_steps=0,
+            adam_beta1=0.85,
+            adam_epsilon=1e-4,  # no element with |g| ~ eps: Adam's g / (|g| + eps) stays well conditioned
+            max_grad_norm=0.0,
+            truncation="drop",
+            loss_reduction="microbatch_mean",
+        ),
+        12,
+        (1e-6, 3e-6, 5e-6, 2e-5),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(TRAJ_EXTRA))
+def test_trajectory_fp32_other_settings_match_torch(case, tiny, train_exe, tmp_path_factory):
+    cfg_kw, seed, tol = TRAJ_EXTRA[case]
+    tmp = tmp_path_factory.mktemp(case)
+    docs = make_edge_docs(40, seed, cfg_kw["seq_len"])
+    met, ref, _ = run_and_compare_trajectory(tiny, train_exe, tmp, docs, cfg_kw, {}, tol)
+    if cfg_kw["max_grad_norm"] == 0:
+        assert all(m["clip_coef"] == 1.0 for m in met)
+    else:
+        clipped = [m["clip_coef"] < 1.0 for m in met]
+        assert any(clipped) and not all(clipped), [m["grad_norm"] for m in met]
+    if cfg_kw["lr_scheduler_type"] == "linear":
+        assert met[0]["lr"] == 0.0 and met[2]["lr"] > 0  # ceil(0.3 * 7) = 3 warmup steps
+    # every packing edge occurred in the windows rrc trained on
+    lens = [len(t) for t, _ in docs]
+    assert 1 in lens and max(lens) > cfg_kw["seq_len"]
+
+
+@pytest.mark.parametrize("reduction", ["window_tokens", "microbatch_mean"])
+def test_all_ignored_window_matches_adamw_with_zero_grads(reduction, tiny, train_exe, tmp_path):
+    """DESIGN.md section 10 item 21: a window without labelled tokens logs loss 0 and still takes the
+    AdamW step with g = 0 (moments decay, the parameters move by the remaining momentum and weight
+    decay). Compared with torch.optim.AdamW fed explicit zero gradients; with shuffle off the fully
+    masked documents 8..15 make one whole window (not the first one)."""
+    rng = random.Random(4)
+    docs = []
+    for i in range(24):
+        ln = rng.randint(3, 8)
+        masked = 8 <= i < 16
+        docs.append(([rng.randrange(VOCAB) for _ in range(ln)], [0] * ln if masked else [0] + [1] * (ln - 1)))
+    cfg_kw = dict(
+        seq_len=16,
+        micro_batch_size=1,
+        grad_accum_steps=2,
+        max_steps=6,
+        shuffle=False,
+        loss_reduction=reduction,
+        weight_decay=0.1,
+        warmup_steps=0,
+        lr_scheduler_type="constant",
+        # microbatch_mean at eps 1e-8 measured params 1.5e-5 (m 6.1e-6): a few elements with |g| near
+        # eps make Adam's m / (sqrt(v) + eps) ill-conditioned; at eps 1e-4 the error is 5.1e-7
+        adam_epsilon=1e-8 if reduction == "window_tokens" else 1e-4,
+    )
+    met, ref, _ = run_and_compare_trajectory(
+        tiny, train_exe, tmp_path, docs, cfg_kw, dict(zero_grad_if_empty=True), (1e-6, 3e-6, 5e-6, 2e-5)
+    )
+    tokens = [m["tokens"] for m in met]
+    empty = [i for i, t in enumerate(tokens) if t == 0]
+    assert empty and empty[0] > 0, tokens  # an empty window after the optimizer state exists
+    for i in empty:
+        assert met[i]["loss"] == 0.0 and met[i]["grad_norm"] == 0.0 and ref["loss"][i] == 0.0
 
 
 def test_trajectory_bf16_anchored_to_hf_bf16(setup_fp32, train_exe, tmp_path):
@@ -973,6 +1161,29 @@ def test_rrcbin_vocab_against_model(data_exe, setup_fp32, train_exe, tmp_path):
         expect_ok=False,
     )
     assert p.returncode == 2 and "larger than the model's vocabulary" in p.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--seq-len", 2**32, "--rows", 2**32, "--count", 1],
+        ["--seq-len", 2**31, "--rows", 1, "--count", 1],
+        ["--seq-len", 4, "--rows", 2**62, "--count", 1],
+        ["--seq-len", 4, "--rows", 1, "--count", 2, "--start-epoch", 2**63 - 1],
+    ],
+    ids=["TxB_wraps", "T_2^31", "B_2^62", "epoch_max"],
+)
+def test_rrc_data_refuses_out_of_range_sizes(args, data_exe, tmp_path):
+    """Untrusted CLI sizes are checked before they are multiplied (no overflow, no SIGFPE)."""
+    f = tmp_path / "d.rrcbin"
+    f.write_bytes(GOOD)
+    p = subprocess.run(
+        [str(data_exe), "pack", str(f), "--out", str(tmp_path / "o.st"), *map(str, args)],
+        capture_output=True,
+        text=True,
+    )
+    assert p.returncode in (1, 2), (p.returncode, p.stderr)
+    assert not (tmp_path / "o.st").exists()
 
 
 def pack(exe, data, out, *args) -> tuple[dict[str, Any], list[tuple[int, int]]]:

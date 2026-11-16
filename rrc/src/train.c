@@ -2,6 +2,7 @@
  * SFT training loop (rrc/include/rrc/train.h, rrc/docs/DESIGN.md §6 / §10). */
 #include "rrc/train.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -838,6 +839,15 @@ rrc_status rrc_train_state_read(const char *path, rrc_train_state *out) {
         if (out->step < 0 || out->cursor.epoch < 0 || out->cursor.index < 0 || out->cursor.micro_batches < 0 ||
             out->tokens_seen < 0)
             BAD("%s: negative counter", path);
+        /* the checksum is not a MAC: a crafted file passes it, and counters near INT64_MAX would
+         * overflow on resume (loader epoch / micro-batch increments, tokens_seen += window) */
+        if (out->step > RRC_DATA_COUNTER_MAX || out->cursor.epoch > RRC_DATA_COUNTER_MAX ||
+            out->cursor.index > RRC_DATA_COUNTER_MAX || out->cursor.micro_batches > RRC_DATA_COUNTER_MAX ||
+            out->tokens_seen > RRC_DATA_COUNTER_MAX)
+            BAD("%s: counter out of range (step %lld, epoch %lld, index %lld, micro_batches %lld, tokens_seen %lld; "
+                "at most 2^62)",
+                path, (long long)out->step, (long long)out->cursor.epoch, (long long)out->cursor.index,
+                (long long)out->cursor.micro_batches, (long long)out->tokens_seen);
         out->config_text = (char *)malloc((size_t)cfg_len + 1);
         out->m = (float *)malloc((size_t)(n ? n : 1) * sizeof(float));
         out->v = (float *)malloc((size_t)(n ? n : 1) * sizeof(float));
@@ -928,6 +938,10 @@ static rrc_status check_adapter_config(const char *dir, const rrc_lora_config *l
         st = RRC_ERROR(RRC_ERR_INVALID_ARG, "%s: %s differs from the training config's lora settings", p, what);       \
         goto done;                                                                                                     \
     } while (0)
+    if (!r || r->type != RRC_JSON_OBJECT) {
+        st = RRC_ERROR(RRC_ERR_INVALID_ARG, "%s: the root is not a JSON object (not a PEFT adapter config)", p);
+        goto done;
+    }
     {
         const rrc_json *v;
         double d;
@@ -943,7 +957,11 @@ static rrc_status check_adapter_config(const char *dir, const rrc_lora_config *l
             MISMATCH("bias (only \"none\" is supported)");
         if ((v = rrc_json_get(r, "use_dora")) && (rrc_json_as_bool(v, "use_dora", &b) != RRC_OK || b))
             MISMATCH("use_dora (not supported)");
-        if ((v = rrc_json_get(r, "target_modules")) && v->type == RRC_JSON_ARRAY) {
+        /* PEFT writes a list of module names, or a string (a regex matched against module paths)
+         * that this check cannot evaluate: only a list is accepted */
+        if ((v = rrc_json_get(r, "target_modules")) && v->type != RRC_JSON_ARRAY)
+            MISMATCH("target_modules (only a list of module names can be checked; a string is a PEFT regex)");
+        if (v) {
             unsigned mask = 0;
             for (size_t i = 0; i < rrc_json_arr_count(v); i++) {
                 unsigned one;
@@ -1044,6 +1062,14 @@ static rrc_status save_checkpoint(trainer *t, int64_t step) {
     snprintf(name, sizeof name, ".checkpoint-%lld.old", (long long)step);
     RRC_CHECK(join(old, sizeof old, c->output_dir, name));
     RRC_CHECK(remove_ckpt_dir(tmp));
+    /* checkpoint-<step> missing but .checkpoint-<step>.old present: an earlier replace of this step
+     * stopped between its two renames. Put the old copy back instead of deleting the only one. */
+    if (!path_exists(dir) && is_dir(old)) {
+        if (rename(old, dir) != 0)
+            return RRC_ERROR(RRC_ERR_IO, "restore %s -> %s: %s", old, dir, strerror(errno));
+        rrc_log(RRC_LOG_WARN, "restored %s from %s (an earlier save of step %lld was interrupted)", dir, old,
+                (long long)step);
+    }
     RRC_CHECK(remove_ckpt_dir(old));
     if (mkdir(tmp, 0755) != 0) return RRC_ERROR(RRC_ERR_IO, "mkdir %s: %s", tmp, strerror(errno));
     /* adapter weights (PEFT key names, fp32, metadata format=pt as PEFT writes) */
@@ -1087,9 +1113,18 @@ static rrc_status save_checkpoint(trainer *t, int64_t step) {
     RRC_CHECK(st);
     RRC_CHECK(fsync_path(tmp));
     /* publish: an existing checkpoint-<step> is moved aside first, then removed */
-    if (path_exists(dir) && rename(dir, old) != 0)
+    const int replacing = path_exists(dir);
+    if (replacing && rename(dir, old) != 0)
         return RRC_ERROR(RRC_ERR_IO, "rename %s -> %s: %s", dir, old, strerror(errno));
-    if (rename(tmp, dir) != 0) return RRC_ERROR(RRC_ERR_IO, "rename %s -> %s: %s", tmp, dir, strerror(errno));
+    if (rename(tmp, dir) != 0) {
+        const int e = errno;
+        /* keep a resumable checkpoint-<step>: move the previous one back (if that fails too, the
+         * next save of this step restores it from .old, see above) */
+        const int restored = replacing && rename(old, dir) == 0;
+        return RRC_ERROR(RRC_ERR_IO, "rename %s -> %s: %s%s", tmp, dir, strerror(e),
+                         !replacing ? "" : restored ? " (the previous checkpoint was kept)"
+                                                    : " (the previous checkpoint is left as .old)");
+    }
     RRC_CHECK(fsync_path(c->output_dir));
     RRC_CHECK(remove_ckpt_dir(old));
     rrc_log(RRC_LOG_INFO, "saved %s", dir);
@@ -1199,6 +1234,32 @@ static rrc_status dump_window(trainer *t, int64_t step, const rrc_microbatch *co
     return st;
 }
 
+/* 1 if `dir` is the directory that contains `path` (compared by device / inode, not by spelling). */
+static int is_parent_of(const char *dir, const char *path) {
+    char p[RRC_PATH_MAX];
+    if (strlen(path) >= sizeof p) return 0;
+    snprintf(p, sizeof p, "%s", path);
+    size_t n = strlen(p);
+    while (n > 1 && p[n - 1] == '/') p[--n] = '\0';
+    char *slash = strrchr(p, '/');
+    if (!slash) snprintf(p, sizeof p, ".");
+    else if (slash == p) p[1] = '\0';
+    else *slash = '\0';
+    struct stat a, b;
+    return stat(dir, &a) == 0 && stat(p, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+/* 1 if output_dir holds a metrics.jsonl or a checkpoint-* entry (a run's outputs). */
+static int holds_run(const char *dir, const char *mpath) {
+    if (path_exists(mpath)) return 1;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int found = 0;
+    for (struct dirent *e; !found && (e = readdir(d));) found = !strncmp(e->d_name, "checkpoint-", 11);
+    closedir(d);
+    return found;
+}
+
 static rrc_status trainer_setup(trainer *t, int64_t *start_step) {
     const rrc_train_config *c = t->c;
     *start_step = 0;
@@ -1274,8 +1335,19 @@ static rrc_status trainer_setup(trainer *t, int64_t *start_step) {
         }
         rrc_train_state_free(&s);
         RRC_CHECK(st);
-        RRC_CHECK(truncate_metrics(mpath, *start_step));
-        t->metrics = fopen(mpath, "ab");
+        /* resume into the checkpoint's own output_dir: keep its metrics up to the step. Into another
+         * directory: only an empty one (or overwrite_output_dir), whose metrics start afresh. */
+        if (is_parent_of(c->output_dir, c->resume_from)) {
+            RRC_CHECK(truncate_metrics(mpath, *start_step));
+            t->metrics = fopen(mpath, "ab");
+        } else {
+            RRC_REQUIRE(c->overwrite_output_dir || !holds_run(c->output_dir, mpath), RRC_ERR_INVALID_ARG,
+                        "%s already holds another run (metrics.jsonl or checkpoint-*) and is not the directory of "
+                        "resume_from %s: resume into that directory or an empty one, or set "
+                        "\"overwrite_output_dir\": true",
+                        c->output_dir, c->resume_from);
+            t->metrics = fopen(mpath, "wb");
+        }
     } else {
         if (c->init_adapter[0]) {
             char p[RRC_PATH_MAX];
@@ -1360,6 +1432,11 @@ rrc_status rrc_train_run(const rrc_train_config *c) {
         if (st != RRC_OK) break;
         st = rrc_sync(t.be);
         if (st != RRC_OK) break;
+        if (step == step0 + 1) /* the workspace is planned by the first forward / backward */
+            rrc_log(RRC_LOG_INFO, "per-step workspace %.3f GB (recompute %s), LoRA parameters + grads + Adam m / v "
+                    "%.3f GB (base weights not included)",
+                    (double)rrc_model_workspace_bytes(t.model) / 1e9, c->recompute == RRC_RECOMPUTE_NONE ? "none" : "full",
+                    (double)rrc_lora_num_params(t.lora) * 16.0 / 1e9);
         t.tokens_seen += window_tokens;
         const double t1 = now_s();
         st = write_metrics(&t, step, loss, lr, &os, window_tokens, input_tokens, t1 - t0, t1 - t_start);

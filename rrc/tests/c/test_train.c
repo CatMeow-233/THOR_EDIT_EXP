@@ -3,6 +3,7 @@
  * rrc_state.bin round trip and corruption, adapter_config.json, and a full rrc_train_run on a tiny
  * checkpoint with stop + resume compared byte for byte (runs under `make asan`). The comparison with
  * transformers / torch / PEFT is rrc/tests/test_train_vs_torch.py. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -388,10 +389,222 @@ RT_TEST(train_end_to_end_stop_and_resume_bit_identical) {
     fclose(fb);
 }
 
+/* ---- counters, checkpoint replacement, output_dir guard, adapter_config roots ------------------ */
+
+/* rename() fault injection (the test binary is linked with -Wl,--wrap=rename): the rename
+ * g_fail_rename_src -> g_fail_rename_dst fails with EIO. */
+int __real_rename(const char *from, const char *to);
+int __wrap_rename(const char *from, const char *to);
+static char g_fail_rename_src[1400], g_fail_rename_dst[1400];
+int __wrap_rename(const char *from, const char *to) {
+    if (g_fail_rename_dst[0] && !strcmp(to, g_fail_rename_dst) && !strcmp(from, g_fail_rename_src)) {
+        errno = EIO;
+        return -1;
+    }
+    return __real_rename(from, to);
+}
+
+/* A crafted rrc_state.bin (checksum recomputed by the writer) with a counter near INT64_MAX is
+ * refused at read time; resuming from it would overflow the loader / tokens_seen counters. */
+RT_TEST(train_state_counter_bounds) {
+    float m[1] = {0}, v[1] = {0};
+    char cfg[] = "x";
+    const char *p = rt_path("state_bounds.bin");
+    const int64_t bad_values[] = {INT64_MAX, INT64_MAX - 8, RRC_DATA_COUNTER_MAX + 1};
+    for (int field = 0; field < 5; field++)
+        for (size_t k = 0; k < sizeof bad_values / sizeof bad_values[0] + 1; k++) {
+            rrc_train_state s, r;
+            memset(&s, 0, sizeof s);
+            s.step = 1;
+            s.n_params = 1;
+            s.config_text = cfg;
+            s.m = m;
+            s.v = v;
+            const int ok = k == sizeof bad_values / sizeof bad_values[0];
+            const int64_t x = ok ? RRC_DATA_COUNTER_MAX : bad_values[k];
+            int64_t *dst[5] = {&s.step, &s.cursor.epoch, &s.cursor.index, &s.cursor.micro_batches, &s.tokens_seen};
+            *dst[field] = x;
+            RT_OK(rrc_train_state_write(p, &s));
+            if (ok) {
+                RT_OK(rrc_train_state_read(p, &r));
+                rrc_train_state_free(&r);
+            } else {
+                RT_STATUS(rrc_train_state_read(p, &r), RRC_ERR_PARSE);
+                RT_EXPECT(strstr(rrc_last_error(), "out of range") != NULL, "field %d: %s", field, rrc_last_error());
+            }
+        }
+}
+
+static rrc_status copy_file(const char *from, const char *to) {
+    FILE *a = fopen(from, "rb"), *b = a ? fopen(to, "wb") : NULL;
+    int ok = a && b;
+    char buf[4096];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof buf, a)) > 0) ok = fwrite(buf, 1, n, b) == n;
+    if (a) fclose(a);
+    if (b) ok = (fclose(b) == 0) && ok;
+    return ok ? RRC_OK : RRC_ERROR(RRC_ERR_IO, "copy %s -> %s", from, to);
+}
+
+static int ckpt_equal(const char *a, const char *b) {
+    static const char *const files[] = {"adapter_model.safetensors", "adapter_config.json", "rrc_state.bin"};
+    for (int i = 0; i < 3; i++) {
+        char pa[1400], pb[1400];
+        snprintf(pa, sizeof pa, "%s/%s", a, files[i]);
+        snprintf(pb, sizeof pb, "%s/%s", b, files[i]);
+        if (!files_equal(pa, pb)) return 0;
+    }
+    return 1;
+}
+
+static int exists(const char *p) {
+    struct stat sb;
+    return stat(p, &sb) == 0;
+}
+
+/* Replacing an existing checkpoint-N: if the final rename fails, the previous checkpoint-N is put
+ * back (still byte-identical and resumable); a checkpoint left as .checkpoint-N.old by a crash
+ * between the two renames is restored rather than deleted by the next save of step N. */
+RT_TEST(train_checkpoint_replace_is_failure_safe) {
+    char model[1200], data[1200], ref[1200], out[1200], json[8192], ck[1400], old[1400], ref_ck[1400];
+    snprintf(model, sizeof model, "%s", rt_path("rp_model"));
+    snprintf(data, sizeof data, "%s", rt_path("rp.rrcbin"));
+    snprintf(ref, sizeof ref, "%s", rt_path("rp_ref"));
+    snprintf(out, sizeof out, "%s", rt_path("rp_out"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    const char *common = "\"dtype\": \"f32\", \"seq_len\": 12, \"micro_batch_size\": 2, \"max_steps\": 3, "
+                         "\"seed\": 1, \"prefetch\": false, \"overwrite_output_dir\": true, \"lora\": {\"r\": 2}";
+#define RUN_TO(dir, extra)                                                                                             \
+    (snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s%s}",     \
+              model, data, dir, common, extra),                                                                       \
+     run_cfg(json))
+    RT_OK(RUN_TO(ref, ", \"stop_after_step\": 1"));
+    RT_OK(RUN_TO(out, ", \"stop_after_step\": 1"));
+    snprintf(ref_ck, sizeof ref_ck, "%s/checkpoint-1", ref);
+    snprintf(ck, sizeof ck, "%s/checkpoint-1", out);
+    snprintf(old, sizeof old, "%s/.checkpoint-1.old", out);
+    RT_ASSERT(ckpt_equal(ck, ref_ck), "equal runs give byte-identical checkpoints");
+    /* 1. the .tmp -> checkpoint-1 rename of the replacing save fails (after checkpoint-1 -> .old) */
+    snprintf(g_fail_rename_dst, sizeof g_fail_rename_dst, "%s", ck);
+    snprintf(g_fail_rename_src, sizeof g_fail_rename_src, "%s/.checkpoint-1.tmp", out);
+    rrc_status st = RUN_TO(out, ", \"stop_after_step\": 1");
+    g_fail_rename_dst[0] = '\0';
+    RT_EXPECT(st == RRC_ERR_IO, "failed publish returned %s", rrc_status_str(st));
+    RT_EXPECT(ckpt_equal(ck, ref_ck), "checkpoint-1 is not the previous one after a failed replace");
+    RT_EXPECT(!exists(old), ".checkpoint-1.old left behind");
+    /* 2. a crash between the two renames: checkpoint-1 missing, .checkpoint-1.old present */
+    RT_ASSERT(__real_rename(ck, old) == 0, "simulate the crash");
+    snprintf(g_fail_rename_dst, sizeof g_fail_rename_dst, "%s", ck);
+    snprintf(g_fail_rename_src, sizeof g_fail_rename_src, "%s/.checkpoint-1.tmp", out);
+    st = RUN_TO(out, ", \"stop_after_step\": 1");
+    g_fail_rename_dst[0] = '\0';
+    RT_EXPECT(st == RRC_ERR_IO, "failed publish returned %s", rrc_status_str(st));
+    RT_EXPECT(ckpt_equal(ck, ref_ck), "the .old copy was not restored");
+    /* 3. the restored checkpoint resumes */
+    char res[1200];
+    snprintf(res, sizeof res, "%s", rt_path("rp_res"));
+    char extra[2000];
+    snprintf(extra, sizeof extra, ", \"resume_from\": \"%s\"", ck);
+    RT_OK(RUN_TO(res, extra));
+    /* 4. a successful replace leaves no .old / .tmp */
+    RT_OK(RUN_TO(out, ", \"stop_after_step\": 1"));
+    RT_EXPECT(ckpt_equal(ck, ref_ck) && !exists(old), "replace");
+    snprintf(old, sizeof old, "%s/.checkpoint-1.tmp", out);
+    RT_EXPECT(!exists(old), ".tmp left behind");
+#undef RUN_TO
+}
+
+/* Resuming into an output_dir that holds another run (metrics.jsonl or checkpoints) is refused like
+ * a fresh run, unless overwrite_output_dir is set or output_dir is the checkpoint's parent. */
+RT_TEST(train_resume_output_dir_guard) {
+    char model[1200], data[1200], a[1200], b[1200], c[1200], json[8192], ck[1400], pa[1400], pb[1400];
+    snprintf(model, sizeof model, "%s", rt_path("og_model"));
+    snprintf(data, sizeof data, "%s", rt_path("og.rrcbin"));
+    snprintf(a, sizeof a, "%s", rt_path("og_A"));
+    snprintf(b, sizeof b, "%s", rt_path("og_B"));
+    snprintf(c, sizeof c, "%s", rt_path("og_C"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    const char *common = "\"dtype\": \"f32\", \"seq_len\": 12, \"max_steps\": 3, \"save_steps\": 1, "
+                         "\"prefetch\": false, \"lora\": {\"r\": 2}";
+#define RUN_TO(dir, extra)                                                                                             \
+    (snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s%s}",     \
+              model, data, dir, common, extra),                                                                       \
+     run_cfg(json))
+    RT_OK(RUN_TO(a, ", \"learning_rate\": 0.5, \"seed\": 11, \"overwrite_output_dir\": true"));
+    RT_OK(RUN_TO(b, ", \"stop_after_step\": 1, \"overwrite_output_dir\": true"));
+    snprintf(ck, sizeof ck, "%s/checkpoint-1", b);
+    char extra[2000];
+    snprintf(extra, sizeof extra, ", \"resume_from\": \"%s/\"", ck); /* trailing slash: same parent */
+    /* refused: A's metrics.jsonl and checkpoints stay untouched */
+    snprintf(pa, sizeof pa, "%s/checkpoint-3/adapter_model.safetensors", a);
+    snprintf(pb, sizeof pb, "%s/a3.safetensors", c);
+    mkdir(c, 0755);
+    RT_OK(copy_file(pa, pb));
+    RT_STATUS(RUN_TO(a, extra), RRC_ERR_INVALID_ARG);
+    RT_EXPECT(strstr(rrc_last_error(), "overwrite_output_dir") != NULL, "%s", rrc_last_error());
+    RT_EXPECT(files_equal(pa, pb), "A's checkpoint-3 was rewritten");
+    /* allowed: the checkpoint's own parent, a fresh directory, and A with overwrite_output_dir */
+    RT_OK(RUN_TO(b, extra));
+    snprintf(pa, sizeof pa, "%s/fresh", c);
+    RT_OK(RUN_TO(pa, extra));
+    snprintf(pa, sizeof pa, "%s/checkpoint-3", b);
+    snprintf(pb, sizeof pb, "%s/fresh/checkpoint-3", c);
+    RT_EXPECT(ckpt_equal(pa, pb), "resume into a fresh directory");
+    char extra2[2100];
+    snprintf(extra2, sizeof extra2, "%s, \"overwrite_output_dir\": true", extra);
+    RT_OK(RUN_TO(a, extra2));
+    snprintf(pa, sizeof pa, "%s/checkpoint-3", a);
+    RT_EXPECT(ckpt_equal(pa, pb), "resume into A with overwrite_output_dir");
+#undef RUN_TO
+}
+
+/* An adapter_config.json whose root is not an object, or whose target_modules is not a list, cannot
+ * be verified against the lora settings and is refused. */
+RT_TEST(train_init_adapter_config_roots) {
+    char model[1200], data[1200], out[1200], ad[1200], json[8192], p[1400], q[1400];
+    snprintf(model, sizeof model, "%s", rt_path("ar_model"));
+    snprintf(data, sizeof data, "%s", rt_path("ar.rrcbin"));
+    snprintf(out, sizeof out, "%s", rt_path("ar_out"));
+    snprintf(ad, sizeof ad, "%s", rt_path("ar_adapter"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    const char *common = "\"dtype\": \"f32\", \"seq_len\": 12, \"max_steps\": 1, \"prefetch\": false, "
+                         "\"overwrite_output_dir\": true, \"lora\": {\"r\": 2}";
+    snprintf(json, sizeof json, "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", %s}", model,
+             data, out, common);
+    RT_OK(run_cfg(json));
+    mkdir(ad, 0755);
+    snprintf(p, sizeof p, "%s/checkpoint-1/adapter_model.safetensors", out);
+    snprintf(q, sizeof q, "%s/adapter_model.safetensors", ad);
+    RT_OK(copy_file(p, q));
+    snprintf(p, sizeof p, "%s/checkpoint-1/adapter_config.json", out);
+    snprintf(q, sizeof q, "%s/adapter_config.json", ad);
+    RT_OK(copy_file(p, q));
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"init_adapter\": \"%s\", %s}",
+             model, data, out, ad, common);
+    RT_OK(run_cfg(json)); /* rrc's own adapter_config.json is accepted */
+    const char *bad[] = {"[]", "\"x\"", "7", "null", "{\"target_modules\": \"all-linear\"}",
+                         "{\"target_modules\": \".*q_proj\"}", "{\"target_modules\": null}"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        RT_OK(rrc_write_file_atomic(q, bad[i], strlen(bad[i])));
+        RT_STATUS(run_cfg(json), RRC_ERR_INVALID_ARG);
+        RT_EXPECT(strstr(rrc_last_error(), "adapter_config.json") != NULL, "%s: %s", bad[i], rrc_last_error());
+    }
+    const char *good = "{\"r\": 2, \"target_modules\": [\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\", "
+                       "\"gate_proj\", \"up_proj\", \"down_proj\"]}";
+    RT_OK(rrc_write_file_atomic(q, good, strlen(good)));
+    RT_OK(run_cfg(json));
+}
+
 const rt_case rt_suite_train[] = {
     RT_CASE(train_lr_schedule_values),         RT_CASE(train_clip_coef),
     RT_CASE(train_optimizer_step_matches_kernel), RT_CASE(train_config_parse_and_round_trip),
     RT_CASE(train_state_round_trip_and_corruption), RT_CASE(train_adapter_config_json),
-    RT_CASE(train_end_to_end_stop_and_resume_bit_identical),
+    RT_CASE(train_end_to_end_stop_and_resume_bit_identical), RT_CASE(train_state_counter_bounds),
+    RT_CASE(train_checkpoint_replace_is_failure_safe), RT_CASE(train_resume_output_dir_guard),
+    RT_CASE(train_init_adapter_config_roots),
 };
 const size_t rt_suite_train_n = sizeof rt_suite_train / sizeof rt_suite_train[0];

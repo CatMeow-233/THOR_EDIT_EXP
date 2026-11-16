@@ -82,6 +82,15 @@ static rrc_status read_batch(const char *path, batch_file *bf) {
         st = RRC_ERROR(RRC_ERR_SHAPE, "batch 'tokens' must be [B, T] or [M, B, T]");
         goto done;
     }
+    {
+        int64_t n = 0;
+        if (bf->M < 1 || bf->B < 1 || bf->T < 1 || __builtin_mul_overflow(bf->B, bf->T, &n) ||
+            __builtin_mul_overflow(n, bf->M, &n) || n > INT32_MAX) {
+            st = RRC_ERROR(RRC_ERR_SHAPE, "batch 'tokens' of shape [%lld, %lld, %lld]: every dimension must be >= 1 "
+                           "and M * B * T < 2^31", (long long)bf->M, (long long)bf->B, (long long)bf->T);
+            goto done;
+        }
+    }
     for (size_t i = 0; i < rrc_st_count(set); i++) {
         const char *nm = rrc_st_at(set, i)->name;
         int known = 0;

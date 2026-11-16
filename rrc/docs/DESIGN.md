@@ -499,8 +499,10 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
     chunk 5 < T = 23 (not a divisor), LM-head chunk 7 < labelled rows, ≥ 2 documents per row with a
     document crossing chunk boundaries, unequal labelled counts per micro-batch (the two reductions
     are asserted to differ), an empty micro-batch inside a window and a fully empty window, GQA with
-    G = 2 and Hkv = 2, Qwen3 with head_dim ≠ hidden/heads, llama3 rope, tied heads, Qwen2 biases,
-    upper-layers-only adapters vs all layers on a 3-layer model, both CPU backends, a bf16
+    G = 2 and Hkv = 2, MHA (G = 1) and MQA (Hkv = 1) with attention chunks 1, 6 and T (item 30),
+    runs of length-1 documents on chunk boundaries and rows of T = 1, Qwen3 with head_dim ≠ hidden/heads, llama3 rope, tied heads, Qwen2 biases,
+    adapters on the layer sets [1, 2], [2], [1], [0], [0, 2] and all layers of a 3-layer model (the
+    backward stopping below an unadapted layer, the input gradient crossing an unadapted gap), both CPU backends, a bf16
     checkpoint saved by HF in several shards (bit-identical to the single-file path). HF's own
     `model(..., labels=...).loss` pins the label shift. `tests/c/test_model.c` adds directional
     finite differences of the loss (fp32 model, double-accumulation backend), chunking / recompute /
@@ -542,7 +544,8 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     (seed, epoch); data.h), not torch's `RandomSampler`: the document order differs from an HF
     Trainer run with the same seed. It is the only random generator after initialisation, so
     (seed, epoch, index) is the full RNG + data state stored for resume.
-18. **Prefetch** is a ring of `2 × grad_accum_steps` host micro-batches filled by one pthread: the
+18. **Prefetch** is a pool of `2 × grad_accum_steps` host micro-batches filled by one pthread (slots
+    are not used round-robin: item 31): the
     `window_tokens` reduction needs the label count of the whole window before the first
     forward/backward, so the trainer takes all micro-batches of a window at once and the thread fills
     the next window meanwhile. The thread touches host memory only (backend calls stay on one thread,
@@ -570,8 +573,8 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
 21. **A window without labelled tokens** gives loss 0 and zero gradients (§10 item 10); rrc still
     performs the AdamW step with g = 0 (the moments decay and the parameters move by the remaining
     momentum) and logs a warning. torch would skip parameters whose `.grad` is `None`, and HF Trainer
-    would compute 0/0. This case is excluded from the torch comparison (the test data always has
-    labels).
+    would compute 0/0. Tested against torch AdamW fed explicit zero gradients
+    (`torch_reference.RefConfig.zero_grad_if_empty`, both reductions, item 32).
 22. **Metrics** (deviation from §6): `tokens_per_s` is `input_tokens_per_s` (non-padding tokens of the
     step / measured step time), `elapsed_s` counts from the start of the process (a resumed run starts
     again at 0), and there is no "max memory" field (the op table has no allocator statistics). Wall
@@ -583,7 +586,9 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     `adapter_config.json` and `rrc_state.bin` as `.tmp`, fsynced, renamed; `adapter_model.safetensors`
     by the stage A writer (`.tmp` + rename, no fsync of its own) and fsynced after its rename. The
     directory is then fsynced and renamed to `checkpoint-<step>` (an existing one is first renamed to
-    `.old` and removed afterwards), and `output_dir` is fsynced. Nothing time- or path-dependent (except the model
+    `.old` and removed afterwards; if the final rename fails it is renamed back, and a
+    `.checkpoint-<step>.old` without a `checkpoint-<step>` is restored, not deleted, by the next save
+    of that step: item 33), and `output_dir` is fsynced. Nothing time- or path-dependent (except the model
     path above) enters a checkpoint, so checkpoints of equal runs are byte-identical.
 24. **`rrc_state.bin`** (layout in train.h) stores m and v, not the parameters: those are read back
     from the checkpoint's `adapter_model.safetensors` (fp32, exact) and checked against the stored
@@ -594,8 +599,9 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     `save_steps`, `stop_after_step`, `prefetch`, `recompute` (bit-identical by §10 item 6),
     `dump_batches`, the LoRA init seed. The model itself is not hashed (16 GB); a different
     checkpoint with the same shapes would be accepted. A trailing FNV-1a 64 over the file detects
-    corruption (tested at every 5th byte). On resume, `metrics.jsonl` lines after the checkpoint step
-    and a partial last line are dropped.
+    corruption (tested at every 5th byte); it is not a MAC, so the counters are also range-checked
+    (item 34). On resume into the checkpoint's own `output_dir`, `metrics.jsonl` lines after the
+    checkpoint step and a partial last line are dropped; resuming into another directory is item 35.
 25. **Measured agreement** (tiny llama, 8 steps, grad accumulation 2, seq_len 32, 2 rows, clipping
     on 4 of 8 steps, warmup 2 + cosine, wd 0.01, two epoch boundaries; CPU double-accumulation
     backend): fp32 max relative error of the loss 5.0e-8, grad norm 3.3e-7, final LoRA parameters
@@ -619,3 +625,84 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     loss, several data files or weighting, the CUDA training path (the loop calls only the op table
     and is backend-agnostic, but `rrc_train` only offers the CPU backends), pinned host buffers,
     a memory metric, and LR schedules beyond the four above.
+
+### Step 3: review repairs (coverage, loader, robustness)
+
+28. **Fail-first evidence**. Each defect below got a regression test that failed on the code before
+    the fix (recorded in the commit message): the loader test hung with prefetch (killed by
+    `timeout`); the state, cursor, checkpoint, resume and adapter-config tests returned the wrong
+    status; the RoPE test crashed (SIGSEGV after a wrapped allocation size) and, under `make asan`,
+    reported the signed overflow at the old `model.c:165`; the permutation call reported the signed
+    overflow at the old `data.c:200` under UBSan; the CLI tests got exit 0 (`rrc_fwdbwd`, an empty
+    batch, an output file written) and exit 0 / SIGFPE (`rrc_data`). The coverage additions
+    (items 30, 32) found no defect: they pass on the unchanged library.
+29. **Bounds instead of wider types**: counters accepted from outside (a start cursor, a
+    checkpoint) are at most `RRC_DATA_COUNTER_MAX = 2^62` (data.h), far beyond any run and far enough
+    below `INT64_MAX` that the loader's `epoch++` / `micro_batches++` and the trainer's
+    `tokens_seen += window` cannot overflow. The permutation seed uses `(uint64_t)epoch + 1`, the
+    same value for every valid epoch (the Python reference is unchanged).
+30. **Coverage added (no defect found)**: tiny `llama_mha` (4 / 4 heads) and `llama_mqa` (4 / 1)
+    variants in `make_tiny_model.VARIANTS`, in `LORA_CASES` (both backends) and in a test over
+    attention chunks 1, 6 and T; a layout with eight length-1 documents (at 0..5, 10, 15: every
+    attention chunk boundary of chunk 5) and a length-2 document on a boundary, over attention
+    chunks 1, 2, 5, T and CE chunks 1, 7; rows with T = 1 (counts 0, loss 0, gradients exactly 0,
+    logits against HF); the layer sets of item 13.
+31. **Loader slots are claimed by stream position**, not `index % ring size`: each slot carries the
+    stream position of its batch; the producer fills any free slot with the next position (under
+    the mutex), the consumer takes the ready slot at its position. data.h allows release in any
+    order, and a batch held while more than a full turn of the ring went through the other hold used
+    to deadlock (prefetch) or fail with `RRC_ERR_INTERNAL` (no prefetch). With prefetch the consumer
+    holds at most `max_held − 1` of `2 · max_held` slots when it asks for a batch, so a free slot
+    always exists for the producer and the wait terminates. Tested by holding `max_held − 1` batches
+    for `8 · max_held` further batches, max_held 2 and 3, both modes, against the reference stream;
+    the data / train suites also run under `make tsan`. The slot search is linear in `2 · max_held`
+    (≤ 2^17), negligible next to a micro-batch.
+32. **Trainer coverage added (no defect found)**: two more fp32 trajectories against torch AdamW +
+    PEFT, on data with documents of length 1, seq_len, seq_len + 1 and longer than seq_len:
+    (a) truncate, grad_accum 3, micro_batch_size 1, betas (0.8, 0.95), eps 1e-6, weight decay 0.3,
+    linear schedule with warmup ratio 0.3, clipping on some steps — measured max relative error loss
+    2.9e-8, grad norm 2.0e-7, parameters 2.4e-7, m 1.1e-6, v 8.7e-7; (b) drop, grad_accum 3,
+    micro_batch_size 2, `microbatch_mean`, constant, no clipping, beta1 0.85, eps 1e-4 — loss 3.0e-8,
+    grad norm 7.9e-7, parameters 8.9e-7, m 3.5e-6, v 4.2e-6. The all-ignored window (item 21):
+    `window_tokens` at eps 1e-8 parameters 5.8e-7, m 1.2e-6; `microbatch_mean` at eps 1e-4
+    parameters 5.1e-7, m 1.9e-6. At eps 1e-8 `microbatch_mean` measured parameters 1.5e-5 (m 6.1e-6),
+    which falls to 7.7e-6 at eps 1e-6 and 5.1e-7 at eps 1e-4: elements with |g| near eps make Adam's
+    `m / (√v + eps)` ill-conditioned, so the test uses eps 1e-4 there rather than a looser
+    tolerance. All use the existing tolerances (1e-6, 3e-6, 5e-6, 2e-5).
+33. **Checkpoint replacement**: see item 23. Tested with `-Wl,--wrap=rename` on the C test binary
+    (the `.tmp → checkpoint-<step>` rename of a replacing save fails; then the state a crash between
+    the two renames leaves): the previous checkpoint stays byte-identical and resumable. If the
+    rename back fails as well, the error says the previous checkpoint is left as `.old`, and the
+    next save of that step restores it. A resume whose `checkpoint-<step>` is missing but whose
+    `.old` exists is not repaired automatically (the error is `RRC_ERR_NOT_FOUND`; renaming it back
+    by hand works).
+34. **`rrc_state.bin` counters** (step, epoch, index, micro_batches, tokens_seen) above 2^62 are
+    `RRC_ERR_PARSE`; the loader refuses a start cursor above 2^62 (`RRC_ERR_INVALID_ARG`), which also
+    covers `rrc_data --start-epoch`.
+35. **Resume into another output directory**: allowed when `output_dir` is the directory of
+    `resume_from` (compared by device / inode), when it holds no `metrics.jsonl` and no
+    `checkpoint-*` entry, or with `overwrite_output_dir`; otherwise refused like a fresh run (a
+    resume used to append to and replace another run's metrics and checkpoints). Outside the
+    checkpoint's own directory the metrics file starts afresh with the resumed steps.
+    `overwrite_output_dir` does not delete checkpoints that the new run does not write.
+36. **RoPE table size**: `max_position_embeddings` from config.json bounds no tensor; with
+    `max_positions = 0` (the trainer's default) the table had `n_pos · head_dim` floats without an
+    overflow check. Now `n_pos > 2^31 − 1` or an overflowing byte count is `RRC_ERR_UNSUPPORTED`
+    before any allocation (the message names `max_positions`, which bounds the table). The stage A
+    config parser is unchanged. The table is still built for all `n_pos` positions even when
+    `seq_len` is smaller (a few MB at 8B shapes; not changed).
+37. **Debug CLIs**: `rrc_fwdbwd` refuses a batch with an empty dimension or `M · B · T ≥ 2^31`
+    (an empty batch used to write an output file with exit 0); `rrc_data` checks `T ≤ 2^31 − 1` and
+    `B ≤ (2^31 − 1) / T` before forming `T · B`.
+38. **`adapter_config.json` checks** (init_adapter / resume): a root that is not an object and a
+    `target_modules` that is not a list (PEFT writes a string for a regex target) are refused,
+    because the alpha / rslora / dropout / DoRA / layer checks could not run on them. The training
+    config's own `"target_modules": "all-linear"` is unaffected.
+39. **Memory**: there is no pre-flight memory check (NOT DONE). The trainer logs, after the first
+    step, the per-step workspace bytes and the LoRA parameter + gradient + Adam state bytes (base
+    weights not included). A reviewer computed from the measuring pass of the workspace layout (not
+    run on a GPU, NOT_TESTED): an 8B-class bf16 model with r = 16 on all linears would need about
+    20 GB at B = 1, T = 4096 with `recompute = full`, 27 GB at B = 4, 36 GB at B = 8, and 39 GB
+    with `recompute = none` at B = 1, excluding GEMM scratch, the CUDA context and cuBLAS workspace.
+    `recompute = none` is meant for small models only; an infeasible configuration is reported only
+    when the backend allocation fails.
