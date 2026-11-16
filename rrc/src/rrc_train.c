@@ -7,6 +7,11 @@
  *
  * Exit status: 0 success, 1 usage error, 2 engine / config error (message on stderr).
  *
+ * TEST ONLY, not in the usage text: --test-offdev runs the config's CPU backend behind the
+ * off-device wrapper (rrc/offdev.h, DESIGN.md §14: device pointers are not host-mapped, so any host
+ * access to backend memory faults) and prints its allocation counters on stderr. Outputs are the
+ * normal run's bit for bit.
+ *
  * Built twice: build/rrc_train (librrc.a only: "backend" "cpu" / "cpu-f32acc"; "cuda" is refused with
  * a message) and, by `make cuda`, build/rrc_train_cuda (-DRRC_WITH_CUDA, linked with librrc_cuda.a):
  * it also runs "backend": "cuda" on device 0 (CUDA_VISIBLE_DEVICES selects the GPU). The CUDA
@@ -17,6 +22,7 @@
 #include <string.h>
 
 #include "rrc/json.h"
+#include "rrc/offdev.h"
 #include "rrc/train.h"
 #ifdef RRC_WITH_CUDA
 #include "rrc_cuda.h"
@@ -34,18 +40,19 @@ static int fail(const char *what) {
 
 int main(int argc, char **argv) {
     const char *config = NULL;
-    int print_schedule = 0, print_default = 0;
+    int print_schedule = 0, print_default = 0, test_offdev = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") && i + 1 < argc) config = argv[++i];
         else if (!strcmp(argv[i], "--print-schedule")) print_schedule = 1;
         else if (!strcmp(argv[i], "--print-default-config")) print_default = 1;
+        else if (!strcmp(argv[i], "--test-offdev")) test_offdev = 1;
         else {
             usage();
             return 1;
         }
     }
     if (print_default) {
-        if (config || print_schedule) {
+        if (config || print_schedule || test_offdev) {
             usage();
             return 1;
         }
@@ -82,6 +89,16 @@ int main(int argc, char **argv) {
         printf("%s\n", s);
         free(s);
         return 0;
+    }
+    if (test_offdev && !print_schedule) {
+        rrc_offdev_stats os;
+        memset(&os, 0, sizeof os);
+        const rrc_status st = rrc_train_run_test_offdev(&c, &os);
+        fprintf(stderr, "rrc_train: test-offdev backend: %lld allocations, %lld frees, %lld live, peak %lld bytes, "
+                        "%lld bad frees, %lld refused translations\n",
+                (long long)os.allocs, (long long)os.frees, (long long)os.live, (long long)os.peak_bytes,
+                (long long)os.bad_frees, (long long)os.bad_ptrs);
+        return st != RRC_OK ? fail("training (test-offdev)") : 0;
     }
 #ifdef RRC_WITH_CUDA
     if (c.backend == RRC_TRAIN_BACKEND_CUDA) {

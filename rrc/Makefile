@@ -1,7 +1,9 @@
 # rrc — build. All outputs go to $(BUILD) (default rrc/build/, gitignored).
 #
 #   make cpu                 static library + binaries with the CPU backend
-#   make test                build and run the C unit tests (+ nvcc header check if CUDA is set)
+#   make test                build and run the C unit tests, then the model / train suites on the
+#                            off-device test backend (rrc_tests --offdev, DESIGN.md §14)
+#                            (+ nvcc header check if CUDA is set)
 #   make cuda CUDA_HOME=...  build librrc_cuda.a, rrc_selftest, rrc_train_cuda with nvcc (CUDA_ARCH or ARCH, default sm_120)
 #   make cuda-objs CUDA_HOME=...  compile every cuda/*.cu to an object only (CI, no GPU, no link)
 #   make asan                `make test` (C tests, rrc_selftest_host, + cuda-host-test with CUDA_HOME)
@@ -133,6 +135,10 @@ expect_fail = st=0; $(1) > $(2) 2>&1 || st=$$?; \
 test: cpu $(TEST_BIN) $(SELFTEST_HOST)
 	@rm -rf $(BUILD)/test_tmp && mkdir -p $(BUILD)/test_tmp
 	RRC_TEST_TMPDIR=$(BUILD)/test_tmp $(TEST_BIN)
+	@# the model, LoRA, trainer and checkpoint suites again with the CPU backends behind the
+	@# off-device test wrapper (device pointers not host-mapped: a host access faults; DESIGN.md §14)
+	@rm -rf $(BUILD)/test_tmp_offdev && mkdir -p $(BUILD)/test_tmp_offdev
+	RRC_TEST_TMPDIR=$(BUILD)/test_tmp_offdev $(TEST_BIN) --offdev model. train. offdev.
 	$(SELFTEST_HOST) --backend emu --deferred --quick > $(BUILD)/test_tmp/selftest_host.log || { cat $(BUILD)/test_tmp/selftest_host.log; exit 1; }
 	@tail -n 1 $(BUILD)/test_tmp/selftest_host.log
 	@# negative checks of the program's exit status: no cuBLASLt (simulated: every triple refused) and

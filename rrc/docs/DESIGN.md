@@ -1034,8 +1034,9 @@ The model line (§10) and the CUDA line (§11) were merged with merge commits; n
    `CUDA_VISIBLE_DEVICES`). COMPILED-ONLY: never run on a GPU.
 3. **Host access audit**: the model, LoRA and trainer code reach backend memory only through the op
    wrappers and `rrc_buf_upload` / `rrc_buf_download` (the only pointer use is address arithmetic
-   for the gate/up view in `model.c`). This was checked by reading the code; the fake runtime of
-   `tests/cuda_host` maps device memory to host memory and would not catch a direct access.
+   for the gate/up view in `model.c`). This was first checked by reading the code (the fake runtime
+   of `tests/cuda_host` maps device memory to host memory and would not catch a direct access); it
+   is now checked by running on a backend whose device pointers fault on host access (§14).
 4. **HOST-ONLY trainer run**: `make cuda-host-train CUDA_HOME=...` links the `rrc_train_cuda` main
    with the fake runtime (`build/rrc_train_shim`), so the model and trainer drive the real
    `cuda_backend.cu` / `cuda_kernels.cu` on host threads. `rrc/tests/test_e2e_cpu.py` runs it on the
@@ -1047,3 +1048,81 @@ The model line (§10) and the CUDA line (§11) were merged with merge commits; n
 5. **End-to-end CPU smoke**: `rrc/tests/test_e2e_cpu.py` (tiny qwen3 + tokenizer trained in the test
    -> `prepare_sft.py` -> `rrc_train` cpu -> `metrics.jsonl`, checkpoints -> `PeftModel`). It is a
    plumbing check, not a numerical one (`test_train_vs_torch.py` is) and not a GPU validation.
+
+## 14. Device-pointer audit
+
+Question: does any host code outside the backends read or write backend memory directly (a
+`rrc_buf.ptr` dereference, `memcpy` / `memset` on it, a pointer handed to a host function),
+instead of `memcpy_h2d` / `memcpy_d2h` (`rrc_buf_upload` / `rrc_buf_download`)? On the CPU backend
+this works by accident; on the CUDA backend it would crash or read garbage. §12 item 3 answered it
+by reading the code. This section makes it a test.
+
+1. **The off-device test backend** (`include/rrc/offdev.h`, `src/offdev_backend.c`; TEST ONLY, not
+   in `rrc/rrc.h`). `rrc_offdev_backend_create(inner)` wraps `rrc_backend_cpu()` or
+   `rrc_backend_cpu_f32acc()` ("cpu-offdev", "cpu-f32acc-offdev", `host_accessible = 0`). It
+   reserves one PROT_NONE, MAP_NORESERVE address range (64 GiB of address space, falling back to 16 /
+   4 / 1 GiB; no fallback to host pointers) and hands out device addresses from it: page aligned,
+   bump allocated, an unmapped guard page after every allocation, never reused. The bytes are a
+   separate allocation of the inner backend. Every memory function and every op translates each
+   pointer through a table sorted by device address (base + offset, so views at any element work;
+   memcpy / memset also check the extent) and calls the inner backend's function directly with the
+   real pointers. Offsets keep their alignment modulo 64 (inner allocations are 64-byte aligned,
+   device bases page aligned) and distinct allocations are disjoint in both spaces, so every alias
+   / overlap decision of `src/ops.c` (made on device addresses) is the inner backend's. A pointer in
+   no live allocation is refused with RRC_ERR_INVALID_ARG; frees of non-base pointers are counted;
+   `rrc_offdev_backend_destroy` reports live allocations, bad frees and refused translations as
+   RRC_ERR_INTERNAL. Any host access to a device pointer is a SIGSEGV.
+2. **Selection** (all TEST ONLY, nothing in the config file, the fingerprint or the outputs changes):
+   * C tests: `rrc_tests --offdev [filters]`; `rt_cpu()` / `rt_cpu_f32acc()` (tests/c/ops_util.h)
+     return the wrappers, the test trainer helper calls `rrc_train_run_test_offdev`.
+   * `rrc_train --test-offdev` (hidden; `rrc_train_run_test_offdev` in train.h wraps the CPU
+     backend the config names, so `rrc_train_run_on`'s refusal of a device backend for a CPU config
+     stays as documented; "cuda" is refused). The wrapper's counters are printed on stderr.
+   * `rrc_fwdbwd --backend cpu-offdev|cpu-f32acc-offdev` (hidden). Counters on stderr.
+3. **What runs on it** (TESTED, CPU):
+   * `make test` (and `make asan`): `rrc_tests --offdev model. train. offdev.`: every test of the
+     model and train suites (LoRA layout / init / safetensors round trip, batch validation and its
+     data-dependent errors, finite-difference gradients for qwen3 / llama / qwen2, recompute /
+     chunking / bf16 invariances, workspace reuse, zero-label windows, load failures, the GEMM dtype
+     recorder, the fused clip + AdamW step, state files, end-to-end stop + resume, failure-safe
+     checkpoint replacement, output-dir guards, init_adapter checks) with every buffer off-device.
+   * Bit-for-bit comparisons (normal `rrc_tests` run, so also under `make asan` / `make tsan`):
+     `model.model_offdev_bit_identical`: qwen3 / llama (upper layers only) / qwen2, f32 and bf16,
+     recompute full and none, cpu and (qwen3) cpu-f32acc: LoRA load from safetensors, three
+     micro-batches with a larger third one (workspace re-plan), loss-only, no-LoRA, microbatch_mean,
+     logits and every hidden state, an out-of-range token (RRC_ERR_RANGE on both), workspace size
+     and allocation count, and the LoRA params + grads written to safetensors: all equal byte for
+     byte (16 combinations). `train.train_offdev_bit_identical`: two settings (f32 /
+     window_tokens / recompute full / prefetch off; bf16 / microbatch_mean / recompute none /
+     cpu-f32acc / prefetch on) with an init adapter, dump_batches and checkpoints every 2 steps:
+     checkpoints (adapter, adapter_config.json, rrc_state.bin), batch dumps and metrics (minus
+     wall-clock fields) equal; resuming on offdev from the CPU checkpoint and on the CPU from the
+     offdev checkpoint reach the same final bytes.
+   * pytest (`-k offdev`, 29 tests): `rrc_fwdbwd` output files identical for every
+     tiny variant of the PEFT comparison (llama, MHA, MQA, llama3 RoPE, tied, qwen2, qwen2 tied,
+     qwen3, qwen3 head_dim 32 + biases) in f32 and bf16 with non-zero PEFT adapters, `--hidden` and
+     `--logits`, plus f32acc, recompute none, microbatch_mean, upper layers only, no LoRA, loss
+     only, seeded init and an out-of-range token (same exit status and message); `rrc_train` on the
+     8-step PEFT-init trajectory (two settings) with checkpoints, batch dumps and metrics identical,
+     and cross-backend resumes byte-identical; `--test-offdev` with a "cuda" config is refused.
+   * The death tests of `offdev.offdev_host_access_faults` show the detector fires: forked children
+     reading / writing a device pointer (base, a view, the last element, a freed range) fault, the
+     same child code on a host pointer completes (under ASan the sanitizer's SEGV report and exit
+     status count as the fault).
+4. **Result: 0 violations found** in the model, LoRA, trainer, optimizer and checkpoint code; no
+   library code was changed for the audit (the trainer only gained the test entry point, a
+   refactor of `rrc_train_run_on` into a static `train_run`). `src/data.c`, `safetensors.c`,
+   `config.c` and `json.c` hold no `rrc_buf` / backend reference at all, so they cannot touch
+   backend memory: that part is shown by inspection, not by the run. What the run covers is what
+   the listed tests execute; code paths no test reaches are not covered (e.g. I/O error paths
+   inside checkpoint writing are covered only where the existing failure-injection tests reach
+   them).
+5. **The check was seen to fail** (manual, once, not committed): a `memset(l->grads.ptr, ...)` in
+   `rrc_lora_zero_grads` made `rrc_tests --offdev model.` and the normal `rrc_tests model.` (via
+   `model_offdev_bit_identical`) die with SIGSEGV; `ss = *(const float *)o->norm.ptr` in
+   `rrc_optimizer_step` made `rrc_tests --offdev train_end_to_end` die with SIGSEGV while the
+   plain CPU `train.` suite still passed.
+6. **Limits**: this proves the absence of host accesses on the paths run, with the CPU kernels as
+   the device. It says nothing about the CUDA backend's own code (COMPILED-ONLY / HOST-ONLY, §11),
+   stream ordering, or device-side bugs. Cost (computed from the code, not measured as a
+   performance number): one binary search over the live allocations per pointer per op.

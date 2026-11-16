@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include "ops_util.h"
+#include "rrc/offdev.h"
 #include "rrc/rrc.h"
 #include "rrc_kc_adamw.h"
 
@@ -46,7 +47,7 @@ RT_TEST(train_clip_coef) {
 }
 
 RT_TEST(train_optimizer_step_matches_kernel) {
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     const int64_t n = 1000;
     float *p = (float *)malloc(n * sizeof(float)), *g = (float *)malloc(n * sizeof(float));
     float *pr = (float *)malloc(n * sizeof(float)), *mr = (float *)calloc((size_t)n, sizeof(float)),
@@ -319,10 +320,15 @@ static int files_equal(const char *a, const char *b) {
     return eq;
 }
 
-static rrc_status run_cfg(const char *json) { /* parse + run */
+/* parse + run; with rrc_tests --offdev on the off-device wrapper of the config's CPU backend */
+static rrc_status run_cfg(const char *json) {
     static rrc_train_config c;
     RRC_CHECK(rrc_train_config_parse(json, strlen(json), &c));
-    return rrc_train_run(&c);
+    if (!rt_offdev_mode()) return rrc_train_run(&c);
+    rrc_offdev_stats st;
+    const rrc_status s = rrc_train_run_test_offdev(&c, &st);
+    if (s == RRC_OK && st.allocs == 0) return RRC_ERROR(RRC_ERR_INTERNAL, "offdev run allocated nothing");
+    return s;
 }
 
 RT_TEST(train_end_to_end_stop_and_resume_bit_identical) {
@@ -599,12 +605,125 @@ RT_TEST(train_init_adapter_config_roots) {
     RT_OK(run_cfg(json));
 }
 
+/* ---- the off-device backend gives the CPU backend's run bit for bit (DESIGN.md §14) ------------ */
+
+static rrc_status run_json(const char *json, int offdev, int64_t *allocs) {
+    static rrc_train_config c;
+    RRC_CHECK(rrc_train_config_parse(json, strlen(json), &c));
+    if (!offdev) return rrc_train_run(&c);
+    rrc_offdev_stats st;
+    memset(&st, 0, sizeof st);
+    const rrc_status s = rrc_train_run_test_offdev(&c, &st);
+    *allocs += st.allocs;
+    return s;
+}
+
+/* metrics.jsonl equal up to the wall-clock fields (from "step_time_s" on) */
+static int metrics_equal(const char *dir_a, const char *dir_b, int want_lines) {
+    char a[1400], b[1400], la[1024], lb[1024];
+    snprintf(a, sizeof a, "%s/metrics.jsonl", dir_a);
+    snprintf(b, sizeof b, "%s/metrics.jsonl", dir_b);
+    FILE *fa = fopen(a, "r"), *fb = fopen(b, "r");
+    int ok = fa && fb, lines = 0;
+    while (ok && fgets(la, sizeof la, fa)) {
+        char *ta = strstr(la, "\"step_time_s\""), *tb = fgets(lb, sizeof lb, fb) ? strstr(lb, "\"step_time_s\"") : NULL;
+        ok = ta && tb;
+        if (ok) {
+            *ta = *tb = '\0';
+            ok = !strcmp(la, lb);
+            lines++;
+        }
+    }
+    if (ok) ok = lines == want_lines && !fgets(lb, sizeof lb, fb);
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return ok;
+}
+
+/* Two settings (f32 / window_tokens / recompute full / prefetch off; bf16 / microbatch_mean /
+ * recompute none / cpu-f32acc / prefetch on), each with an init adapter, dump_batches and
+ * checkpoints every 2 steps: the off-device run's checkpoints (adapter, adapter_config, optimizer
+ * state), batch dumps and metrics equal the CPU run's; a resume on the off-device backend from the
+ * CPU run's checkpoint, and a CPU resume from the off-device run's, both end in the same bytes. */
+RT_TEST(train_offdev_bit_identical) {
+    char model[1200], data[1200], init[1200], json[16384];
+    snprintf(model, sizeof model, "%s", rt_path("od_model"));
+    snprintf(data, sizeof data, "%s", rt_path("od.rrcbin"));
+    snprintf(init, sizeof init, "%s", rt_path("od_init"));
+    RT_OK(write_tiny_ckpt(model));
+    RT_OK(write_tiny_data(data));
+    int64_t allocs = 0;
+    /* the init adapter: a CPU run's checkpoint (non-zero B) */
+    snprintf(json, sizeof json,
+             "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"dtype\": \"f32\", "
+             "\"seq_len\": 12, \"max_steps\": 2, \"learning_rate\": 0.05, \"prefetch\": false, "
+             "\"overwrite_output_dir\": true, \"lora\": {\"r\": 2, \"alpha\": 4}}",
+             model, data, init);
+    RT_OK(run_json(json, 0, &allocs));
+    char ad[1400];
+    snprintf(ad, sizeof ad, "%s/checkpoint-2", init);
+    static const char *const k_settings[2] = {
+        "\"dtype\": \"f32\", \"loss_reduction\": \"window_tokens\", \"recompute\": \"full\", \"prefetch\": false",
+        "\"dtype\": \"bf16\", \"loss_reduction\": \"microbatch_mean\", \"recompute\": \"none\", "
+        "\"backend\": \"cpu-f32acc\", \"prefetch\": true"};
+    for (int k = 0; k < 2; k++) {
+        char common[3000], dirs[4][1200];
+        snprintf(common, sizeof common,
+                 "%s, \"seq_len\": 12, \"micro_batch_size\": 2, \"grad_accum_steps\": 2, \"max_steps\": 5, "
+                 "\"save_steps\": 2, \"learning_rate\": 0.01, \"lr_scheduler_type\": \"cosine\", \"warmup_steps\": 1, "
+                 "\"max_grad_norm\": 0.05, \"weight_decay\": 0.01, \"seed\": 7, \"dump_batches\": true, "
+                 "\"overwrite_output_dir\": true, \"lora\": {\"r\": 2, \"alpha\": 4}, \"attn_chunk\": 5, "
+                 "\"ce_chunk\": 3",
+                 k_settings[k]);
+        static const char *const names[4] = {"od_cpu", "od_off", "od_res_off", "od_res_cpu"};
+        for (int i = 0; i < 4; i++) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "%s%d", names[i], k);
+            snprintf(dirs[i], sizeof dirs[i], "%s", rt_path(nm));
+        }
+        for (int off = 0; off < 2; off++) {
+            snprintf(json, sizeof json,
+                     "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"init_adapter\": \"%s\", %s}",
+                     model, data, dirs[off], ad, common);
+            RT_OK(run_json(json, off, &allocs));
+        }
+        /* resume from step 2 of the other backend's run */
+        for (int r = 0; r < 2; r++) {
+            const int off = r == 0; /* dirs[2]: offdev resumes the CPU run, dirs[3]: CPU resumes offdev */
+            snprintf(json, sizeof json,
+                     "{\"model_dir\": \"%s\", \"data_path\": \"%s\", \"output_dir\": \"%s\", \"resume_from\": "
+                     "\"%s/checkpoint-2\", %s}",
+                     model, data, dirs[2 + r], dirs[off ? 0 : 1], common);
+            RT_OK(run_json(json, off, &allocs));
+        }
+        for (int step = 2; step <= 5; step += step == 4 ? 1 : 2) {
+            char a[1400], b[1400];
+            snprintf(a, sizeof a, "%s/checkpoint-%d", dirs[0], step);
+            snprintf(b, sizeof b, "%s/checkpoint-%d", dirs[1], step);
+            RT_EXPECT(ckpt_equal(a, b), "setting %d: checkpoint-%d of the off-device run differs", k, step);
+            if (step < 4) continue;
+            for (int r = 2; r < 4; r++) {
+                snprintf(b, sizeof b, "%s/checkpoint-%d", dirs[r], step);
+                RT_EXPECT(ckpt_equal(a, b), "setting %d: checkpoint-%d of resume %d differs", k, step, r);
+            }
+        }
+        for (int step = 1; step <= 5; step++) {
+            char a[1400], b[1400];
+            snprintf(a, sizeof a, "%s/batches/step-%06d.safetensors", dirs[0], step);
+            snprintf(b, sizeof b, "%s/batches/step-%06d.safetensors", dirs[1], step);
+            RT_EXPECT(files_equal(a, b), "setting %d: batch dump of step %d differs", k, step);
+        }
+        RT_EXPECT(metrics_equal(dirs[0], dirs[1], 5), "setting %d: metrics differ", k);
+    }
+    RT_EXPECT(allocs > 0, "no allocation went through the off-device backend");
+}
+
 const rt_case rt_suite_train[] = {
     RT_CASE(train_lr_schedule_values),         RT_CASE(train_clip_coef),
     RT_CASE(train_optimizer_step_matches_kernel), RT_CASE(train_config_parse_and_round_trip),
     RT_CASE(train_state_round_trip_and_corruption), RT_CASE(train_adapter_config_json),
     RT_CASE(train_end_to_end_stop_and_resume_bit_identical), RT_CASE(train_state_counter_bounds),
     RT_CASE(train_checkpoint_replace_is_failure_safe), RT_CASE(train_resume_output_dir_guard),
-    RT_CASE(train_init_adapter_config_roots),
+    RT_CASE(train_init_adapter_config_roots), RT_CASE(train_offdev_bit_identical),
 };
 const size_t rt_suite_train_n = sizeof rt_suite_train / sizeof rt_suite_train[0];

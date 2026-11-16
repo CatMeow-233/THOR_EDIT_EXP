@@ -22,7 +22,8 @@ section). Nothing here makes a performance claim; every performance figure is NO
 
 ```sh
 make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_train, rrc_data (CPU backend)
-make -C rrc test                # build and run the C unit tests (build/rrc_tests)
+make -C rrc test                # build and run the C unit tests (build/rrc_tests), then the model /
+                                # train suites on the off-device test backend (rrc_tests --offdev)
 make -C rrc test CUDA_HOME=/usr/local/cuda        # + nvcc compile check of all headers (sm_120)
 make -C rrc test RRC_NVCC=/path/to/bin/nvcc       # same, with an explicit nvcc
 make -C rrc cuda CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_120   # librrc_cuda.a, rrc_selftest, rrc_train_cuda
@@ -41,7 +42,8 @@ make -C rrc clean cpu test                       # C unit tests
 HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
 ```
 
-* `rrc/tests/c/` — one binary, `build/rrc_tests [substring]` runs the matching tests:
+* `rrc/tests/c/` — one binary, `build/rrc_tests [--offdev] [substring ...]` runs the tests whose
+  `suite.name` contains one of the substrings (all without one); `--offdev` is described below:
   * `common`: status/error reporting; bf16 conversion exhaustive over all 65536 bf16 patterns,
     stratified f32 patterns against an independent double-precision RNE reference, boundaries.
   * `json`: strict parser (every malformed form rejected with line:col), UTF-8 / `\u` surrogate
@@ -61,6 +63,18 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
     OpenMP threads at sizes that run every parallel loop.
   * `grad`: every backward op (rmsnorm, rope, attention softmax, swiglu, cross entropy, GEMM
     transposes) against central finite differences of double-precision forward references.
+  * `offdev`: the off-device test backend itself (DESIGN.md §14): a forked child that reads or
+    writes a device pointer (base, view, last element, freed range) faults while the same child
+    code on a host pointer completes; views and ops give the inner backend's bytes; refused
+    pointers, bad frees and leaks are reported. `model.model_offdev_bit_identical` and
+    `train.train_offdev_bit_identical` compare model / LoRA / trainer / checkpoint runs on the CPU
+    backend and on its off-device wrapper byte for byte.
+* `build/rrc_tests --offdev model. train. offdev.` (part of `make test`, also under `make asan`)
+  runs those suites with `rt_cpu()` / `rt_cpu_f32acc()` returning off-device wrappers of the CPU
+  backends and the trainer runs on `rrc_train_run_test_offdev`: device pointers are not
+  host-mapped, so a host access to backend memory anywhere in the model, LoRA, trainer or
+  checkpoint code (or in the tests) is a SIGSEGV. At exit a live allocation, a bad free, a refused
+  translation, or no allocation at all through the wrappers fails the run. TEST ONLY.
 * `rrc/tests/test_config_loading.py` — tiny random checkpoints from `rrc/tools/make_tiny_model.py`
   (llama, llama tied, llama3 rope scaling, qwen2, qwen2 tied, qwen3, qwen3 tied, qwen3 with
   head_dim != hidden/heads and attention biases, a bf16 sharded checkpoint) loaded by
@@ -74,6 +88,9 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   bf16 error), both CPU backends, packed rows checked against per-document HF runs, small attention
   and LM-head chunks, both loss reductions, empty micro-batches and windows, upper-layer-only
   adapters, init, refusals. The C suite `model` adds finite-difference gradient checks.
+  `test_offdev_backend_*` runs `rrc_fwdbwd` on `cpu` and on the hidden test backend `cpu-offdev`
+  (every variant, f32 and bf16, plus f32acc, recompute none, microbatch_mean, upper layers only,
+  no LoRA, loss only, seeded init, an out-of-range token) and requires byte-identical output files.
 * `rrc/tests/test_train_vs_torch.py` (stage B, training driver) — `build/rrc_train` against
   PyTorch + transformers + PEFT: the LR sequence against `transformers.get_scheduler` (exact, every
   schedule, warmup 0 / >= total / ratio, total 1), clipping against `torch.nn.utils.clip_grad_norm_`
@@ -85,7 +102,10 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   checkpoint with `peft.PeftModel.from_pretrained` (logits equal rrc's), `prepare_sft.py` with a
   tokenizer trained in the test, every malformed `.rrcbin`, packing determinism and the packing spec,
   config strictness, refusal of an `init_adapter` whose `adapter_config.json` disagrees with `lora`,
-  and that every config field is documented below. The C suites `data` and
+  and that every config field is documented below. `test_offdev_backend_*` repeats the trajectory
+  (f32; bf16 + cpu-f32acc + microbatch_mean + recompute none + prefetch) with the hidden test option
+  `rrc_train --test-offdev` and requires byte-identical checkpoints, batch dumps and metrics (minus
+  wall-clock fields), and byte-identical resumes across the two backends. The C suites `data` and
   `train` cover the reader / loader / optimizer / state file / an end-to-end stop + resume without
   Python.
 * `rrc/tests/test_e2e_cpu.py` — end-to-end **CPU smoke** (not a GPU validation): a tiny qwen3
@@ -266,6 +286,7 @@ machine add `"backend": "cuda"` and run `rrc/build/rrc_train_cuda`; COMPILED-ONL
 | `include/rrc/backend.h`, `src/ops.c` | the frozen op table and its host-side checks |
 | `kernels_common/rrc_kc*.h` | per-element / per-row math shared by gcc and nvcc |
 | `src/cpu_backend.c` | CPU reference backend (OpenMP) |
+| `include/rrc/offdev.h`, `src/offdev_backend.c` | TEST ONLY off-device wrapper of a CPU backend (device pointers in a PROT_NONE range; DESIGN.md §14) |
 | `tests/cuda/headers_check.cu` | nvcc compile check of all headers and every `RRC_HD` function |
 | `include/rrc/model.h`, `src/model.c`, `src/model_exec.c` | model loading; decoder forward / backward with LoRA (stage B, DESIGN.md §10) |
 | `include/rrc/lora.h`, `src/lora.c` | LoRA adapter: layout, PEFT names, seeded init, safetensors I/O |

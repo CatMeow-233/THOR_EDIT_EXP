@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "rrc/json.h"
+#include "rrc/offdev.h"
 #include "rrc/safetensors.h"
 
 /* ---- LR schedule ------------------------------------------------------------------------------ */
@@ -1375,6 +1376,8 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, int64_
     return RRC_OK;
 }
 
+static rrc_status train_run(const rrc_train_config *c, const rrc_backend *device_be);
+
 rrc_status rrc_train_run(const rrc_train_config *c) { return rrc_train_run_on(c, NULL); }
 
 rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be) {
@@ -1387,6 +1390,25 @@ rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device
                 "config: \"backend\": \"cuda\" needs the CUDA build of rrc_train: this program has only the CPU "
                 "backends (\"cpu\", \"cpu-f32acc\"); build it with `make -C rrc cuda CUDA_HOME=...` and run "
                 "build/rrc_train_cuda");
+    return train_run(c, device_be);
+}
+
+/* TEST ONLY (DESIGN.md §14): the CPU backend the config names, wrapped by the off-device backend. */
+rrc_status rrc_train_run_test_offdev(const rrc_train_config *c, rrc_offdev_stats *final) {
+    RRC_REQUIRE(c, RRC_ERR_INVALID_ARG, "null argument");
+    RRC_REQUIRE(c->backend == RRC_TRAIN_BACKEND_CPU || c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC, RRC_ERR_UNSUPPORTED,
+                "the off-device test backend wraps a CPU backend (\"cpu\" or \"cpu-f32acc\")");
+    const rrc_backend *od = NULL;
+    RRC_CHECK(rrc_offdev_backend_create(
+        c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC ? rrc_backend_cpu_f32acc() : rrc_backend_cpu(), &od));
+    /* train_run frees every buffer of the run before it returns, so the wrapper is destroyed last
+     * and reports any allocation left behind */
+    const rrc_status st = train_run(c, od);
+    const rrc_status ds = rrc_offdev_backend_destroy(od, final);
+    return st != RRC_OK ? st : ds;
+}
+
+static rrc_status train_run(const rrc_train_config *c, const rrc_backend *device_be) {
     const double t_start = now_s();
     trainer t;
     memset(&t, 0, sizeof t);
