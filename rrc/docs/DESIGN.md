@@ -511,3 +511,105 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
     and two OpenMP threads (the `--wrap=malloc` test link works with ASan). `build/asan/rrc_fwdbwd`
     was also run by hand under ASan on two tiny models (f32 and bf16, both recompute policies, an
     error path); that run is not part of `make asan`.
+
+### Step 2: training driver (data, optimizer, trainer)
+
+Code: `include/rrc/{data,train}.h`, `src/{data,train}.c`, `src/rrc_train.c`, `src/rrc_data.c`,
+`tools/prepare_sft.py`, `tools/torch_reference.py`, `tests/c/test_{data,train}.c`,
+`tests/test_train_vs_torch.py`. Status: **TESTED (CPU)** against torch + transformers + PEFT on tiny
+models; nothing has run on a GPU; the trainer has no CUDA path yet; no performance figure exists
+(NOT_TESTED). No change to the op table or its wrappers was needed (the optimizer uses
+`sum_squares` and `adamw_step` with `grad_scale` as frozen).
+
+15. **`.rrcbin` header**: §6 names the fields; their widths are fixed here as three u64 after the
+    8-byte magic (32-byte header), documents u32 len / u32 tokens / u8 mask, no padding. Validation
+    covers every field (data.h); in addition a header `vocab_size` above the model's vocabulary is
+    refused even if every token would fit (it means another tokenizer). Bounds are checked in u64
+    before any allocation (`num_docs ≤ (size − 32) / 9`), tokens are checked `< vocab` (≤ 2³¹ − 1)
+    before the int32 cast. The file is mmapped and checked in one pass (FNV-1a 64 of the bytes
+    identifies it in `rrc_state.bin`).
+16. **Packing is greedy and never splits a document** across rows: a document that does not fit in
+    the rest of a row closes the row (padding: one extra document with label −100 and positions
+    restarting at 0). Epochs are concatenated into one document stream, so a row or window may hold
+    the end of one epoch and the start of the next; the cursor (epoch, index into that epoch's order)
+    at a micro-batch boundary is the loader's whole state. This is not TRL's packing strategy
+    (`bfd` / wrapped): which documents share a row differs, so per-step losses are not comparable to
+    a TRL run step by step, only the per-document semantics are (padding-free packing with
+    position ids). The torch comparison feeds the reference the batches rrc trained on
+    (`dump_batches`), and an independent Python implementation of the spec
+    (`torch_reference.pack_reference`) reproduces those batches exactly.
+17. **Shuffling** is rrc's own generator (splitmix64 Fisher–Yates with modulo reduction, seeded by
+    (seed, epoch); data.h), not torch's `RandomSampler`: the document order differs from an HF
+    Trainer run with the same seed. It is the only random generator after initialisation, so
+    (seed, epoch, index) is the full RNG + data state stored for resume.
+18. **Prefetch** is a ring of `2 × grad_accum_steps` host micro-batches filled by one pthread: the
+    `window_tokens` reduction needs the label count of the whole window before the first
+    forward/backward, so the trainer takes all micro-batches of a window at once and the thread fills
+    the next window meanwhile. The thread touches host memory only (backend calls stay on one thread,
+    backend.h), copies its error message into the slot (the error state is thread-local) and the
+    consumer re-raises it. Batches are a pure function of the cursor (tested: prefetch on / off,
+    hold counts, repeated runs, start from a saved cursor; the data / train suites run under
+    `make tsan`). There is no pinned / asynchronous upload (§9 item 13). Whether the thread helps or
+    competes with the OpenMP threads of the CPU backend is not measured.
+19. **LR schedule** (deviation from §3): `constant_with_warmup` is added; transformers' `constant`
+    ignores warmup, so rrc's does too. transformers 5.23 has no `warmup_ratio`: `warmup_steps` is one
+    float (≥ 1: `int()` steps, < 1: `ceil(ratio · max_steps)`), and rrc's config follows that.
+    Optimizer step s uses `lr · λ(s − 1)` (LambdaLR evaluates λ(last_epoch) before each step), so with
+    warmup the first step has lr 0. Tested exact (`==`) against `get_scheduler` for 15 cases incl.
+    warmup 0, warmup ≥ total, total 1, a ratio and a fractional step count (C `cos` equals
+    `math.cos`).
+20. **Clipping**: total norm = `sqrtf(sum_squares(all LoRA grads))`, one reduction over the
+    contiguous gradient buffer; torch takes the norm of per-tensor norms, so the two differ in the last
+    bits (measured relative difference ≤ 3.3e-7 over the trajectory). The coefficient is torch's
+    exactly: `max_norm / (total_norm + 1e-6)` on an f32 tensor is `reciprocal(total_norm + 1e-6f) ·
+    (float)max_norm` (Python's `__rtruediv__`; plain f32 division differs in 17 % of random cases, a
+    20000-sample probe), clamped at 1 and always applied (multiplying by 1 is exact); it is fused
+    into AdamW via `grad_scale`. Tested bit-exact against torch's formula on rrc's norm, and m against
+    the clipped torch gradient. `max_grad_norm = 0` disables clipping (HF: `None` or 0). A non-finite
+    norm stops training with `RRC_ERR_RANGE` before any update (HF would continue with NaN).
+21. **A window without labelled tokens** gives loss 0 and zero gradients (§10 item 10); rrc still
+    performs the AdamW step with g = 0 (the moments decay and the parameters move by the remaining
+    momentum) and logs a warning. torch would skip parameters whose `.grad` is `None`, and HF Trainer
+    would compute 0/0. This case is excluded from the torch comparison (the test data always has
+    labels).
+22. **Metrics** (deviation from §6): `tokens_per_s` is `input_tokens_per_s` (non-padding tokens of the
+    step / measured step time), `elapsed_s` counts from the start of the process (a resumed run starts
+    again at 0), and there is no "max memory" field (the op table has no allocator statistics). Wall
+    times are measured with `CLOCK_MONOTONIC`, never synthesized.
+23. **Checkpoints**: `adapter_config.json` holds a subset of the fields PEFT 0.21 writes; every one
+    of them equals what PEFT's own `save_pretrained` writes for the same `LoraConfig` (tested), except
+    `base_model_name_or_path`, which is `model_dir` as given. `adapter_model.safetensors` carries
+    PEFT's metadata `{"format": "pt"}`. Each file is written as `.tmp`, fsynced and renamed inside
+    `.checkpoint-<step>.tmp/`, which is fsynced and renamed to `checkpoint-<step>` (an existing one is
+    first renamed to `.old` and removed afterwards). Nothing time- or path-dependent (except the model
+    path above) enters a checkpoint, so checkpoints of equal runs are byte-identical.
+24. **`rrc_state.bin`** (layout in train.h) stores m and v, not the parameters: those are read back
+    from the checkpoint's `adapter_model.safetensors` (fp32, exact) and checked against the stored
+    FNV-1a hash. Resume also refuses another data file (hash) and a different config fingerprint:
+    every field that changes the trajectory (dtype, backend, shapes, optimizer and schedule values,
+    resolved warmup, reduction, data seed / shuffle / truncation / pad id, LoRA r / alpha / rslora /
+    targets / layers, attention / CE chunk sizes, max_positions). Not part of it: paths,
+    `save_steps`, `stop_after_step`, `prefetch`, `recompute` (bit-identical by §10 item 6),
+    `dump_batches`, the LoRA init seed. The model itself is not hashed (16 GB); a different
+    checkpoint with the same shapes would be accepted. A trailing FNV-1a 64 over the file detects
+    corruption (tested at every 5th byte). On resume, `metrics.jsonl` lines after the checkpoint step
+    and a partial last line are dropped.
+25. **Measured agreement** (tiny llama, 8 steps, grad accumulation 2, seq_len 32, 2 rows, clipping
+    on 4 of 8 steps, warmup 2 + cosine, wd 0.01, two epoch boundaries; CPU double-accumulation
+    backend): fp32 max relative error of the loss 5.0e-8, grad norm 3.3e-7, final LoRA parameters
+    2.8e-7, Adam m 8.3e-7, v 7.8e-7 (parameters moved by ≥ 26 % relative). bf16 base: rrc's max loss
+    error against the fp32 truth on the same rounded weights 2.2e-4 vs HF-bf16's 2.5e-4; final
+    parameters at most 0.32 of the allowed `2·e_HF + 0.005`. The PEFT-loaded checkpoint reproduces
+    rrc's logits within 1.8e-7 (adapter effect on the logits 0.69). Mutation checks (by hand, not in
+    CI): using λ(s) instead of λ(s − 1) fails the trajectory test; dropping the clip epsilon or using
+    plain division passed the parameter / loss tolerances (Adam is nearly invariant to a 1e-6 relative
+    gradient scale) and is caught only by the exact coefficient check, which was added for that reason.
+26. **`prepare_sft.py` assistant spans** are located on the rendered text (prefix renderings with
+    `add_generation_prompt`), and a token is a target iff its first character lies in a span; a
+    template that is not prefix-stable is refused rather than guessed. Tested with a WordLevel
+    tokenizer trained in the test (`tokenizers`), a two-turn conversation with a system message, and a
+    prompt/completion pair.
+27. **Not done in step 2**: an epoch-based run length (only `max_steps`), evaluation / validation
+    loss, several data files or weighting, the CUDA training path (the loop calls only the op table
+    and is backend-agnostic, but `rrc_train` only offers the CPU backends), pinned host buffers,
+    a memory metric, and LR schedules beyond the four above.

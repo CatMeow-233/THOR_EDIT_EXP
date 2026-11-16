@@ -155,7 +155,12 @@ def train_reference(
     for p in params:
         assert p.dtype == torch.float32
     opt = torch.optim.AdamW(
-        params, lr=cfg.learning_rate, betas=cfg.betas, eps=cfg.eps, weight_decay=cfg.weight_decay, foreach=False
+        params,
+        lr=cfg.learning_rate,
+        betas=cfg.betas,
+        eps=cfg.eps,
+        weight_decay=cfg.weight_decay,
+        foreach=False,
     )
     sched = get_scheduler(
         cfg.lr_scheduler_type, opt, num_warmup_steps=cfg.warmup_steps, num_training_steps=cfg.max_steps

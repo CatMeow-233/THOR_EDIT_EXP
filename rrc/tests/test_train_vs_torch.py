@@ -160,7 +160,10 @@ def read_metrics(out_dir: pathlib.Path) -> list[dict[str, Any]]:
 
 
 def load_windows(out_dir: pathlib.Path, n: int) -> list[dict[str, Any]]:
-    return [safetensors_torch.load_file(str(out_dir / f"batches/step-{s:06d}.safetensors")) for s in range(1, n + 1)]
+    return [
+        safetensors_torch.load_file(str(out_dir / f"batches/step-{s:06d}.safetensors"))
+        for s in range(1, n + 1)
+    ]
 
 
 def rrc_order(names) -> list[str]:
@@ -199,6 +202,8 @@ def read_state(path: pathlib.Path, adapter: dict[str, Any]) -> dict[str, Any]:
         index=index,
         micro_batches=mbs,
         tokens_seen=tokens,
+        params_hash=phash,
+        data_hash=dhash,
         config=data[96 : 96 + cfg_len].decode(),
         m=m,
         v=v,
@@ -269,7 +274,9 @@ def test_lr_schedule_matches_transformers(sched, warmup, total, train_exe, tmp_p
     )
     p = run_train(train_exe, cfg, extra=["--print-schedule"])
     got = json.loads(p.stdout)
-    targs = TrainingArguments(output_dir=str(tmp_path / "hf"), warmup_steps=warmup, max_steps=total, report_to=[])
+    targs = TrainingArguments(
+        output_dir=str(tmp_path / "hf"), warmup_steps=warmup, max_steps=total, report_to=[]
+    )
     hf_warmup = targs.get_warmup_steps(total)
     assert got["warmup_steps"] == hf_warmup
     opt = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=lr)
@@ -469,14 +476,25 @@ def test_resume_is_bit_identical(setup_fp32, train_exe, tmp_path):
     full = tmp_path / "full"
     run_train(
         train_exe,
-        write_cfg(tmp_path / "full.json", **common, output_dir=str(full), init_adapter=str(s["init"]),
-                  save_steps=K, prefetch=False),
+        write_cfg(
+            tmp_path / "full.json",
+            **common,
+            output_dir=str(full),
+            init_adapter=str(s["init"]),
+            save_steps=K,
+            prefetch=False,
+        ),
     )
     part = tmp_path / "part"
     run_train(
         train_exe,
-        write_cfg(tmp_path / "a.json", **common, output_dir=str(part), init_adapter=str(s["init"]),
-                  stop_after_step=K),
+        write_cfg(
+            tmp_path / "a.json",
+            **common,
+            output_dir=str(part),
+            init_adapter=str(s["init"]),
+            stop_after_step=K,
+        ),
     )
     assert not (part / f"checkpoint-{N}").exists()
     for f in CKPT_FILES:
@@ -491,8 +509,9 @@ def test_resume_is_bit_identical(setup_fp32, train_exe, tmp_path):
         f.write('{"step": 7, "loss": 1.0}\n{"step": 8, "lo')
     run_train(
         train_exe,
-        write_cfg(tmp_path / "b.json", **common, output_dir=str(part),
-                  resume_from=str(part / f"checkpoint-{K}")),
+        write_cfg(
+            tmp_path / "b.json", **common, output_dir=str(part), resume_from=str(part / f"checkpoint-{K}")
+        ),
     )
     for f in CKPT_FILES:
         assert (part / f"checkpoint-{N}" / f).read_bytes() == (full / f"checkpoint-{N}" / f).read_bytes(), f
@@ -510,15 +529,27 @@ def test_resume_refusals(setup_fp32, train_exe, tmp_path):
     out = tmp_path / "o"
     run_train(
         train_exe,
-        write_cfg(tmp_path / "a.json", **common, output_dir=str(out), init_adapter=str(s["init"]),
-                  max_steps=4, stop_after_step=2),
+        write_cfg(
+            tmp_path / "a.json",
+            **common,
+            output_dir=str(out),
+            init_adapter=str(s["init"]),
+            max_steps=4,
+            stop_after_step=2,
+        ),
     )
     ck = out / "checkpoint-2"
     # a trajectory-relevant setting changed
     p = run_train(
         train_exe,
-        write_cfg(tmp_path / "b.json", **common, output_dir=str(out), resume_from=str(ck), max_steps=4,
-                  learning_rate=2e-2),
+        write_cfg(
+            tmp_path / "b.json",
+            **common,
+            output_dir=str(out),
+            resume_from=str(ck),
+            max_steps=4,
+            learning_rate=2e-2,
+        ),
         expect_ok=False,
     )
     assert p.returncode == 2 and "learning_rate" in p.stderr
@@ -527,8 +558,14 @@ def test_resume_refusals(setup_fp32, train_exe, tmp_path):
     prepare_sft.write_rrcbin(str(other), make_docs(30, seed=1), VOCAB)
     p = run_train(
         train_exe,
-        write_cfg(tmp_path / "c.json", model_dir=str(s["model"]), data_path=str(other), output_dir=str(out),
-                  resume_from=str(ck), max_steps=4),
+        write_cfg(
+            tmp_path / "c.json",
+            model_dir=str(s["model"]),
+            data_path=str(other),
+            output_dir=str(out),
+            resume_from=str(ck),
+            max_steps=4,
+        ),
         expect_ok=False,
     )
     assert p.returncode == 2 and "not the data file" in p.stderr
@@ -576,7 +613,9 @@ def test_peft_loads_checkpoint_and_matches_rrc_logits(tiny, train_exe, fwdbwd_ex
 
     mdir = tiny("qwen3_hd32_bias")
     targets = ["q_proj", "v_proj", "o_proj", "up_proj"]
-    init = make_init_adapter(mdir, tmp_path / "init", r=6, alpha=10.0, targets=targets, rslora=True, layers=[1])
+    init = make_init_adapter(
+        mdir, tmp_path / "init", r=6, alpha=10.0, targets=targets, rslora=True, layers=[1]
+    )
     data = tmp_path / "d.rrcbin"
     prepare_sft.write_rrcbin(str(data), make_docs(20, seed=4), VOCAB)
     out = tmp_path / "o"
@@ -596,7 +635,12 @@ def test_peft_loads_checkpoint_and_matches_rrc_logits(tiny, train_exe, fwdbwd_ex
     # our adapter_config.json is a subset of what PEFT itself writes for the same LoraConfig
     base = AutoModelForCausalLM.from_pretrained(mdir, dtype=torch.float32)
     lc = LoraConfig(
-        r=6, lora_alpha=10, target_modules=targets, lora_dropout=0.0, use_rslora=True, layers_to_transform=[1],
+        r=6,
+        lora_alpha=10,
+        target_modules=targets,
+        lora_dropout=0.0,
+        use_rslora=True,
+        layers_to_transform=[1],
         task_type="CAUSAL_LM",
     )
     get_peft_model(base, lc).save_pretrained(str(tmp_path / "peft_own"))
@@ -623,12 +667,36 @@ def test_peft_loads_checkpoint_and_matches_rrc_logits(tiny, train_exe, fwdbwd_ex
     assert list(cfg_loaded.layers_to_transform) == [1] and set(cfg_loaded.target_modules) == set(targets)
     w = load_windows(out, 1)[0]
     batch = tmp_path / "batch.safetensors"
-    safetensors_torch.save_file({k: w[k][:1].contiguous() for k in ("tokens", "labels", "doc_ids")}, str(batch))
+    safetensors_torch.save_file(
+        {k: w[k][:1].contiguous() for k in ("tokens", "labels", "doc_ids")}, str(batch)
+    )
     r = subprocess.run(
-        [str(fwdbwd_exe), "--model", str(mdir), "--batch", str(batch), "--out", str(tmp_path / "fb"), "--dtype",
-         "f32", "--lora", str(ck / "adapter_model.safetensors"), "--r", "6", "--alpha", "10", "--rslora",
-         "--targets", ",".join(targets), "--layers", "1", "--logits", "--no-grad"],
-        capture_output=True, text=True,
+        [
+            str(fwdbwd_exe),
+            "--model",
+            str(mdir),
+            "--batch",
+            str(batch),
+            "--out",
+            str(tmp_path / "fb"),
+            "--dtype",
+            "f32",
+            "--lora",
+            str(ck / "adapter_model.safetensors"),
+            "--r",
+            "6",
+            "--alpha",
+            "10",
+            "--rslora",
+            "--targets",
+            ",".join(targets),
+            "--layers",
+            "1",
+            "--logits",
+            "--no-grad",
+        ],
+        capture_output=True,
+        text=True,
     )
     assert r.returncode == 0, r.stderr
     got = safetensors_torch.load_file(str(tmp_path / "fb"))["logits"][0]
@@ -699,27 +767,45 @@ def test_prepare_sft_round_trip(data_exe, tmp_path):
     tok = AutoTokenizer.from_pretrained(str(tmp_path / "tok"), local_files_only=True)
     assert len(tok) < VOCAB
     examples = [
-        {"messages": [{"role": "user", "content": "what is two plus two"},
-                      {"role": "assistant", "content": "it is four"}]},
-        {"messages": [{"role": "system", "content": "chat"},
-                      {"role": "user", "content": "hello there"},
-                      {"role": "assistant", "content": "i am fine thanks"},
-                      {"role": "user", "content": "translate cat to french"},
-                      {"role": "assistant", "content": "chat"}]},
+        {
+            "messages": [
+                {"role": "user", "content": "what is two plus two"},
+                {"role": "assistant", "content": "it is four"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "system", "content": "chat"},
+                {"role": "user", "content": "hello there"},
+                {"role": "assistant", "content": "i am fine thanks"},
+                {"role": "user", "content": "translate cat to french"},
+                {"role": "assistant", "content": "chat"},
+            ]
+        },
         {"prompt": "the cat sat", "completion": "on the mat"},
     ]
     src = tmp_path / "in.jsonl"
     src.write_text("\n".join(json.dumps(e) for e in examples) + "\n")
     out = tmp_path / "d.rrcbin"
     p = subprocess.run(
-        [sys.executable, str(RRC_DIR / "tools/prepare_sft.py"), "--tokenizer", str(tmp_path / "tok"), "--input",
-         str(src), "--output", str(out)],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(RRC_DIR / "tools/prepare_sft.py"),
+            "--tokenizer",
+            str(tmp_path / "tok"),
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
     )
     assert p.returncode == 0, p.stderr
     stats = json.loads(p.stdout)
     vocab, docs = prepare_sft.read_rrcbin(str(out))
     assert vocab == len(tok) and stats["num_docs"] == 3 and len(docs) == 3
+
     # tokens are exactly the tokenizer's; the masked tokens are exactly the assistant turns (+ <|end|>)
     def targets(i):
         toks, mask = docs[i]
@@ -733,7 +819,9 @@ def test_prepare_sft_round_trip(data_exe, tmp_path):
     assert tok.convert_ids_to_tokens(docs[2][0]) == ["<s>", "the", "cat", "sat", "on", "the", "mat", "</s>"]
     assert targets(2) == ["on", "the", "mat", "</s>"]
     # the C reader agrees
-    c = subprocess.run([str(data_exe), "check", str(out), "--vocab", str(VOCAB)], capture_output=True, text=True)
+    c = subprocess.run(
+        [str(data_exe), "check", str(out), "--vocab", str(VOCAB)], capture_output=True, text=True
+    )
     assert c.returncode == 0, c.stderr
     info = json.loads(c.stdout)
     assert info["num_docs"] == 3 and info["vocab_size"] == len(tok)
@@ -743,17 +831,37 @@ def test_prepare_sft_round_trip(data_exe, tmp_path):
     bad = tmp_path / "bad.jinja"
     bad.write_text("{% for m in messages|reverse %}{{ m['content'] }} {% endfor %}")
     p = subprocess.run(
-        [sys.executable, str(RRC_DIR / "tools/prepare_sft.py"), "--tokenizer", str(tmp_path / "tok"), "--input",
-         str(src), "--output", str(tmp_path / "x.rrcbin"), "--chat-template", str(bad)],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(RRC_DIR / "tools/prepare_sft.py"),
+            "--tokenizer",
+            str(tmp_path / "tok"),
+            "--input",
+            str(src),
+            "--output",
+            str(tmp_path / "x.rrcbin"),
+            "--chat-template",
+            str(bad),
+        ],
+        capture_output=True,
+        text=True,
     )
     assert p.returncode != 0 and "prefix-stable" in p.stderr
     src2 = tmp_path / "in2.jsonl"
     src2.write_text(json.dumps({"text": "the cat"}) + "\n")
     p = subprocess.run(
-        [sys.executable, str(RRC_DIR / "tools/prepare_sft.py"), "--tokenizer", str(tmp_path / "tok"), "--input",
-         str(src2), "--output", str(tmp_path / "y.rrcbin")],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            str(RRC_DIR / "tools/prepare_sft.py"),
+            "--tokenizer",
+            str(tmp_path / "tok"),
+            "--input",
+            str(src2),
+            "--output",
+            str(tmp_path / "y.rrcbin"),
+        ],
+        capture_output=True,
+        text=True,
     )
     assert p.returncode != 0 and "needs 'messages'" in p.stderr
 
@@ -808,21 +916,28 @@ def test_malformed_rrcbin_refused(case, data_exe, tmp_path):
 def test_rrcbin_vocab_against_model(data_exe, setup_fp32, train_exe, tmp_path):
     f = tmp_path / "big_vocab.rrcbin"
     prepare_sft.write_rrcbin(str(f), [([1, 2, 200], [0, 1, 1])], 300)
-    p = subprocess.run([str(data_exe), "check", str(f), "--vocab", str(VOCAB)], capture_output=True, text=True)
+    p = subprocess.run(
+        [str(data_exe), "check", str(f), "--vocab", str(VOCAB)], capture_output=True, text=True
+    )
     assert p.returncode == 2 and "larger than the model's vocabulary" in p.stderr
     # rrc_train validates the data against the model too
     p = run_train(
         train_exe,
-        write_cfg(tmp_path / "c.json", model_dir=str(setup_fp32["model"]), data_path=str(f),
-                  output_dir=str(tmp_path / "o")),
+        write_cfg(
+            tmp_path / "c.json",
+            model_dir=str(setup_fp32["model"]),
+            data_path=str(f),
+            output_dir=str(tmp_path / "o"),
+        ),
         expect_ok=False,
     )
     assert p.returncode == 2 and "larger than the model's vocabulary" in p.stderr
 
 
 def pack(exe, data, out, *args) -> tuple[dict[str, Any], list[tuple[int, int]]]:
-    p = subprocess.run([str(exe), "pack", str(data), "--out", str(out), *map(str, args)], capture_output=True,
-                       text=True)
+    p = subprocess.run(
+        [str(exe), "pack", str(data), "--out", str(out), *map(str, args)], capture_output=True, text=True
+    )
     assert p.returncode == 0, p.stderr
     t = safetensors_torch.load_file(str(out))
     with safe_open(str(out), "pt") as f:
@@ -857,7 +972,9 @@ def test_packing_deterministic_and_matches_spec(shuffle, truncation, data_exe, t
         assert a[k].tolist() == spec[k], k
     # starting from a saved cursor reproduces the tail exactly (what resume relies on)
     e, i = ca[4]
-    tail, ct = pack(data_exe, data, tmp_path / "f", *args, "--count", 7, "--start-epoch", e, "--start-index", i)
+    tail, ct = pack(
+        data_exe, data, tmp_path / "f", *args, "--count", 7, "--start-epoch", e, "--start-index", i
+    )
     assert ct == ca[5:]
     for k in a:
         assert torch.equal(tail[k], a[k][5:]), k
@@ -868,13 +985,19 @@ def test_packing_deterministic_and_matches_spec(shuffle, truncation, data_exe, t
     seen: list[list[int]] = []
     for m in range(12):
         for r in range(3):
-            tok, lab, pos, did = (a[k][m, r].tolist() for k in ("tokens", "labels", "position_ids", "doc_ids"))
+            tok, lab, pos, did = (
+                a[k][m, r].tolist() for k in ("tokens", "labels", "position_ids", "doc_ids")
+            )
             start = 0
             for t in range(1, 33):
                 if t == 32 or did[t] != did[start]:
                     seg = tok[start:t]
                     assert pos[start:t] == list(range(t - start))
-                    match = [j for j in usable if docs[j][0][: t - start] == seg and len(seg) == min(32, len(docs[j][0]))]
+                    match = [
+                        j
+                        for j in usable
+                        if docs[j][0][: t - start] == seg and len(seg) == min(32, len(docs[j][0]))
+                    ]
                     if match:
                         seen.append(seg)
                         j = match[0]

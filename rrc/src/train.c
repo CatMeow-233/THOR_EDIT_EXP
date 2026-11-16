@@ -529,14 +529,16 @@ rrc_status rrc_train_config_to_json(const rrc_train_config *c, char **out) {
     rrc_jw_str(&w, c->dtype == RRC_F32 ? "f32" : "bf16");
     rrc_jw_key(&w, "backend");
     rrc_jw_str(&w, k_backend_names[c->backend_f32acc ? 1 : 0]);
-    rrc_jw_key(&w, "seq_len");
-    rrc_jw_int(&w, c->seq_len);
+    rrc_jw_key(&w, "seq_len"); /* required: null until set */
+    if (c->seq_len) rrc_jw_int(&w, c->seq_len);
+    else rrc_jw_null(&w);
     rrc_jw_key(&w, "micro_batch_size");
     rrc_jw_int(&w, c->micro_batch_size);
     rrc_jw_key(&w, "grad_accum_steps");
     rrc_jw_int(&w, c->grad_accum_steps);
     rrc_jw_key(&w, "max_steps");
-    rrc_jw_int(&w, c->max_steps);
+    if (c->max_steps) rrc_jw_int(&w, c->max_steps);
+    else rrc_jw_null(&w);
     rrc_jw_key(&w, "learning_rate");
     rrc_jw_double(&w, c->learning_rate);
     rrc_jw_key(&w, "lr_scheduler_type");
