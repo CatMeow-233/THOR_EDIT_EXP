@@ -30,6 +30,7 @@ typedef struct rrc_st_opts {
     int verbose;     /* print every case, not only failures and per-op summaries */
     int tf32;        /* dev GEMMs may use TF32 (widens the GEMM tolerance) */
     int quick;       /* smaller large-GEMM case (host runs) */
+    int strict;      /* GEMM, swiglu, bias_grad compared bitwise (dev uses the CPU's arithmetic: kc-emu) */
     FILE *out;       /* NULL: stdout */
     const char *only; /* run only ops whose name contains this substring (NULL: all) */
     /* describes the path of dev's most recent gemm into buf; returns 0 if unknown */

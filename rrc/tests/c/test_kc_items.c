@@ -38,6 +38,7 @@ static void harness(const rrc_backend *dev, const char *only, const char *log) {
     o.out = f;
     o.only = only;
     o.gemm_path = rrc_backend_is_emu(dev) ? emu_path : NULL;
+    o.strict = rrc_backend_is_emu(dev); /* bitwise for GEMM (all paths), swiglu and bias_grad */
     rrc_st_result r;
     int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
     RT_EXPECT(fails == 0, "%s: %d failed checks (log: %s)", dev->name, fails, rt_path(log));

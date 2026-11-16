@@ -153,6 +153,58 @@ RT_TEST(plan_reference_matches_cpu_gemm) {
     RT_EXPECT(n_chunked > 100, "the tiny cap must force multi-chunk plans (%d chunked)", n_chunked);
 }
 
+/* Scratch leading dimensions >= 64 that are padded (cols not a multiple of 8) and batch chunks with
+ * 1 < nb < batch, bit-identical to the CPU backend. */
+RT_TEST(plan_padded_ld_and_batch_chunks) {
+    rt_rng rng = {991};
+    const rrc_backend *cpu = rrc_backend_cpu_f32acc();
+    static const int combos[3][4] = {/* da db dc level */ {1, 0, 1, 0}, {0, 1, 1, 0}, {1, 1, 1, 1}};
+    int n_mid = 0;
+    for (int ci = 0; ci < 3; ci++)
+        for (int layout = LP_BATCH; layout <= LP_BCAST_B; layout++)
+            for (int tr = 0; tr < 4; tr++) {
+                const rrc_dtype da = k_f[combos[ci][0]], db = k_f[combos[ci][1]], dc = k_f[combos[ci][2]];
+                const rrc_gemm_level level = (rrc_gemm_level)combos[ci][3];
+                const rrc_trans ta = (tr & 2) ? RRC_OP_T : RRC_OP_N, tb = (tr & 1) ? RRC_OP_T : RRC_OP_N;
+                pcase pc;
+                pcase_make(&pc, &rng, ta, tb, 70, 67, 69, layout, da, db, dc, 0.5f);
+                pc.g.batch = 3;
+                rrc_buf a = rt_upload(cpu, da, pc.A, pc.na), b = rt_upload(cpu, db, pc.B, pc.nb),
+                        c = rt_upload(cpu, dc, pc.C, pc.nc), c2 = rt_upload(cpu, dc, pc.C, pc.nc);
+                rrc_gemm_args g = pc.g;
+                g.a = a;
+                g.b = b;
+                g.c = c;
+                RT_OK(rrc_gemm(cpu, &g));
+                g.c = c2;
+                rrc_gemm_plan pl;
+                RT_OK(rrc_gemm_plan_make(&g, NULL, level, &pl));
+                RT_ASSERT(pl.nb == 3 && pl.n_chunks == 1, "default cap: one chunk");
+                rrc_gemm_plan_opts po = {pl.scratch_elems * 2 / 3 + 1, 0, 0}; /* room for about 2 of 3 slices */
+                RT_OK(rrc_gemm_plan_make(&g, &po, level, &pl));
+                if (pl.nb > 1 && pl.nb < 3) n_mid++;
+                rrc_gemm_chunk ch;
+                rrc_gemm_plan_chunk(&pl, (void *)&rng, 0, &ch);
+                int padded = 0;
+                for (int j = 0; j < ch.n_pre; j++) padded |= ch.pre[j].dld > ch.pre[j].cols;
+                RT_EXPECT(padded, "a padded scratch ld (cols >= 64, not a multiple of 8) is exercised");
+                RT_ASSERT(exec_plan(&pl), "scratch allocation");
+                float *want = rt_download(c, pc.nc), *got = rt_download(c2, pc.nc);
+                int same = 1;
+                for (int64_t i = 0; i < pc.nc; i++) same &= same_bits(got[i], want[i]);
+                RT_EXPECT(same, "combo %d layout %d tr %d: nb %lld lm %lld ln %lld chunks %lld differs from the CPU", ci,
+                          layout, tr, (long long)pl.nb, (long long)pl.lm, (long long)pl.ln, (long long)pl.n_chunks);
+                free(want);
+                free(got);
+                rrc_buf_free(&a);
+                rrc_buf_free(&b);
+                rrc_buf_free(&c);
+                rrc_buf_free(&c2);
+                pcase_free(&pc);
+            }
+    RT_EXPECT(n_mid >= 6, "batch chunks with 1 < nb < batch exercised in %d cases", n_mid);
+}
+
 RT_TEST(plan_promotion_table) {
     /* level 0: native for f32 f32 f32 / bf16 bf16 f32 / bf16 bf16 bf16; promote the bf16 operand of
      * a mixed pair; bf16 C next to f32 operands via f32 scratch. level 1: everything f32. */
@@ -354,7 +406,7 @@ RT_TEST(ladder_levels) {
 }
 
 const rt_case rt_suite_gemm_plan[] = {
-    RT_CASE(plan_reference_matches_cpu_gemm), RT_CASE(plan_promotion_table), RT_CASE(plan_bounded_scratch_lm_head),
+    RT_CASE(plan_reference_matches_cpu_gemm), RT_CASE(plan_padded_ld_and_batch_chunks), RT_CASE(plan_promotion_table), RT_CASE(plan_bounded_scratch_lm_head),
     RT_CASE(plan_alignment_and_tf32),         RT_CASE(ladder_levels),
 };
 const size_t rt_suite_gemm_plan_n = sizeof rt_suite_gemm_plan / sizeof rt_suite_gemm_plan[0];

@@ -422,7 +422,10 @@ build/rrc_selftest [--device N] [--tf32] [--sync-each-op] [--gemm-level 0|1|2] [
 Link line for users of the backend: `librrc_cuda.a librrc.a -lcublasLt -lcudart -lstdc++ -ldl -lrt`
 (plus `-fopenmp -lm -lpthread` for librrc). `rrc_cuda.h` is in `rrc/cuda/` (add `-Irrc/cuda`); the
 frozen `backend.h` is unchanged. nvcc flags are explicit: `-fmad=false -prec-div=true
--prec-sqrt=true -ftz=false` (§11.3). The CPU build never needs CUDA.
+-prec-sqrt=true -ftz=false` (§11.3). `ARCH` is accepted as an alias of `CUDA_ARCH` only when it
+looks like `sm_*` (so an exported `ARCH=x86_64` is ignored; `ARCH=sm_100` was compiled once). The CUDA
+objects are ordinary prerequisites of `cuda-objs` and `librrc_cuda.a`, so `make -j cuda` builds each
+once. The CPU build never needs CUDA.
 
 ### 11.2 GEMM: plan, dtype paths, ladder
 
@@ -526,8 +529,11 @@ refusals by type triple and minimum alignment). Tests (`make test`):
   operand swap, bounded scratch for the LM-head case and 2-D chunking, alignment, TF32 propagation,
   and the ladder with simulated refusals (refused bf16 types → level 1; misaligned bf16 view →
   promoted into aligned scratch; misaligned f32 → kernel).
-* `kc_items.*`: the selftest harness with kc-emu as the device against `rrc_backend_cpu_f32acc`
-  (all ops, aliases, range errors with immediate and deferred reporting, forced kernel and
+* `gemm_plan.plan_padded_ld_and_batch_chunks`: padded scratch leading dimensions (≥ 64, not a
+  multiple of 8) and batch chunks with 1 < nb < batch, bit-identical to the CPU backend.
+* `kc_items.*`: the selftest harness with kc-emu as the device against `rrc_backend_cpu_f32acc`,
+  in strict mode (GEMM on every path, swiglu and bias_grad compared bitwise, since the emulator
+  uses the CPU's arithmetic; the other classes as in §11.6) (all ops, aliases, range errors with immediate and deferred reporting, forced kernel and
   promote-all GEMM paths with a tiny scratch cap); the same harness with the double-accumulation
   CPU backend as the device (its tolerances accept a correct backend with different arithmetic);
   bad token ids neither read out of bounds nor write.
@@ -549,8 +555,8 @@ errors are `RRC_ERR_BACKEND` (allocation failures `RRC_ERR_OOM`).
 
 `memcpy_h2d` is `cudaMemcpyAsync` followed by a stream synchronize (the contract: the host source
 may be reused on return); the pinned double-buffered staging that would let uploads overlap compute
-(§6) is not implemented. `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` is
-`cudaFree` (implicitly synchronizing). The GEMM scratch and the sum_squares partial buffer grow on
+(§6) is not implemented. `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` synchronizes the stream, then
+calls `cudaFree`. The GEMM scratch and the sum_squares partial buffer grow on
 demand (stream synchronize before freeing the old buffer). All calls on one backend must come from
 one host thread (backend.h); the backend calls `cudaSetDevice` at creation only.
 
@@ -559,13 +565,16 @@ one host thread (backend.h); the backend calls `cudaSetDevice` at creation only.
 The first program to run on the 5090. It prints device name, compute capability, SM count, total
 and free memory, driver / runtime / cuBLASLt versions and the options; then for every op runs random
 inputs (odd sizes, padded leading dimensions, batched/broadcast/interleaved/misaligned/fused-block
-GEMMs, a 256×384×512 GEMM per dtype combination, and the in-place / alias uses: rmsnorm y = x,
+GEMMs, a dense aligned 256×384×512 GEMM per dtype combination, and the in-place / alias uses: rmsnorm y = x,
 dx = dy, dx = x; rope y = x; softmax p = s, ds = dp, ds = p; swiglu h = gate block, in-place and fused
 [dgate | dup] backward; add out = a; axpy y = x; gemm C as a column block beside A; cross entropy
 in place) on the CUDA
 backend and on `rrc_backend_cpu_f32acc`, prints per-op case counts, the worst error/tolerance ratio
 and PASS/FAIL (every case with `-v`, failing cases always, with max abs/rel error and the worst
-element), prints the GEMM path per dtype combination, checks range-error reporting (op or next
+element), prints the GEMM path per dtype combination and a tally of ladder levels per GEMM layout (plain,
+batched, broadcast A/B, interleaved C, misaligned, fused column blocks, aligned), naming every case
+that fell back to the kernel GEMM (a correct but slow path that would otherwise be invisible
+behind a PASS), checks range-error reporting (op or next
 sync, then a clean sync), and runs every case twice requiring bit-identical results. Exit status 0
 only if everything passes. Tolerances (applied per element, `scale` = max |ref| of the output):
 

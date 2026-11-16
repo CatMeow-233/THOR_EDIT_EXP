@@ -137,6 +137,9 @@ int main(int argc, char **argv) {
     o.tf32 = tf32;
     o.only = only;
     o.gemm_path = path_of;
+#ifdef RRC_SELFTEST_HOST
+    o.strict = !strcmp(backend, "emu"); /* the emulator uses the CPU's arithmetic */
+#endif
     rrc_st_result r;
     int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
 #ifdef RRC_SELFTEST_HOST

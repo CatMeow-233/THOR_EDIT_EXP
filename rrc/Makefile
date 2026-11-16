@@ -43,10 +43,10 @@ TEST_OBJS := $(patsubst $(RRC_DIR)/tests/c/%.c,$(BUILD)/obj/tests/%.o,$(TEST_SRC
 TEST_BIN  := $(BUILD)/rrc_tests
 
 # ---- CUDA ---------------------------------------------------------------------------------
-# CUDA_ARCH (or its alias ARCH) selects the SASS target; PTX for the same compute capability is
+# CUDA_ARCH (or its alias ARCH, only if it looks like sm_*) selects the SASS target; PTX for the same compute capability is
 # embedded too. Device math flags are spelled out: no FMA contraction (-fmad=false), IEEE division
 # and square root, denormals kept, so the kernels' fp32 arithmetic is the CPU backend's (§11.3).
-ifneq ($(strip $(ARCH)),)
+ifneq ($(filter sm_%,$(ARCH)),)
 CUDA_ARCH := $(ARCH)
 endif
 CUDA_ARCH ?= sm_120
@@ -77,7 +77,7 @@ comma := ,
 CUDA_LDLIBS := $(if $(CUDA_LIBDIR),-L$(CUDA_LIBDIR) -Wl$(comma)-rpath$(comma)$(CUDA_LIBDIR)) \
                -lcublasLt -lcudart -lstdc++ -ldl -lrt
 
-.PHONY: all cpu test cuda cuda-objs asan clean nvcc-check
+.PHONY: all cpu test cuda cuda-objs asan clean nvcc-check nvcc-missing
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -135,11 +135,12 @@ nvcc-check:
 	@echo "nvcc header check: OK ($(CUDA_ARCH) + $(CUDA_COMPUTE) PTX)"
 
 # COMPILED-ONLY: every cuda/*.cu to an object (what CI runs; needs nvcc, no GPU, no CUDA libraries).
-cuda-objs:
-	@test -n "$(NVCC)" || { echo "make cuda-objs: set CUDA_HOME=/path/to/cuda (or RRC_NVCC=/path/to/nvcc)"; exit 1; }
-	@$(MAKE) --no-print-directory nvcc-check
-	@$(MAKE) --no-print-directory $(CUDA_OBJS)
+# The objects are plain prerequisites (no sub-make), so `make -j cuda` builds each object once.
+cuda-objs: $(if $(NVCC),nvcc-check $(CUDA_OBJS),nvcc-missing)
 	@echo "cuda-objs: compiled $(words $(CUDA_OBJS)) CUDA sources for $(CUDA_ARCH) + $(CUDA_COMPUTE) PTX (COMPILED-ONLY)"
+
+nvcc-missing:
+	@echo "make cuda / cuda-objs: set CUDA_HOME=/path/to/cuda (or RRC_NVCC=/path/to/nvcc)"; exit 1
 
 # librrc_cuda.a (kernels + backend + the pure-C plan/harness objects) and rrc_selftest. Linking needs
 # libcudart and libcublasLt from $(CUDA_HOME)/lib64 (or lib); running needs a GPU and its driver.

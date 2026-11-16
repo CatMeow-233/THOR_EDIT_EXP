@@ -21,7 +21,10 @@ typedef struct st {
     uint64_t rng;
     const char *op;
     int op_checks, op_fail;
-    double op_worst;
+    double op_worst, op_abs, op_rel;
+    /* gemm path tally per layout (level 0 / 1 / 2) and the cases that ran at the kernel level */
+    int tally[8][3];
+    int n_kernel_cases;
     char paths[8][160]; /* gemm paths seen per (a, b, c) dtype triple */
 } st;
 
@@ -113,12 +116,12 @@ typedef rrc_status (*runfn)(const rrc_backend *be, const void *ctx, float *out);
 static void op_begin(st *t, const char *op) {
     t->op = op;
     t->op_checks = t->op_fail = 0;
-    t->op_worst = 0.0;
+    t->op_worst = t->op_abs = t->op_rel = 0.0;
 }
 static void op_end(st *t) {
     if (t->op_checks == 0) return;
-    fprintf(t->out, "  %-22s %4d cases  worst err/tol %.3g  %s\n", t->op, t->op_checks, t->op_worst,
-            t->op_fail ? "FAIL" : "PASS");
+    fprintf(t->out, "  %-22s %4d cases  max_abs %-9.3g max_rel %-9.3g worst err/tol %-9.3g %s\n", t->op, t->op_checks,
+            t->op_abs, t->op_rel, t->op_worst, t->op_fail ? "FAIL" : "PASS");
 }
 static int want(st *t, const char *op) { return !t->o->only || strstr(op, t->o->only) != NULL; }
 
@@ -215,6 +218,8 @@ static void check(st *t, const char *name, int cls, double n_red, const double *
         t->op_fail++;
     }
     if (worst > t->op_worst) t->op_worst = worst;
+    if (max_abs > t->op_abs) t->op_abs = max_abs;
+    if (max_rel > t->op_rel) t->op_rel = max_rel;
     if (fail || det_fail || t->o->verbose) {
         fprintf(t->out, "    %s %-6s %s  max_abs %.3g  max_rel %.3g  err/tol %.3g%s%s%s\n",
                 fail ? "FAIL" : "PASS", k_cls_name[cls], name, max_abs, max_rel, worst,
@@ -319,8 +324,8 @@ static double *gemm_mag(const gcase *g) {
     return mag;
 }
 
-enum { L_PLAIN = 0, L_BATCH, L_BCAST_A, L_BCAST_B, L_INTERLEAVE_C, L_MISALIGNED, L_FUSED, L_N };
-static const char *k_layout[] = {"plain", "batched", "bcastA", "bcastB", "interleavedC", "misaligned", "fusedAC"};
+enum { L_PLAIN = 0, L_BATCH, L_BCAST_A, L_BCAST_B, L_INTERLEAVE_C, L_MISALIGNED, L_FUSED, L_ALIGNED, L_N };
+static const char *k_layout[] = {"plain", "batched", "bcastA", "bcastB", "interleavedC", "misaligned", "fusedAC", "aligned"};
 
 static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, int64_t k, int layout, rrc_dtype da,
                       rrc_dtype db, rrc_dtype dc, float beta) {
@@ -336,18 +341,22 @@ static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, i
     g.dc = dc;
     g.alpha = 1.25f;
     g.beta = beta;
-    g.batch = (layout == L_PLAIN || layout == L_MISALIGNED || layout == L_FUSED) ? 1 : 3;
+    g.batch = (layout == L_PLAIN || layout == L_MISALIGNED || layout == L_FUSED || layout == L_ALIGNED) ? 1 : 3;
     const int64_t ar = ta == RRC_OP_N ? m : k, ac = ta == RRC_OP_N ? k : m;
     const int64_t br = tb == RRC_OP_N ? k : n, bc = tb == RRC_OP_N ? n : k;
     g.lda = ac + (layout == L_MISALIGNED ? 1 : 3);
     g.ldb = bc + 2;
+    if (layout == L_ALIGNED) { /* dense: 256-byte aligned buffers, ld = cols (tensor-core friendly sizes) */
+        g.lda = ac;
+        g.ldb = bc;
+    }
     g.sa = layout == L_BCAST_A ? 0 : ar * g.lda + 1;
     g.sb = layout == L_BCAST_B ? 0 : br * g.ldb + 5;
     if (layout == L_INTERLEAVE_C) {
         g.ldc = g.batch * n + 1;
         g.sc = n;
     } else {
-        g.ldc = n + 1;
+        g.ldc = layout == L_ALIGNED ? n : n + 1;
         g.sc = m * g.ldc + 2;
     }
     g.a_off = layout == L_MISALIGNED ? 1 : 0;
@@ -372,11 +381,17 @@ static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, i
              (long long)k, (long long)g.batch, k_layout[layout], (double)beta);
     outspec os = {1, {{g.nc, dc}}};
     if (mag) {
-        check(t, name, CLS_GEMM, 0.0, mag, k, run_gemm, &g, &os);
+        check(t, name, t->o->strict ? CLS_EXACT : CLS_GEMM, 0.0, mag, k, run_gemm, &g, &os);
         char path[160];
-        if (layout == L_PLAIN && t->o->gemm_path && t->o->gemm_path(t->dev, path, sizeof path)) {
+        if (t->o->gemm_path && t->o->gemm_path(t->dev, path, sizeof path)) {
             int bit = 4 * (g.da == RRC_BF16) + 2 * (db == RRC_BF16) + (dc == RRC_BF16);
-            if (!t->paths[bit][0]) snprintf(t->paths[bit], sizeof t->paths[bit], "%s", path);
+            if (layout == L_PLAIN && !t->paths[bit][0]) snprintf(t->paths[bit], sizeof t->paths[bit], "%s", path);
+            int level = !strncmp(path, "kernel", 6) ? 2 : (!strncmp(path, "promote-all", 11) ? 1 : 0);
+            t->tally[layout][level]++;
+            if (level == 2) {
+                if (t->n_kernel_cases < 40) fprintf(t->out, "    note: kernel GEMM (no cuBLASLt algorithm): %s\n", name);
+                t->n_kernel_cases++;
+            }
         }
     } else {
         fprintf(t->out, "    FAIL %s: host allocation failed\n", name);
@@ -397,15 +412,15 @@ static void test_gemm(st *t) {
         rrc_dtype da = F[(combo >> 2) & 1], db = F[(combo >> 1) & 1], dc = F[combo & 1];
         for (int tr = 0; tr < 4; tr++) {
             rrc_trans ta = (tr & 2) ? RRC_OP_T : RRC_OP_N, tb = (tr & 1) ? RRC_OP_T : RRC_OP_N;
-            for (int layout = 0; layout < L_N; layout++) {
+            for (int layout = 0; layout < L_ALIGNED; layout++) {
                 if (layout == L_FUSED && ta == RRC_OP_T) continue; /* the fused case is defined for ta = N */
                 gemm_case(t, ta, tb, 37, 29, 53, layout, da, db, dc, 0.75f);
                 if (layout <= L_BATCH) gemm_case(t, ta, tb, 37, 29, 53, layout, da, db, dc, 0.0f);
             }
         }
         /* a larger aligned problem (tensor-core paths on the device) and degenerate sizes */
-        if (t->o->quick) gemm_case(t, RRC_OP_N, RRC_OP_T, 64, 96, 128, L_PLAIN, da, db, dc, 0.0f);
-        else gemm_case(t, RRC_OP_N, RRC_OP_T, 256, 384, 512, L_PLAIN, da, db, dc, 0.0f);
+        if (t->o->quick) gemm_case(t, RRC_OP_N, RRC_OP_T, 64, 96, 128, L_ALIGNED, da, db, dc, 0.0f);
+        else gemm_case(t, RRC_OP_N, RRC_OP_T, 256, 384, 512, L_ALIGNED, da, db, dc, 0.0f);
         gemm_case(t, RRC_OP_N, RRC_OP_N, 1, 1, 1, L_PLAIN, da, db, dc, 0.5f);
         gemm_case(t, RRC_OP_T, RRC_OP_N, 64, 8, 1, L_BATCH, da, db, dc, 1.0f);
     }
@@ -416,6 +431,12 @@ static void test_gemm(st *t) {
             fprintf(t->out, "    %-4s x %-4s -> %-4s : %s\n", dn((combo & 4) ? RRC_BF16 : RRC_F32),
                     dn((combo & 2) ? RRC_BF16 : RRC_F32), dn((combo & 1) ? RRC_BF16 : RRC_F32),
                     t->paths[combo][0] ? t->paths[combo] : "(unknown)");
+        fprintf(t->out, "  gemm cases per layout and ladder level (0 native/promoted, 1 promote-all, 2 kernel):\n");
+        for (int l = 0; l < L_N; l++)
+            fprintf(t->out, "    %-13s level0 %3d  level1 %3d  level2 %3d\n", k_layout[l], t->tally[l][0], t->tally[l][1],
+                    t->tally[l][2]);
+        if (t->n_kernel_cases)
+            fprintf(t->out, "  %d gemm cases ran on the kernel fallback (correct, but not cuBLASLt)\n", t->n_kernel_cases);
     }
 }
 
@@ -550,7 +571,8 @@ static void test_bias(st *t) {
             outspec os = {1, {{k.cols, RRC_F32}}};
             /* a reduction over rows: the kernel sums sequentially like cpu_f32acc (expected bit-identical),
              * checked with the REDUCE tolerance so that other correct summation orders pass */
-            if (k.x && k.bias) check(t, name, CLS_REDUCE, (double)k.rows, NULL, 0, run_bias_grad, &k, &os);
+            if (k.x && k.bias)
+                check(t, name, t->o->strict ? CLS_EXACT : CLS_REDUCE, (double)k.rows, NULL, 0, run_bias_grad, &k, &os);
             free(k.x);
             free(k.bias);
         }
@@ -918,7 +940,7 @@ static void test_swiglu(st *t) {
             static const char *mb[] = {"separate dgate/dup", "fused [dgate|dup]", "in place dgate=gate dup=up"};
             snprintf(name, sizeof name, "%s %s rows=%lld cols=%lld fused [gate|up], %s", op, dn(k.dt),
                      (long long)k.rows, (long long)k.cols, bwd ? mb[k.mode] : mf[k.mode]);
-            if (k.gu && k.dh && k.o) check(t, name, CLS_ULP, 0, NULL, 0, run_swiglu, &k, &os);
+            if (k.gu && k.dh && k.o) check(t, name, t->o->strict ? CLS_EXACT : CLS_ULP, 0, NULL, 0, run_swiglu, &k, &os);
             free(k.gu);
             free(k.dh);
             free(k.o);

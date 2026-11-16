@@ -128,8 +128,11 @@ rrc_status cb_alloc(const rrc_backend *be, size_t bytes, void **out) {
     return RRC_OK;
 }
 void cb_free(const rrc_backend *be, void *ptr) {
-    (void)be;
-    if (ptr) (void)cudaFree(ptr); // implicitly synchronizes; errors resurface at the next sync
+    if (!ptr) return;
+    // work enqueued on the stream may still use ptr: wait for it before freeing (errors of that
+    // work, if any, resurface at the next sync)
+    (void)cudaStreamSynchronize(CB(be)->stream);
+    (void)cudaFree(ptr);
 }
 rrc_status cb_h2d(const rrc_backend *be, void *dst, const void *src, size_t bytes) {
     cuda_be *c = CB(be);
