@@ -6,6 +6,11 @@
  *   rrc_train --print-default-config                every config field with its default (null = required)
  *
  * Exit status: 0 success, 1 usage error, 2 engine / config error (message on stderr).
+ *
+ * Built twice: build/rrc_train (librrc.a only: "backend" "cpu" / "cpu-f32acc"; "cuda" is refused with
+ * a message) and, by `make cuda`, build/rrc_train_cuda (-DRRC_WITH_CUDA, linked with librrc_cuda.a):
+ * it also runs "backend": "cuda" on device 0 (CUDA_VISIBLE_DEVICES selects the GPU). The CUDA
+ * build is COMPILED-ONLY until it has been run on a GPU.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +18,9 @@
 
 #include "rrc/json.h"
 #include "rrc/train.h"
+#ifdef RRC_WITH_CUDA
+#include "rrc_cuda.h"
+#endif
 
 static void usage(void) {
     fprintf(stderr, "usage: rrc_train --config FILE [--print-schedule]\n"
@@ -75,6 +83,19 @@ int main(int argc, char **argv) {
         free(s);
         return 0;
     }
+#ifdef RRC_WITH_CUDA
+    if (c.backend == RRC_TRAIN_BACKEND_CUDA) {
+        const rrc_backend *be = NULL;
+        if (rrc_cuda_backend_create(0, &be) != RRC_OK) return fail("CUDA backend");
+        /* rrc_train_run_on frees every buffer of the run (model, adapter, optimizer) before it
+         * returns, on error paths too, so the backend is destroyed last. */
+        const rrc_status st = rrc_train_run_on(&c, be);
+        int rc = 0;
+        if (st != RRC_OK) rc = fail("training");
+        rrc_cuda_backend_destroy(be);
+        return rc;
+    }
+#endif
     if (rrc_train_run(&c) != RRC_OK) return fail("training");
     return 0;
 }

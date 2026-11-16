@@ -3,10 +3,13 @@
 `rrc` is the C/CUDA LoRA training engine described in [DESIGN.md](DESIGN.md). This page covers
 what exists so far: the build, the frozen backend interface, the CPU reference backend, the JSON /
 safetensors / config loaders (stage A); the model forward / backward with LoRA and the SFT training
-driver `rrc_train` with its data tools (stage B, model line; CPU backend only); and their tests.
+driver `rrc_train` with its data tools (stage B, model line); the CUDA backend and its selftest
+(stage B, CUDA line); and their tests.
 
-Status: everything listed here is **TESTED (CPU)**, except the nvcc header check, which is
-**COMPILED-ONLY** (no GPU in the development environment). Nothing here makes a performance claim.
+Status: the CPU parts are **TESTED (CPU)**. Everything that runs on a GPU (the CUDA backend,
+`rrc_selftest`, `rrc_train_cuda`) is **COMPILED-ONLY** (no GPU in the development environment);
+parts of it are additionally exercised **HOST-ONLY** on a fake CUDA runtime (see the CUDA line
+section). Nothing here makes a performance claim; every performance figure is NOT_TESTED.
 
 ## Requirements
 
@@ -22,7 +25,8 @@ make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_t
 make -C rrc test                # build and run the C unit tests (build/rrc_tests)
 make -C rrc test CUDA_HOME=/usr/local/cuda        # + nvcc compile check of all headers (sm_120)
 make -C rrc test RRC_NVCC=/path/to/bin/nvcc       # same, with an explicit nvcc
-make -C rrc cuda CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_120   # compile cuda/*.cu (later stages)
+make -C rrc cuda CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_120   # librrc_cuda.a, rrc_selftest, rrc_train_cuda
+make -C rrc cuda-objs CUDA_HOME=/usr/local/cuda  # compile cuda/*.cu only (no link; CI)
 make -C rrc clean
 ```
 
@@ -84,7 +88,15 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   and that every config field is documented below. The C suites `data` and
   `train` cover the reader / loader / optimizer / state file / an end-to-end stop + resume without
   Python.
-* `make -C rrc asan` — the C tests under AddressSanitizer + UBSan (build/asan).
+* `rrc/tests/test_e2e_cpu.py` — end-to-end **CPU smoke** (not a GPU validation): a tiny qwen3
+  checkpoint and a tokenizer trained in the test, `prepare_sft.py` (chat + prompt/completion
+  examples), `build/rrc_train` with `"backend": "cpu"` for 4 steps, `metrics.jsonl` (one finite line
+  per step), checkpoints, and `peft.PeftModel.from_pretrained` loading every saved tensor; also the
+  CPU build's refusal of `"backend": "cuda"`. With `CUDA_HOME` set and `RRC_TEST_HOST_SHIM_TRAIN=1`
+  it also runs `"backend": "cuda"` through `build/rrc_train_shim` (HOST-ONLY: the real `cuda/*.cu`
+  on the fake runtime, minutes per step) and compares it with the CPU run.
+* `make -C rrc asan` — `make test` under AddressSanitizer + UBSan (build/asan): the C tests,
+  `rrc_selftest_host` and its negative checks, and with `CUDA_HOME` the HOST-ONLY `cuda-host-test`.
 * `make -C rrc tsan` — the `data` and `train` C suites (prefetch thread next to the training loop)
   under ThreadSanitizer (build/tsan; `OMP_NUM_THREADS=1` because libgomp is not instrumented).
 
@@ -109,8 +121,10 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
 
 ## Training (`rrc_train`)
 
-Status: **TESTED (CPU)** against PyTorch + PEFT on tiny models (above). Nothing has run on a GPU;
-there is no CUDA backend in the training path yet, and no performance figure exists (NOT_TESTED).
+Status: **TESTED (CPU)** against PyTorch + PEFT on tiny models (above). Nothing has run on a GPU.
+`"backend": "cuda"` is available in `build/rrc_train_cuda` (built by `make -C rrc cuda`; device 0,
+select the GPU with `CUDA_VISIBLE_DEVICES`); it is **COMPILED-ONLY** on a GPU and was executed only
+HOST-ONLY on the fake runtime of `tests/cuda_host`. No performance figure exists (NOT_TESTED).
 The `*_time_s` / `*_per_s` metrics are wall-clock measurements of whatever machine runs the job.
 
 ```sh
@@ -190,7 +204,7 @@ out-of-range values. Required: `model_dir`, `data_path`, `output_dir`, `seq_len`
 | `resume_from` | null | a `checkpoint-<K>` directory to continue from (exclusive with `init_adapter`); `output_dir` must be that checkpoint's directory, an empty one, or `overwrite_output_dir` must be set |
 | `overwrite_output_dir` | false | allow a fresh run where `metrics.jsonl` already exists (it is truncated), or a resume into a directory holding another run's `metrics.jsonl` / `checkpoint-*` (metrics start afresh); checkpoints the run does not write are kept |
 | `dtype` | `"bf16"` | base weights / activations: `"bf16"` or `"f32"` (LoRA, grads, AdamW are always fp32) |
-| `backend` | `"cpu"` | `"cpu"` (double accumulation) or `"cpu-f32acc"` (fp32 accumulation) |
+| `backend` | `"cpu"` | `"cpu"` (double accumulation), `"cpu-f32acc"` (fp32 accumulation) or `"cuda"` (only in `build/rrc_train_cuda` from `make cuda`; `build/rrc_train` refuses it before creating anything). Part of the resume fingerprint: a checkpoint resumes only on the backend it was written with |
 | `seq_len` | required | tokens per packed row (≤ the model's positions) |
 | `micro_batch_size` | 1 | rows per micro-batch |
 | `grad_accum_steps` | 1 | micro-batches per optimizer step (1 … 65536) |
@@ -237,8 +251,8 @@ Example (`train.json`):
 }
 ```
 
-(On the CPU backend an 8B model is far too slow to train; the example shows the fields. The CUDA
-backend is a later stage.)
+(On the CPU backend an 8B model is far too slow to train; the example shows the fields. On the GPU
+machine add `"backend": "cuda"` and run `rrc/build/rrc_train_cuda`; COMPILED-ONLY, not run on a GPU.)
 
 ## Source map
 
@@ -271,6 +285,7 @@ never executed (no GPU here). On the GPU machine:
 ```sh
 make -C rrc cuda CUDA_HOME=/usr/local/cuda      # build/librrc_cuda.a, build/rrc_selftest (ARCH=sm_120 default)
 rrc/build/rrc_selftest                          # every op vs the CPU backend; exit 0 = PASS
+rrc/build/rrc_train_cuda --config train.json    # rrc_train with "backend": "cuda" available
 ```
 
 `rrc_selftest` fails (exit 1) if the dense aligned GEMM cases do not reach cuBLASLt (natively for

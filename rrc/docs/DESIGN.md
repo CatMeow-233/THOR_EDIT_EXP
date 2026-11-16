@@ -513,6 +513,8 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
     and two OpenMP threads (the `--wrap=malloc` test link works with ASan). `build/asan/rrc_fwdbwd`
     was also run by hand under ASan on two tiny models (f32 and bf16, both recompute policies, an
     error path); that run is not part of `make asan`.
+    (After the merge with the CUDA line, `make asan` runs the whole `make test` with these flags,
+    including `rrc_selftest_host` and, with `CUDA_HOME`, `cuda-host-test`; §12.)
 
 ### Step 2: training driver (data, optimizer, trainer)
 
@@ -1008,3 +1010,39 @@ of §7 (they need the model/trainer of the other stage-B line).
   This replaces the earlier decision that fallback notes are warnings only.
 * `rrc_cuda_options.max_grid_blocks` (default 0 = 2²⁰ blocks) and the launch macros are additions
   to the CUDA line's own API; `backend.h` and the op wrappers are unchanged.
+
+## 12. Integration of the stage B lines
+
+The model line (§10) and the CUDA line (§11) were merged with merge commits; neither changed
+`backend.h` or the op wrappers, and the merged tree builds and tests both. Decisions:
+
+1. **Build**: one Makefile with both lines' targets. The sanitizer variable is `RRC_SAN_FLAGS`
+   (the CUDA line's `SAN` is kept as an alias). `make asan` runs the whole `make test` (C tests,
+   `rrc_selftest_host` and its negative checks, with `CUDA_HOME` the HOST-ONLY `cuda-host-test`)
+   with the model line's flags (`-fno-sanitize-recover=all`, leak detection, `OMP_NUM_THREADS=2`);
+   before, each line's `asan` covered only its own part. The C test binary links both lines'
+   objects with `--wrap=malloc` and `--wrap=rename`.
+2. **`"backend": "cuda"` in the trainer**: the config value is parsed everywhere (so
+   `--print-schedule` works with it) and is part of the resume fingerprint. `librrc.a` stays free of
+   CUDA symbols: `rrc_train_run_on(config, device_backend)` takes a caller-supplied backend.
+   `src/rrc_train.c` is compiled twice: `build/rrc_train` (CPU only; `rrc_train_run` refuses
+   `"cuda"` with RRC_ERR_UNSUPPORTED before creating the output directory or loading anything) and
+   `build/rrc_train_cuda` (`-DRRC_WITH_CUDA`, its own object file, linked with `librrc_cuda.a`; built
+   by `make cuda`). It creates the CUDA backend on device 0 and destroys it after
+   `rrc_train_run_on` has freed every buffer of the run. No new config key (device selection is
+   `CUDA_VISIBLE_DEVICES`). COMPILED-ONLY: never run on a GPU.
+3. **Host access audit**: the model, LoRA and trainer code reach backend memory only through the op
+   wrappers and `rrc_buf_upload` / `rrc_buf_download` (the only pointer use is address arithmetic
+   for the gate/up view in `model.c`). This was checked by reading the code; the fake runtime of
+   `tests/cuda_host` maps device memory to host memory and would not catch a direct access.
+4. **HOST-ONLY trainer run**: `make cuda-host-train CUDA_HOME=...` links the `rrc_train_cuda` main
+   with the fake runtime (`build/rrc_train_shim`), so the model and trainer drive the real
+   `cuda_backend.cu` / `cuda_kernels.cu` on host threads. `rrc/tests/test_e2e_cpu.py` runs it on the
+   tiny qwen3 model when `CUDA_HOME` and `RRC_TEST_HOST_SHIM_TRAIN=1` are set (opt-in: the fake
+   runtime runs one host thread per CUDA thread, about four minutes per 4-micro-batch step) and
+   compares losses, gradient norms and the saved adapter with the CPU run. On one run (f32, 3
+   steps) the losses agreed to about 1e-8 relative. This is evidence about the host-side code and the
+   kernel bodies only: no device, no real cuBLASLt, no inter-block races.
+5. **End-to-end CPU smoke**: `rrc/tests/test_e2e_cpu.py` (tiny qwen3 + tokenizer trained in the test
+   -> `prepare_sft.py` -> `rrc_train` cpu -> `metrics.jsonl`, checkpoints -> `PeftModel`). It is a
+   plumbing check, not a numerical one (`test_train_vs_torch.py` is) and not a GPU validation.

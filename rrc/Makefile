@@ -2,11 +2,12 @@
 #
 #   make cpu                 static library + binaries with the CPU backend
 #   make test                build and run the C unit tests (+ nvcc header check if CUDA is set)
-#   make cuda CUDA_HOME=...  build librrc_cuda.a + rrc_selftest with nvcc (CUDA_ARCH or ARCH, default sm_120)
+#   make cuda CUDA_HOME=...  build librrc_cuda.a, rrc_selftest, rrc_train_cuda with nvcc (CUDA_ARCH or ARCH, default sm_120)
 #   make cuda-objs CUDA_HOME=...  compile every cuda/*.cu to an object only (CI, no GPU, no link)
 #   make asan                `make test` (C tests, rrc_selftest_host, + cuda-host-test with CUDA_HOME)
 #                            under AddressSanitizer + UBSan (build/asan)
 #   make tsan                data + train C tests (prefetch thread) under ThreadSanitizer (build/tsan)
+#   make cuda-host-train CUDA_HOME=...  HOST-ONLY: build/rrc_train_shim (rrc_train_cuda on the fake runtime)
 #   make cuda-host-test CUDA_HOME=...  HOST-ONLY: the real cuda/*.cu built with g++ on a fake CUDA runtime
 #                            (tests/cuda_host; needs only the toolkit headers; part of `test` when CUDA_HOME is set)
 #   make clean
@@ -83,7 +84,7 @@ comma := ,
 CUDA_LDLIBS := $(if $(CUDA_LIBDIR),-L$(CUDA_LIBDIR) -Wl$(comma)-rpath$(comma)$(CUDA_LIBDIR)) \
                -lcublasLt -lcudart -lstdc++ -ldl -lrt
 
-.PHONY: all cpu test cuda cuda-objs asan tsan clean nvcc-check nvcc-missing cuda-host-test cuda-host-missing
+.PHONY: all cpu test cuda cuda-objs asan tsan clean nvcc-check nvcc-missing cuda-host-test cuda-host-train cuda-host-missing
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -167,8 +168,8 @@ nvcc-missing:
 
 # librrc_cuda.a (kernels + backend + the pure-C plan/harness objects) and rrc_selftest. Linking needs
 # libcudart and libcublasLt from $(CUDA_HOME)/lib64 (or lib); running needs a GPU and its driver.
-cuda: cuda-objs $(CUDA_LIB) $(BUILD)/rrc_selftest
-	@echo "make cuda: built $(CUDA_LIB) and $(BUILD)/rrc_selftest (run it on the GPU: $(BUILD)/rrc_selftest)"
+cuda: cuda-objs $(CUDA_LIB) $(BUILD)/rrc_selftest $(BUILD)/rrc_train_cuda
+	@echo "make cuda: built $(CUDA_LIB), $(BUILD)/rrc_selftest and $(BUILD)/rrc_train_cuda (run on the GPU: $(BUILD)/rrc_selftest)"
 
 $(CUDA_LIB): $(CUDA_OBJS) $(CUDA_HOST_OBJS)
 	@mkdir -p $(dir $@)
@@ -180,6 +181,15 @@ $(BUILD)/obj/cuda_host/selftest.o: $(RRC_DIR)/cuda/selftest.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(NVCC_INC) -c $< -o $@
 
 $(BUILD)/rrc_selftest: $(BUILD)/obj/cuda_host/selftest.o $(CUDA_LIB) $(LIB)
+	$(CC) $(CFLAGS) $^ -o $@ $(CUDA_LDLIBS) $(LDLIBS)
+
+# rrc_train with "backend": "cuda" (src/rrc_train.c with -DRRC_WITH_CUDA; its own object, so the CPU
+# build's obj/src/rrc_train.o is untouched). COMPILED-ONLY until run on a GPU.
+$(BUILD)/obj/cuda_host/rrc_train_cuda.o: $(RRC_DIR)/src/rrc_train.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DRRC_WITH_CUDA -c $< -o $@
+
+$(BUILD)/rrc_train_cuda: $(BUILD)/obj/cuda_host/rrc_train_cuda.o $(CUDA_LIB) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(CUDA_LDLIBS) $(LDLIBS)
 
 $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
@@ -217,6 +227,15 @@ $(SHIM_TEST): $(BUILD)/obj/cuda_shim/test_cuda_host.o $(SHIM_OBJS) $(CUDA_HOST_O
 # rrc_selftest's CUDA main (selftest.c without RRC_SELFTEST_HOST) on the fake runtime
 $(SHIM_SELFTEST): $(BUILD)/obj/cuda_host/selftest.o $(SHIM_OBJS) $(CUDA_HOST_OBJS) $(LIB)
 	$(CXX_HOST) $(RRC_SAN_FLAGS) $(SAN) -pthread $^ -o $@ -fopenmp -lm
+
+# rrc_train_cuda's main on the fake runtime: the trainer and model code driving the real
+# cuda_backend.cu / cuda_kernels.cu on host threads (HOST-ONLY; used by rrc/tests/test_e2e_cpu.py when
+# CUDA_HOME is set). `make cuda-host-train CUDA_HOME=...`
+SHIM_TRAIN := $(BUILD)/rrc_train_shim
+$(SHIM_TRAIN): $(BUILD)/obj/cuda_host/rrc_train_cuda.o $(SHIM_OBJS) $(CUDA_HOST_OBJS) $(LIB)
+	$(CXX_HOST) $(RRC_SAN_FLAGS) $(SAN) -pthread $^ -o $@ -fopenmp -lm
+
+cuda-host-train: $(if $(CUDA_HOST_OK),$(SHIM_TRAIN),cuda-host-missing)
 
 cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST),cuda-host-missing)
 	@mkdir -p $(BUILD)/test_tmp
@@ -257,4 +276,4 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(patsubst %,$(BUILD)/obj/src/%.d,$(BIN_NAMES)) \
-         $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(SHIM_OBJS:.o=.d) $(BUILD)/obj/cuda_shim/test_cuda_host.d
+         $(BUILD)/obj/cuda_host/rrc_train_cuda.d $(BUILD)/obj/cuda_host/selftest.d $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(SHIM_OBJS:.o=.d) $(BUILD)/obj/cuda_shim/test_cuda_host.d

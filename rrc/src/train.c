@@ -242,7 +242,7 @@ static rrc_status get_enum(const rrc_json *v, const char *key, const char *const
 }
 
 static const char *const k_dtype_names[] = {"f32", "bf16"};
-static const char *const k_backend_names[] = {"cpu", "cpu-f32acc"};
+static const char *const k_backend_names[] = {"cpu", "cpu-f32acc", "cuda"};
 static const char *const k_reduction_names[] = {"window_tokens", "microbatch_mean"};
 static const char *const k_trunc_names[] = {"truncate", "drop"};
 static const char *const k_recompute_names[] = {"full", "none"};
@@ -347,7 +347,8 @@ rrc_status rrc_train_config_parse(const char *text, size_t len, rrc_train_config
             S(get_enum(v, k, k_dtype_names, 2, &e));
             c->dtype = e ? RRC_BF16 : RRC_F32;
         } else if (!strcmp(k, "backend")) {
-            S(get_enum(v, k, k_backend_names, 2, &c->backend_f32acc));
+            S(get_enum(v, k, k_backend_names, 3, &e));
+            c->backend = (rrc_train_backend)e;
         } else if (!strcmp(k, "seq_len")) {
             S(get_int(v, k, 1, INT32_MAX, &c->seq_len));
             have_seq = 1;
@@ -529,7 +530,7 @@ rrc_status rrc_train_config_to_json(const rrc_train_config *c, char **out) {
     rrc_jw_key(&w, "dtype");
     rrc_jw_str(&w, c->dtype == RRC_F32 ? "f32" : "bf16");
     rrc_jw_key(&w, "backend");
-    rrc_jw_str(&w, k_backend_names[c->backend_f32acc ? 1 : 0]);
+    rrc_jw_str(&w, k_backend_names[c->backend]);
     rrc_jw_key(&w, "seq_len"); /* required: null until set */
     if (c->seq_len) rrc_jw_int(&w, c->seq_len);
     else rrc_jw_null(&w);
@@ -643,7 +644,7 @@ rrc_status rrc_train_config_fingerprint(const rrc_train_config *c, char **out) {
     RRC_REQUIRE(c && out, RRC_ERR_INVALID_ARG, "null argument");
     sbuf b = {NULL, 0, 0, 0};
     sb_printf(&b, "dtype=%s\n", c->dtype == RRC_F32 ? "f32" : "bf16");
-    sb_printf(&b, "backend=%s\n", k_backend_names[c->backend_f32acc ? 1 : 0]);
+    sb_printf(&b, "backend=%s\n", k_backend_names[c->backend]);
     sb_printf(&b, "seq_len=%lld\nmicro_batch_size=%lld\ngrad_accum_steps=%lld\nmax_steps=%lld\n",
               (long long)c->seq_len, (long long)c->micro_batch_size, (long long)c->grad_accum_steps,
               (long long)c->max_steps);
@@ -1260,10 +1261,10 @@ static int holds_run(const char *dir, const char *mpath) {
     return found;
 }
 
-static rrc_status trainer_setup(trainer *t, int64_t *start_step) {
+static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, int64_t *start_step) {
     const rrc_train_config *c = t->c;
     *start_step = 0;
-    t->be = c->backend_f32acc ? rrc_backend_cpu_f32acc() : rrc_backend_cpu();
+    t->be = device_be ? device_be : c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC ? rrc_backend_cpu_f32acc() : rrc_backend_cpu();
     rrc_model_opts mo;
     rrc_model_opts_default(&mo);
     mo.dtype = c->dtype;
@@ -1374,14 +1375,24 @@ static rrc_status trainer_setup(trainer *t, int64_t *start_step) {
     return RRC_OK;
 }
 
-rrc_status rrc_train_run(const rrc_train_config *c) {
+rrc_status rrc_train_run(const rrc_train_config *c) { return rrc_train_run_on(c, NULL); }
+
+rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be) {
     RRC_REQUIRE(c, RRC_ERR_INVALID_ARG, "null argument");
+    RRC_REQUIRE(c->backend >= RRC_TRAIN_BACKEND_CPU && c->backend <= RRC_TRAIN_BACKEND_CUDA, RRC_ERR_INVALID_ARG,
+                "config: invalid backend %d", (int)c->backend);
+    RRC_REQUIRE(c->backend == RRC_TRAIN_BACKEND_CUDA || !device_be, RRC_ERR_INVALID_ARG,
+                "a device backend was supplied but the config's backend is \"%s\"", k_backend_names[c->backend]);
+    RRC_REQUIRE(c->backend != RRC_TRAIN_BACKEND_CUDA || device_be, RRC_ERR_UNSUPPORTED,
+                "config: \"backend\": \"cuda\" needs the CUDA build of rrc_train: this program has only the CPU "
+                "backends (\"cpu\", \"cpu-f32acc\"); build it with `make -C rrc cuda CUDA_HOME=...` and run "
+                "build/rrc_train_cuda");
     const double t_start = now_s();
     trainer t;
     memset(&t, 0, sizeof t);
     t.c = c;
     int64_t step0 = 0;
-    rrc_status st = trainer_setup(&t, &step0);
+    rrc_status st = trainer_setup(&t, device_be, &step0);
     const int64_t M = c->grad_accum_steps;
     const int64_t end = c->stop_after_step > 0 ? c->stop_after_step : c->max_steps;
     const int64_t warmup = rrc_train_config_warmup(c);

@@ -85,6 +85,15 @@ rrc_status rrc_optimizer_step(rrc_optimizer *o, rrc_buf params, rrc_buf grads, d
 
 #define RRC_PATH_MAX 4096
 
+/* "backend": the CPU reference backend with double ("cpu") or fp32 ("cpu-f32acc") accumulation,
+ * or the CUDA backend ("cuda"), which needs a caller-supplied backend (rrc_train_run_on; the CUDA
+ * build of the rrc_train program, build/rrc_train_cuda, does that). librrc.a has no CUDA code. */
+typedef enum rrc_train_backend {
+    RRC_TRAIN_BACKEND_CPU = 0,
+    RRC_TRAIN_BACKEND_CPU_F32ACC = 1,
+    RRC_TRAIN_BACKEND_CUDA = 2,
+} rrc_train_backend;
+
 typedef struct rrc_train_config {
     char model_dir[RRC_PATH_MAX];
     char data_path[RRC_PATH_MAX];
@@ -93,7 +102,7 @@ typedef struct rrc_train_config {
     char resume_from[RRC_PATH_MAX];  /* "" = fresh run */
     int overwrite_output_dir;
     rrc_dtype dtype;
-    int backend_f32acc; /* 0: "cpu", 1: "cpu-f32acc" */
+    rrc_train_backend backend;
     int64_t seq_len, micro_batch_size, grad_accum_steps, max_steps;
     double learning_rate;
     rrc_lr_schedule lr_scheduler_type;
@@ -178,6 +187,11 @@ rrc_status rrc_peft_adapter_config_json(const rrc_lora_config *lc, const char *b
  * checkpoints output_dir/checkpoint-<step>/{adapter_model.safetensors, adapter_config.json,
  * rrc_state.bin} (every save_steps, at stop_after_step and at max_steps). */
 rrc_status rrc_train_run(const rrc_train_config *c);
+/* Same, on `device_be` when c->backend is RRC_TRAIN_BACKEND_CUDA (a backend from
+ * rrc_cuda_backend_create; the caller destroys it after this returns). With device_be NULL the
+ * backend comes from c->backend, and "cuda" is refused with RRC_ERR_UNSUPPORTED before anything is
+ * created or loaded. A non-NULL device_be with a CPU c->backend is RRC_ERR_INVALID_ARG. */
+rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be);
 
 #ifdef __cplusplus
 }
