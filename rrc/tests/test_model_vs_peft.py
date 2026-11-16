@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import pathlib
+import re
 import subprocess
 from typing import Any
 
@@ -851,3 +852,112 @@ def test_refusals(tiny, fwdbwd, tmp_path):
     save_batch(bad, tmp_path / "bad")
     p = run_rrc(fwdbwd, mdir, tmp_path / "bad", tmp_path / "o", expect_ok=False)
     assert p.returncode == 2 and "contiguous" in p.stderr
+
+
+# --------------------------------------------------------------------------------------------
+# off-device test backend (rrc/docs/DESIGN.md section 14): device pointers are not host-mapped, so
+# any host access to backend memory in the model / LoRA code faults; the output file must be the
+# plain CPU backend's byte for byte
+# --------------------------------------------------------------------------------------------
+
+OFFDEV_STATS = re.compile(
+    r"test-offdev backend: (\d+) allocations, (\d+) frees, (\d+) live, peak \d+ bytes, (\d+) bad frees, "
+    r"(\d+) refused translations"
+)
+
+
+def run_both(fwdbwd, mdir, batch, out_dir: pathlib.Path, backend="cpu", expect_ok=True, **kw):
+    """rrc_fwdbwd on `backend` and on `backend`-offdev; returns (bytes, bytes, stderr of offdev)."""
+    res = []
+    for be in (backend, backend + "-offdev"):
+        out = out_dir / f"out_{be}.safetensors"
+        p = run_rrc(fwdbwd, mdir, batch, out, backend=be, expect_ok=False, **kw)
+        if expect_ok:
+            assert p.returncode == 0, f"rrc_fwdbwd --backend {be} failed ({p.returncode}): {p.stderr}"
+        res.append((p, out.read_bytes() if p.returncode == 0 else None))
+    (pa, a), (pb, b) = res
+    assert pa.returncode == pb.returncode, (pa.stderr, pb.stderr)
+    m = OFFDEV_STATS.search(pb.stderr)
+    assert m, pb.stderr
+    allocs, frees, live, bad_frees, bad_ptrs = map(int, m.groups())
+    assert allocs > 0 and allocs == frees and live == 0 and bad_frees == 0 and bad_ptrs == 0, pb.stderr
+    assert OFFDEV_STATS.search(pa.stderr) is None
+    return a, b, pa, pb
+
+
+@pytest.mark.parametrize("dtype", ["f32", "bf16"])
+@pytest.mark.parametrize("variant,targets,rslora", LORA_CASES, ids=[c[0] for c in LORA_CASES])
+def test_offdev_backend_is_bit_identical(variant, targets, rslora, dtype, tiny, fwdbwd, tmp_path):
+    """Every model variant (GQA / MHA / MQA, llama3 RoPE, tied heads, biases, q/k norm), f32 and
+    bf16: window loss, per-micro-batch losses, every LoRA gradient, logits and every hidden state."""
+    mdir = tiny(variant)
+    pm = peft_model(mdir, torch.float32, targets, rslora=rslora, alpha=8.0)
+    adapter = write_adapter(pm, tmp_path / "adapter")
+    save_batch(build_window(MAIN_LAYOUT, seed=2), tmp_path / "batch")
+    a, b, _, _ = run_both(
+        fwdbwd,
+        mdir,
+        tmp_path / "batch",
+        tmp_path,
+        lora=adapter,
+        dtype=dtype,
+        targets=targets,
+        rslora=rslora,
+        extra=["--hidden"],
+    )
+    assert a == b
+    out = safetensors_torch.load_file(str(tmp_path / "out_cpu.safetensors"))
+    grads = [v for k, v in out.items() if k.startswith("grad.")]
+    assert grads and all(g.abs().sum() > 0 for g in grads)  # a non-vacuous comparison
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "f32acc",
+        "recompute_none",
+        "microbatch_mean",
+        "upper_layers",
+        "no_lora",
+        "no_grad",
+        "seeded_init",
+        "bad_token",
+    ],
+)
+def test_offdev_backend_other_paths(case, tiny, fwdbwd, tmp_path):
+    """The other code paths of rrc_fwdbwd on the off-device backend: fp32 accumulation, no
+    recomputation, the microbatch_mean reduction, LoRA on upper layers only, base model only,
+    loss only, rrc's seeded init, and a data-dependent error (same exit status and message)."""
+    variant = "llama_3layers" if case == "upper_layers" else "qwen3_hd32_bias"
+    mdir = tiny(variant)
+    kw: dict[str, Any] = dict(dtype="bf16", extra=["--hidden"])
+    backend = "cpu"
+    if case not in ("no_lora", "seeded_init"):
+        layers = [1, 2] if case == "upper_layers" else None
+        pm = peft_model(mdir, torch.float32, ALL_TARGETS, layers=layers)
+        kw["lora"] = write_adapter(pm, tmp_path / "adapter")
+        kw["layers"] = layers
+    if case == "f32acc":
+        backend = "cpu-f32acc"
+    elif case == "recompute_none":
+        kw["extra"] += ["--recompute", "none"]
+    elif case == "microbatch_mean":
+        kw["reduction"] = "microbatch_mean"
+    elif case == "no_lora":
+        kw["lora"] = "none"
+    elif case == "no_grad":
+        kw["extra"] += ["--no-grad"]
+    w = build_window(MAIN_LAYOUT, seed=3)
+    if case == "bad_token":
+        w.tokens[1, 0, 4] = VOCAB
+    save_batch(w, tmp_path / "batch")
+    a, b, pa, pb = run_both(
+        fwdbwd, mdir, tmp_path / "batch", tmp_path, backend=backend, expect_ok=case != "bad_token", **kw
+    )
+    if case == "bad_token":
+        assert pa.returncode == 2 and a is None and b is None
+        assert "RRC_ERR_RANGE" in pa.stderr
+        rest = [ln for ln in pb.stderr.splitlines() if "test-offdev backend:" not in ln]
+        assert rest == pa.stderr.splitlines()
+    else:
+        assert a is not None and a == b

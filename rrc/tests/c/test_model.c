@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "ops_util.h"
+#include "rrc/offdev.h"
 #include "rrc/rrc.h"
 
 /* qwen3 with q/k norm, attention biases, tied embeddings, GQA (4 query heads, 2 kv heads) and
@@ -131,7 +132,7 @@ RT_TEST(model_lora_layout_and_init) {
     RT_OK(write_ckpt("m_qwen3", k_cfg_qwen3, 1, &dir));
     rrc_model_config c;
     RT_OK(rrc_config_load(dir, 0, &c));
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     rrc_lora_config lc;
     rrc_lora_config_default(&lc);
     lc.r = 3;
@@ -234,7 +235,7 @@ RT_TEST(model_batch_validation) {
     rrc_model_opts_default(&mo);
     mo.dtype = RRC_F32;
     rrc_model *m = NULL;
-    RT_OK(rrc_model_load(rrc_backend_cpu(), dir, &mo, &m));
+    RT_OK(rrc_model_load(rt_cpu(), dir, &mo, &m));
     tb b;
     const int lens[] = {4, 5, 0, 0};
     make_batch(&b, 2, 9, lens, 24, 3, 1);
@@ -312,7 +313,7 @@ static void fd_check(const char *cfg, const char *name, uint64_t seed, unsigned 
     mo.attn_chunk = 3;
     mo.ce_chunk = 4;
     rrc_model *m = NULL;
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     RT_OK(rrc_model_load(be, dir, &mo, &m));
     const rrc_model_config *c = rrc_model_get_config(m);
     rrc_lora_config lc;
@@ -467,7 +468,7 @@ RT_TEST(model_invariances) {
     make_batch(&b0, 2, 13, l0, 32, 5, 2);
     make_batch(&b1, 2, 13, l1, 32, 6, 1);
     rrc_batch x[2] = {as_batch(&b0), as_batch(&b1)};
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     run_out ref, o;
     int64_t allocs = 0;
     RT_OK(run_once(dir, be, RRC_F32, 64, 64, RRC_RECOMPUTE_FULL, x, 2, &ref, &allocs));
@@ -488,7 +489,7 @@ RT_TEST(model_invariances) {
         RT_EXPECT(max_rel(o.logits, ref.logits, ref.nl) < 1e-6, "chunks logits");
         run_free(&o);
     }
-    RT_OK(run_once(dir, rrc_backend_cpu_f32acc(), RRC_F32, 3, 2, RRC_RECOMPUTE_FULL, x, 2, &o, NULL));
+    RT_OK(run_once(dir, rt_cpu_f32acc(), RRC_F32, 3, 2, RRC_RECOMPUTE_FULL, x, 2, &o, NULL));
     RT_EXPECT(max_rel(o.grads, ref.grads, ref.np) < 1e-4, "f32acc grads %g", max_rel(o.grads, ref.grads, ref.np));
     run_free(&o);
     for (int bi = 0; bi < 2; bi++) {
@@ -513,7 +514,7 @@ RT_TEST(model_zero_labels_and_loss_only) {
     mo.dtype = RRC_F32;
     mo.attn_chunk = 2;
     rrc_model *m = NULL;
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     RT_OK(rrc_model_load(be, dir, &mo, &m));
     rrc_lora_config lc;
     rrc_lora_config_default(&lc);
@@ -602,7 +603,7 @@ RT_TEST(model_zero_labels_and_loss_only) {
  * tensor: the RoPE table size n_pos * head_dim must not overflow (it is refused before any
  * allocation, so this also runs under ASan's default allocator limits). */
 RT_TEST(model_load_refuses_huge_rope_table) {
-    const rrc_backend *be = rrc_backend_cpu();
+    const rrc_backend *be = rt_cpu();
     const char *dir;
     RT_OK(write_ckpt("huge_pos", k_cfg_qwen2, 3, &dir));
     char file[1400];
@@ -631,6 +632,217 @@ RT_TEST(model_load_refuses_huge_rope_table) {
     }
 }
 
+/* ---- the off-device backend gives the CPU backend's results bit for bit (DESIGN.md §14) -------- */
+
+typedef struct od_run {
+    double loss[3], loss_nograd, loss_nolora, loss_mbmean;
+    float grads_mb[3]; /* grad_scale of each micro-batch */
+    float *grads, *logits, *hidden;
+    int64_t np, nl, nh, ws_allocs;
+    size_t ws_bytes;
+    rrc_status bad_token;
+} od_run;
+
+static void od_run_free(od_run *o) {
+    free(o->grads);
+    free(o->logits);
+    free(o->hidden);
+}
+
+/* Everything the model and LoRA code do with backend memory, on `be`: weight upload, LoRA load
+ * from safetensors and save (download) to `lora_out`, zero grads, forward + backward of a window
+ * of three micro-batches (the third one larger: the workspace is re-planned), loss-only, no-LoRA,
+ * microbatch_mean, the logits + hidden-state forward, and a data-dependent error. */
+static rrc_status od_model_run(const char *dir, const rrc_backend *be, rrc_dtype dt, rrc_recompute rc,
+                               const rrc_lora_config *lc, const char *lora_in, const char *lora_out,
+                               const rrc_batch *x, od_run *o) {
+    memset(o, 0, sizeof *o);
+    rrc_model_opts mo;
+    rrc_model_opts_default(&mo);
+    mo.dtype = dt;
+    mo.attn_chunk = 3;
+    mo.ce_chunk = 4;
+    mo.recompute = rc;
+    rrc_model *m = NULL;
+    rrc_lora *l = NULL;
+    rrc_st_writer *w = NULL;
+    rrc_status st;
+    RRC_CHECK_GOTO(st, rrc_model_load(be, dir, &mo, &m), done);
+    const rrc_model_config *c = rrc_model_get_config(m);
+    RRC_CHECK_GOTO(st, rrc_lora_create(be, c, lc, &l), done);
+    RRC_CHECK_GOTO(st, rrc_lora_load_safetensors(l, lora_in), done);
+    RRC_CHECK_GOTO(st, rrc_lora_zero_grads(l), done);
+    int64_t total = 0;
+    for (int i = 0; i < 3; i++) {
+        int64_t n = 0;
+        RRC_CHECK_GOTO(st, rrc_batch_count_labels(&x[i], &n), done);
+        total += n;
+    }
+    for (int i = 0; i < 3; i++) {
+        rrc_fb_opts fo = window_opts(total);
+        rrc_fb_result res;
+        RRC_CHECK_GOTO(st, rrc_model_forward_backward(m, l, &x[i], &fo, &res), done);
+        o->loss[i] = res.loss;
+        o->grads_mb[i] = res.grad_scale;
+    }
+    o->np = rrc_lora_num_params(l);
+    o->grads = dl_all(rrc_lora_grads(l), o->np);
+    {
+        rrc_fb_opts fo = window_opts(total);
+        fo.compute_grad = 0;
+        rrc_fb_result res;
+        RRC_CHECK_GOTO(st, rrc_model_forward_backward(m, l, &x[0], &fo, &res), done);
+        o->loss_nograd = res.loss;
+        RRC_CHECK_GOTO(st, rrc_model_forward_backward(m, NULL, &x[1], &fo, &res), done);
+        o->loss_nolora = res.loss;
+        rrc_fb_opts fm = {RRC_LOSS_MICROBATCH_MEAN, total, 3, 1};
+        RRC_CHECK_GOTO(st, rrc_model_forward_backward(m, l, &x[2], &fm, &res), done);
+        o->loss_mbmean = res.loss;
+    }
+    o->nl = x[0].rows * x[0].seq_len * c->vocab_size;
+    o->nh = (c->num_layers + 1) * x[0].rows * x[0].seq_len * c->hidden_size;
+    o->logits = (float *)malloc((size_t)o->nl * sizeof(float));
+    o->hidden = (float *)malloc((size_t)o->nh * sizeof(float));
+    if (!o->logits || !o->hidden || !o->grads) {
+        st = RRC_ERROR(RRC_ERR_OOM, "results");
+        goto done;
+    }
+    RRC_CHECK_GOTO(st, rrc_model_forward_logits(m, l, &x[0], o->logits, o->hidden), done);
+    {
+        int32_t tok[256];
+        memcpy(tok, x[0].tokens, (size_t)(x[0].rows * x[0].seq_len) * sizeof(int32_t));
+        tok[4] = (int32_t)c->vocab_size; /* out of range: reported by the backend's embedding op */
+        rrc_batch bad = x[0];
+        bad.tokens = tok;
+        rrc_fb_opts fo = window_opts(total);
+        rrc_fb_result res;
+        o->bad_token = rrc_model_forward_backward(m, l, &bad, &fo, &res);
+    }
+    o->ws_bytes = rrc_model_workspace_bytes(m);
+    o->ws_allocs = rrc_model_workspace_allocs(m);
+    RRC_CHECK_GOTO(st, rrc_st_writer_create(&w), done);
+    RRC_CHECK_GOTO(st, rrc_lora_add_to_writer(l, 0, "param.", w), done);
+    RRC_CHECK_GOTO(st, rrc_lora_add_to_writer(l, 1, "grad.", w), done);
+    RRC_CHECK_GOTO(st, rrc_st_writer_write(w, lora_out), done);
+done:
+    rrc_st_writer_free(w);
+    rrc_lora_free(l);
+    rrc_model_free(m);
+    return st;
+}
+
+static int same_file(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int eq = fa && fb;
+    while (eq) {
+        const int ca = fgetc(fa), cb = fgetc(fb);
+        if (ca != cb) eq = 0;
+        if (ca == EOF || cb == EOF) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return eq;
+}
+
+RT_TEST(model_offdev_bit_identical) {
+    static const struct {
+        const char *name, **cfg;
+        int64_t vocab, n_layers, layers[2];
+        const char *targets;
+    } k_models[] = {
+        {"od_qwen3", &k_cfg_qwen3, 32, 0, {0, 0}, "all-linear"},
+        {"od_llama", &k_cfg_llama, 40, 2, {1, 2}, "k_proj,o_proj,gate_proj,down_proj"},
+        {"od_qwen2", &k_cfg_qwen2, 24, 0, {0, 0}, "q_proj,v_proj,up_proj"},
+    };
+    int64_t combos = 0;
+    for (size_t mi = 0; mi < sizeof k_models / sizeof k_models[0]; mi++) {
+        const char *dir;
+        RT_OK(write_ckpt(k_models[mi].name, *k_models[mi].cfg, 60 + mi, &dir));
+        char mdir[1200];
+        snprintf(mdir, sizeof mdir, "%s", dir);
+        rrc_lora_config lc;
+        rrc_lora_config_default(&lc);
+        lc.r = 3;
+        lc.alpha = 5;
+        lc.n_layers = k_models[mi].n_layers;
+        for (int64_t i = 0; i < lc.n_layers; i++) lc.layers[i] = k_models[mi].layers[i];
+        RT_OK(rrc_lora_parse_targets(k_models[mi].targets, &lc.target_mask));
+        /* a non-zero adapter (B != 0, so every LoRA gradient is non-zero), written once with the CPU
+         * backend and loaded by both runs */
+        char lin[1200];
+        snprintf(lin, sizeof lin, "%s", rt_path("od_lora_in.safetensors"));
+        {
+            rrc_model_config c;
+            RT_OK(rrc_config_load(mdir, 0, &c));
+            rrc_lora *l = NULL;
+            RT_OK(rrc_lora_create(rrc_backend_cpu(), &c, &lc, &l));
+            randomize_lora(l, 90 + mi, 0.3f, 0.3f);
+            rrc_st_writer *w = NULL;
+            rrc_status st = rrc_st_writer_create(&w);
+            if (st == RRC_OK) st = rrc_lora_add_to_writer(l, 0, NULL, w);
+            if (st == RRC_OK) st = rrc_st_writer_write(w, lin);
+            rrc_st_writer_free(w);
+            rrc_lora_free(l);
+            RT_OK(st);
+        }
+        tb b[3];
+        const int l0[] = {4, 6, 0, 0}, l1[] = {2, 2, 2, 0, 7, 0}, l2[] = {5, 0, 3, 3, 0, 9, 0};
+        make_batch(&b[0], 2, 11, l0, k_models[mi].vocab, 70 + mi, 2);
+        make_batch(&b[1], 2, 11, l1, k_models[mi].vocab, 80 + mi, 1);
+        make_batch(&b[2], 3, 13, l2, k_models[mi].vocab, 85 + mi, 1);
+        rrc_batch x[3] = {as_batch(&b[0]), as_batch(&b[1]), as_batch(&b[2])};
+        for (int dt = 0; dt < 2; dt++)
+            for (int rc = 0; rc < 2; rc++)
+                for (int acc = 0; acc < (mi == 0 ? 2 : 1); acc++) {
+                    const rrc_dtype dtype = dt ? RRC_BF16 : RRC_F32;
+                    const rrc_recompute rec = rc ? RRC_RECOMPUTE_NONE : RRC_RECOMPUTE_FULL;
+                    const rrc_backend *cpu = acc ? rrc_backend_cpu_f32acc() : rrc_backend_cpu(), *od = NULL;
+                    RT_OK(rrc_offdev_backend_create(cpu, &od));
+                    char fa[1200], fb[1200];
+                    snprintf(fa, sizeof fa, "%s", rt_path("od_out_cpu.safetensors"));
+                    snprintf(fb, sizeof fb, "%s", rt_path("od_out_offdev.safetensors"));
+                    od_run ra, rb;
+                    const rrc_status sa = od_model_run(mdir, cpu, dtype, rec, &lc, lin, fa, x, &ra);
+                    const rrc_status sb = od_model_run(mdir, od, dtype, rec, &lc, lin, fb, x, &rb);
+                    rrc_offdev_stats ost;
+                    const rrc_status sd = rrc_offdev_backend_destroy(od, &ost);
+                    const char *what = k_models[mi].name;
+                    RT_EXPECT(sa == RRC_OK && sb == RRC_OK && sd == RRC_OK, "%s dt %d rc %d acc %d: %s / %s / %s: %s",
+                              what, dt, rc, acc, rrc_status_str(sa), rrc_status_str(sb), rrc_status_str(sd),
+                              rrc_last_error());
+                    if (sa == RRC_OK && sb == RRC_OK) {
+                        RT_EXPECT(ost.allocs >= 4 && ost.live == 0, "%s: offdev allocations %lld", what,
+                                  (long long)ost.allocs);
+                        RT_EXPECT(!memcmp(ra.loss, rb.loss, sizeof ra.loss) &&
+                                      !memcmp(ra.grads_mb, rb.grads_mb, sizeof ra.grads_mb) &&
+                                      ra.loss_nograd == rb.loss_nograd && ra.loss_nolora == rb.loss_nolora &&
+                                      ra.loss_mbmean == rb.loss_mbmean,
+                                  "%s dt %d rc %d acc %d: losses differ (%.17g vs %.17g)", what, dt, rc, acc, ra.loss[0],
+                                  rb.loss[0]);
+                        RT_EXPECT(ra.np == rb.np && !memcmp(ra.grads, rb.grads, sizeof(float) * (size_t)ra.np),
+                                  "%s dt %d rc %d acc %d: grads differ", what, dt, rc, acc);
+                        RT_EXPECT(!memcmp(ra.logits, rb.logits, sizeof(float) * (size_t)ra.nl) &&
+                                      !memcmp(ra.hidden, rb.hidden, sizeof(float) * (size_t)ra.nh),
+                                  "%s dt %d rc %d acc %d: logits / hidden states differ", what, dt, rc, acc);
+                        RT_EXPECT(ra.bad_token == RRC_ERR_RANGE && rb.bad_token == RRC_ERR_RANGE, "bad token: %s / %s",
+                                  rrc_status_str(ra.bad_token), rrc_status_str(rb.bad_token));
+                        RT_EXPECT(ra.ws_bytes == rb.ws_bytes && ra.ws_allocs == rb.ws_allocs && ra.ws_allocs == 2,
+                                  "workspace %zu/%zu bytes, %lld/%lld allocations", ra.ws_bytes, rb.ws_bytes,
+                                  (long long)ra.ws_allocs, (long long)rb.ws_allocs);
+                        RT_EXPECT(same_file(fa, fb), "%s dt %d rc %d acc %d: saved params / grads differ", what, dt, rc,
+                                  acc);
+                        double gn = 0;
+                        for (int64_t i = 0; i < ra.np; i++) gn += (double)ra.grads[i] * ra.grads[i];
+                        RT_EXPECT(gn > 0, "zero gradient: the comparison would be vacuous");
+                        combos++;
+                    }
+                    od_run_free(&ra);
+                    od_run_free(&rb);
+                }
+    }
+    RT_EXPECT(combos == 16, "%lld combinations compared", (long long)combos);
+}
+
 /* ---- the GEMM dtype combinations the model issues (input for device backends) ---------------- */
 
 static rrc_backend g_rec_be;
@@ -638,13 +850,13 @@ static unsigned g_combo_seen; /* bit (a * 4 + b * 2 + c) for dtypes f32 = 0, bf1
 static rrc_status rec_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
     (void)be;
     g_combo_seen |= 1u << ((g->a.dtype == RRC_BF16) * 4 + (g->b.dtype == RRC_BF16) * 2 + (g->c.dtype == RRC_BF16));
-    return rrc_backend_cpu()->gemm(rrc_backend_cpu(), g);
+    return rt_cpu()->gemm(rt_cpu(), g);
 }
 
 RT_TEST(model_gemm_dtype_combinations) {
     const char *dir;
     RT_OK(write_ckpt("combo_qwen3", k_cfg_qwen3, 51, &dir));
-    g_rec_be = *rrc_backend_cpu();
+    g_rec_be = *rt_cpu();
     g_rec_be.name = "cpu-gemm-recorder";
     g_rec_be.gemm = rec_gemm;
     const rrc_backend *be = &g_rec_be;
@@ -686,6 +898,6 @@ RT_TEST(model_gemm_dtype_combinations) {
 const rt_case rt_suite_model[] = {
     RT_CASE(model_lora_layout_and_init), RT_CASE(model_batch_validation),      RT_CASE(model_grad_finite_differences),
     RT_CASE(model_invariances),          RT_CASE(model_zero_labels_and_loss_only), RT_CASE(model_gemm_dtype_combinations),
-    RT_CASE(model_load_refuses_huge_rope_table),
+    RT_CASE(model_load_refuses_huge_rope_table), RT_CASE(model_offdev_bit_identical),
 };
 const size_t rt_suite_model_n = sizeof rt_suite_model / sizeof rt_suite_model[0];

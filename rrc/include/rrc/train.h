@@ -226,6 +226,14 @@ typedef struct rrc_train_preflight {
 rrc_status rrc_train_memory_preflight(const rrc_train_config *c, const rrc_model_config *mc, int cuda,
                                       uint64_t device_total_bytes, rrc_train_preflight *out);
 
+/* TEST ONLY (rrc/docs/DESIGN.md §14): rrc_train_run on the off-device wrapper (rrc/offdev.h) of the
+ * CPU backend c->backend names ("cpu" or "cpu-f32acc"; "cuda" is RRC_ERR_UNSUPPORTED). The config,
+ * its fingerprint and every output are those of rrc_train_run, so the results must be identical bit
+ * for bit; any host access to backend memory faults. The wrapper is destroyed after the run and
+ * its final counters stored in `final` (if non-NULL); a device allocation left live is an error. */
+struct rrc_offdev_stats;
+rrc_status rrc_train_run_test_offdev(const rrc_train_config *c, struct rrc_offdev_stats *final);
+
 #ifdef __cplusplus
 }
 #endif

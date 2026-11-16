@@ -1300,3 +1300,113 @@ def test_every_config_field_is_documented(train_exe):
     assert keys == documented, (
         f"undocumented: {sorted(keys - documented)}, documented but not a field: {sorted(documented - keys)}"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# e. off-device test backend (rrc/docs/DESIGN.md section 14): device pointers are not host-mapped,
+#    so any host access to backend memory in the trainer / model / LoRA / checkpoint code faults;
+#    every output must be the plain CPU run's byte for byte
+# --------------------------------------------------------------------------------------------
+
+OFFDEV_STATS = re.compile(
+    r"rrc_train: test-offdev backend: (\d+) allocations, (\d+) frees, (\d+) live, peak \d+ bytes, (\d+) bad frees, "
+    r"(\d+) refused translations"
+)
+WALL_CLOCK = ("step_time_s", "elapsed_s", "input_tokens_per_s")
+
+
+def run_offdev(exe, cfg_path) -> subprocess.CompletedProcess:
+    p = run_train(exe, cfg_path, extra=["--test-offdev"])
+    m = OFFDEV_STATS.search(p.stderr)
+    assert m, p.stderr
+    allocs, frees, live, bad_frees, bad_ptrs = map(int, m.groups())
+    assert allocs > 0 and allocs == frees and live == 0 and bad_frees == 0 and bad_ptrs == 0, p.stderr
+    return p
+
+
+def assert_same_run(a: pathlib.Path, b: pathlib.Path, steps: list[int], n_batches: int = 0) -> None:
+    for s in steps:
+        for f in CKPT_FILES:
+            assert (a / f"checkpoint-{s}" / f).read_bytes() == (b / f"checkpoint-{s}" / f).read_bytes(), (
+                s,
+                f,
+            )
+    for s in range(1, n_batches + 1):
+        name = f"batches/step-{s:06d}.safetensors"
+        assert (a / name).read_bytes() == (b / name).read_bytes(), name
+    ma, mb = read_metrics(a), read_metrics(b)
+    assert len(ma) == len(mb)
+    for x, y in zip(ma, mb):
+        for k in WALL_CLOCK:
+            x.pop(k), y.pop(k)
+        assert x == y
+
+
+OFFDEV_TRAIN_CASES = {
+    "f32": dict(dtype="f32", prefetch=False),
+    "bf16_f32acc_mbmean_norecompute": dict(
+        dtype="bf16", backend="cpu-f32acc", loss_reduction="microbatch_mean", recompute="none", prefetch=True
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(OFFDEV_TRAIN_CASES))
+def test_offdev_backend_trajectory_and_resume_bit_identical(case, setup_fp32, train_exe, tmp_path):
+    """The 8-step trajectory (PEFT init adapter, accumulation, clipping, warmup + cosine, weight
+    decay, two epoch boundaries, batch dumps) on the CPU backend and on its off-device wrapper:
+    every checkpoint file (adapter, adapter_config.json, optimizer state), every batch dump and the
+    metrics (minus wall-clock fields). Then a stop at step 5 + resume on the off-device backend from
+    the CPU run's checkpoint-5 (and the CPU backend from the off-device run's) reach the same bytes."""
+    s = setup_fp32
+    N, K = BASE_CFG["max_steps"], 5
+    common = dict(model_dir=str(s["model"]), data_path=str(s["data"]), **OFFDEV_TRAIN_CASES[case])
+    runs = {}
+    for name in ("cpu", "offdev"):
+        out = tmp_path / name
+        cfg = write_cfg(
+            tmp_path / f"{name}.json",
+            **common,
+            output_dir=str(out),
+            init_adapter=str(s["init"]),
+            save_steps=K,
+            dump_batches=True,
+        )
+        if name == "cpu":
+            p = run_train(train_exe, cfg)
+            assert OFFDEV_STATS.search(p.stderr) is None
+        else:
+            run_offdev(train_exe, cfg)
+        runs[name] = out
+    assert_same_run(runs["cpu"], runs["offdev"], [K, N], N)
+    for name, src in (("resume_offdev", runs["cpu"]), ("resume_cpu", runs["offdev"])):
+        out = tmp_path / name
+        cfg = write_cfg(
+            tmp_path / f"{name}.json", **common, output_dir=str(out), resume_from=str(src / f"checkpoint-{K}")
+        )
+        if name == "resume_offdev":
+            run_offdev(train_exe, cfg)
+        else:
+            run_train(train_exe, cfg)
+        for f in CKPT_FILES:
+            assert (out / f"checkpoint-{N}" / f).read_bytes() == (
+                runs["cpu"] / f"checkpoint-{N}" / f
+            ).read_bytes(), (
+                name,
+                f,
+            )
+
+
+def test_offdev_backend_refuses_cuda_config(setup_fp32, train_exe, tmp_path):
+    """--test-offdev wraps a CPU backend only; nothing is created for a "cuda" config."""
+    s = setup_fp32
+    out = tmp_path / "o"
+    cfg = write_cfg(
+        tmp_path / "c.json",
+        model_dir=str(s["model"]),
+        data_path=str(s["data"]),
+        output_dir=str(out),
+        backend="cuda",
+    )
+    p = run_train(train_exe, cfg, expect_ok=False, extra=["--test-offdev"])
+    assert p.returncode == 2 and "wraps a CPU backend" in p.stderr, p.stderr
+    assert not out.exists()

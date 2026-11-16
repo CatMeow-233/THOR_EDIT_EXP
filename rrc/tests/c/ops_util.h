@@ -94,6 +94,12 @@ static inline double rt_max_err(const float *got, const double *want, int64_t n,
 static inline double *rt_dalloc(int64_t n) { return (double *)calloc((size_t)(n > 0 ? n : 1), sizeof(double)); }
 
 /* Both CPU backends (double and float accumulation). */
-static inline const rrc_backend *rt_backend(int i) { return i == 0 ? rrc_backend_cpu() : rrc_backend_cpu_f32acc(); }
+/* The CPU backends the tests run on: rrc_backend_cpu() / rrc_backend_cpu_f32acc(), or with
+ * `rrc_tests --offdev` their off-device wrappers (rrc/offdev.h, DESIGN.md §14), created once by the
+ * runner and checked for leaks at exit (test_main.c). */
+int rt_offdev_mode(void);
+const rrc_backend *rt_cpu(void);
+const rrc_backend *rt_cpu_f32acc(void);
+static inline const rrc_backend *rt_backend(int i) { return i == 0 ? rt_cpu() : rt_cpu_f32acc(); }
 
 #endif

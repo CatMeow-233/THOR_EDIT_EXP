@@ -24,11 +24,17 @@
  * "hidden". Metadata (exact decimal strings): loss (window loss), loss_sum, n_tokens, window_tokens,
  * loss_mb (comma-separated, %.17g), workspace_bytes, workspace_allocs.
  * Exit status: 0 on success, 1 on usage errors, 2 on engine errors (message on stderr).
+ *
+ * TEST ONLY, not in the usage text: --backend cpu-offdev|cpu-f32acc-offdev runs the same CPU backend
+ * behind the off-device wrapper (rrc/offdev.h, DESIGN.md §14: device pointers are not host-mapped,
+ * so any host access to backend memory faults); the output file is the plain backend's bit for
+ * bit. The wrapper's allocation counters are printed on stderr.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "rrc/offdev.h"
 #include "rrc/rrc.h"
 
 static void usage(void) {
@@ -136,6 +142,7 @@ int main(int argc, char **argv) {
     rrc_lora_config lc;
     rrc_lora_config_default(&lc);
     const rrc_backend *be = rrc_backend_cpu();
+    int offdev = 0;
     int no_lora = 0, no_grad = 0, want_logits = 0, want_hidden = 0;
     rrc_loss_reduction red = RRC_LOSS_WINDOW_TOKENS;
     for (int i = 1; i < argc; i++) {
@@ -182,8 +189,9 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(a, "--backend")) {
             NEED_VAL;
-            if (!strcmp(v, "cpu")) be = rrc_backend_cpu();
-            else if (!strcmp(v, "cpu-f32acc")) be = rrc_backend_cpu_f32acc();
+            offdev = !strcmp(v, "cpu-offdev") || !strcmp(v, "cpu-f32acc-offdev");
+            if (!strcmp(v, "cpu") || !strcmp(v, "cpu-offdev")) be = rrc_backend_cpu();
+            else if (!strcmp(v, "cpu-f32acc") || !strcmp(v, "cpu-f32acc-offdev")) be = rrc_backend_cpu_f32acc();
             else {
                 usage();
                 return 1;
@@ -262,6 +270,14 @@ int main(int argc, char **argv) {
     memset(&bf, 0, sizeof bf);
     float *logits = NULL, *hidden = NULL, *loss_mb = NULL;
     int32_t *ntok = NULL;
+    const rrc_backend *od = NULL;
+    if (offdev) {
+        if (rrc_offdev_backend_create(be, &od) != RRC_OK) {
+            rc = fail("creating the off-device test backend");
+            goto out;
+        }
+        be = od;
+    }
     if (rrc_model_load(be, model_dir, &mo, &m) != RRC_OK) {
         rc = fail("loading the model");
         goto out;
@@ -394,5 +410,15 @@ out:
     free(ntok);
     rrc_lora_free(lora);
     rrc_model_free(m);
+    if (od) {
+        rrc_offdev_stats os;
+        memset(&os, 0, sizeof os);
+        const rrc_status ds = rrc_offdev_backend_destroy(od, &os);
+        fprintf(stderr, "rrc_fwdbwd: test-offdev backend: %lld allocations, %lld frees, %lld live, peak %lld bytes, %lld bad "
+                        "frees, %lld refused translations\n", (long long)os.allocs,
+                (long long)os.frees, (long long)os.live, (long long)os.peak_bytes, (long long)os.bad_frees,
+                (long long)os.bad_ptrs);
+        if (ds != RRC_OK && rc == 0) rc = fail("off-device test backend");
+    }
     return rc;
 }

@@ -16,6 +16,7 @@
 
 #include "rrc/census.h"
 #include "rrc/json.h"
+#include "rrc/offdev.h"
 #include "rrc/safetensors.h"
 
 /* ---- LR schedule ------------------------------------------------------------------------------ */
@@ -1348,11 +1349,13 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, uint64
         RRC_REQUIRE(c->pad_token_id < mc0.vocab_size, RRC_ERR_RANGE, "pad_token_id = %d >= vocab_size %lld",
                     (int)c->pad_token_id, (long long)mc0.vocab_size);
         rrc_train_preflight pf;
-        RRC_CHECK(rrc_train_memory_preflight(c, &mc0, device_be != NULL, device_total, &pf));
+        /* the target follows the config's backend: the off-device test backend (§14) wraps a CPU one */
+        const int cuda_target = c->backend == RRC_TRAIN_BACKEND_CUDA;
+        RRC_CHECK(rrc_train_memory_preflight(c, &mc0, cuda_target, device_total, &pf));
         rrc_log(RRC_LOG_INFO, "memory pre-flight (computed by a dry run, not measured): peak %.3f GiB, budget %s%.3f GiB",
                 gib(pf.peak_bytes), pf.budget_bytes ? "" : "none: ", pf.budget_bytes ? gib(pf.budget_bytes) : 0.0);
         if (!pf.budget_bytes) rrc_log(RRC_LOG_INFO, "memory pre-flight budget: %s", pf.budget_source);
-        if (device_be && c->memory_budget_bytes < 0 && !device_total)
+        if (cuda_target && c->memory_budget_bytes < 0 && !device_total)
             rrc_log(RRC_LOG_WARN, "memory pre-flight: the device's total memory is unknown, no budget applied");
     }
     rrc_model_opts mo;
@@ -1465,6 +1468,8 @@ static rrc_status trainer_setup(trainer *t, const rrc_backend *device_be, uint64
     return RRC_OK;
 }
 
+static rrc_status train_run(const rrc_train_config *c, const rrc_backend *device_be, uint64_t device_total);
+
 rrc_status rrc_train_run(const rrc_train_config *c) { return rrc_train_run_on_device(c, NULL, 0); }
 
 rrc_status rrc_train_run_on(const rrc_train_config *c, const rrc_backend *device_be) {
@@ -1481,6 +1486,25 @@ rrc_status rrc_train_run_on_device(const rrc_train_config *c, const rrc_backend 
                 "config: \"backend\": \"cuda\" needs the CUDA build of rrc_train: this program has only the CPU "
                 "backends (\"cpu\", \"cpu-f32acc\"); build it with `make -C rrc cuda CUDA_HOME=...` and run "
                 "build/rrc_train_cuda");
+    return train_run(c, device_be, device_total);
+}
+
+/* TEST ONLY (DESIGN.md §14): the CPU backend the config names, wrapped by the off-device backend. */
+rrc_status rrc_train_run_test_offdev(const rrc_train_config *c, rrc_offdev_stats *final) {
+    RRC_REQUIRE(c, RRC_ERR_INVALID_ARG, "null argument");
+    RRC_REQUIRE(c->backend == RRC_TRAIN_BACKEND_CPU || c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC, RRC_ERR_UNSUPPORTED,
+                "the off-device test backend wraps a CPU backend (\"cpu\" or \"cpu-f32acc\")");
+    const rrc_backend *od = NULL;
+    RRC_CHECK(rrc_offdev_backend_create(
+        c->backend == RRC_TRAIN_BACKEND_CPU_F32ACC ? rrc_backend_cpu_f32acc() : rrc_backend_cpu(), &od));
+    /* train_run frees every buffer of the run before it returns, so the wrapper is destroyed last
+     * and reports any allocation left behind */
+    const rrc_status st = train_run(c, od, 0);
+    const rrc_status ds = rrc_offdev_backend_destroy(od, final);
+    return st != RRC_OK ? st : ds;
+}
+
+static rrc_status train_run(const rrc_train_config *c, const rrc_backend *device_be, uint64_t device_total) {
     const double t_start = now_s();
     trainer t;
     memset(&t, 0, sizeof t);
