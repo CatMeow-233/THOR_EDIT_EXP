@@ -933,7 +933,7 @@ typedef struct xcase {
     int op; /* 0 add, 1 axpy, 2 scale, 3 convert */
     int64_t n;
     rrc_dtype adt, bdt, odt;
-    int alias; /* add: out = a; axpy: (none) */
+    int alias; /* add: out = a; axpy: y = x */
     float alpha;
     float *a, *b, *o;
 } xcase;
@@ -952,7 +952,8 @@ static rrc_status run_ew(const rrc_backend *be, const void *ctx, float *out) {
         RRC_CHECK_GOTO(s, rrc_add(be, k->n, a, b, o), done);
         break;
     case 1:
-        RRC_CHECK_GOTO(s, upf(&bs, be, k->odt, k->o, k->n, &o), done);
+        if (k->alias) o = a; /* y += alpha * y */
+        else RRC_CHECK_GOTO(s, upf(&bs, be, k->odt, k->o, k->n, &o), done);
         RRC_CHECK_GOTO(s, rrc_axpy(be, k->n, k->alpha, a, o), done);
         break;
     case 2:
@@ -978,7 +979,7 @@ static void test_elementwise(st *t) {
         op_begin(t, ops[op]);
         for (int c = 0; c < 9; c++) {
             xcase k = {op, c == 8 ? 1 : 1007, F[c & 1], F[(c >> 1) & 1], F[(c >> 2) & 1], 0, -0.75f, NULL, NULL, NULL};
-            if (op == 0 && c == 8) {
+            if (op <= 1 && c == 8) {
                 k.n = 1007;
                 k.alias = 1;
                 k.odt = k.adt;
@@ -990,7 +991,7 @@ static void test_elementwise(st *t) {
             k.o = hrand(t, k.n, 3.0f, k.odt);
             char name[128];
             snprintf(name, sizeof name, "%s a %s b %s out %s n=%lld%s", ops[op], dn(k.adt), dn(k.bdt), dn(k.odt),
-                     (long long)k.n, k.alias ? " out=a" : "");
+                     (long long)k.n, k.alias ? (op == 0 ? " out=a" : " y=x") : "");
             outspec os = {1, {{k.n, k.odt}}};
             if (k.a && k.b && k.o) check(t, name, CLS_EXACT, 0, NULL, 0, run_ew, &k, &os);
             free(k.a);

@@ -85,3 +85,21 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
 | `kernels_common/rrc_kc*.h` | per-element / per-row math shared by gcc and nvcc |
 | `src/cpu_backend.c` | CPU reference backend (OpenMP) |
 | `tests/cuda/headers_check.cu` | nvcc compile check of all headers and every `RRC_HD` function |
+
+## CUDA line (stage B, COMPILED-ONLY)
+
+The CUDA backend (`rrc/cuda/`, design and status in [DESIGN.md §11](DESIGN.md)) implements the
+frozen op table with cuBLASLt GEMMs and item-body kernels. It has been compiled for `sm_120` but
+never executed (no GPU here). On the GPU machine:
+
+```sh
+make -C rrc cuda CUDA_HOME=/usr/local/cuda      # build/librrc_cuda.a, build/rrc_selftest (ARCH=sm_120 default)
+rrc/build/rrc_selftest                          # every op vs the CPU backend; exit 0 = PASS
+```
+
+Without a GPU: `make -C rrc cuda-objs CUDA_HOME=...` compiles every `.cu` (CI);
+`rrc/tools/fetch_cuda_toolkit.sh DEST` assembles a compile-only CUDA 12.9 toolkit from pinned
+PyPI wheels and conda packages (not needed for the CPU build; not run by tests). `make -C rrc test`
+also runs the kernel bodies, the GEMM plan and the selftest harness on CPU through the host
+emulation backend (`build/rrc_selftest_host`); `make -C rrc asan` runs the C tests under
+AddressSanitizer + UBSan.

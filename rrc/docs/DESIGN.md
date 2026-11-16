@@ -387,3 +387,205 @@ left open or a place where the implementation differs from the text above, and w
     including index 0, contributes 0 and its gradient is 0, as in torch. Before this rule a leading
     -inf produced `exp(-inf - (-inf)) = NaN` for the whole row. A row of only -inf logits gives
     NaN (torch does the same).
+
+## 11. Stage B CUDA line
+
+Status: everything in this section that runs on a GPU is **COMPILED-ONLY** (nvcc 12.9,
+`sm_120` + `compute_120` PTX, `-Werror`; never executed: there is no GPU in the development
+environment). What is **TESTED (CPU)** is the pure-C part (GEMM plan, ladder driver, the kernel
+bodies, the self-test harness) through a host emulation of the backend. Nothing here is a
+performance claim; every performance property is NOT_TESTED. The supported-type table of §11.2 is
+an expectation, not a measurement, until `rrc_selftest` has run on the device.
+
+### 11.1 Files and build
+
+| path | contents | status |
+| --- | --- | --- |
+| `kernels_common/rrc_kc_items.h` | `RRC_HD` per-item bodies of every kernel (parameters structs, lane partials, fixed trees, finalizers, element items, range checks) | TESTED (CPU, via kc-emu) + compiled for sm_120 |
+| `cuda/gemm_plan.{h,c}` | pure host row-major → column-major translation, promotion/chunking, ladder driver `rrc_gemm_execute` | TESTED (CPU) |
+| `cuda/kc_emu.{h,c}` | `kc-emu`: an `rrc_backend` on host memory running the item bodies in shuffled order and the GEMM ladder with a simulated library | TESTED (CPU) |
+| `cuda/selftest_ops.{h,c}` | backend-agnostic op self-test (the body of `rrc_selftest`) | executed on CPU against kc-emu and the CPU backend |
+| `cuda/selftest.c` | `rrc_selftest` (CUDA) and `rrc_selftest_host` (`-DRRC_SELFTEST_HOST`) | host build executed in `make test`; CUDA build linked only |
+| `cuda/rrc_cuda.h` | public API: `rrc_cuda_backend_create[_ex](device, [opts,] &be)`, `rrc_cuda_backend_destroy`, options, device info, last GEMM path | — |
+| `cuda/cuda_kernels.cu`, `cuda/cuda_internal.h` | the `__global__` shells and their launchers | COMPILED-ONLY |
+| `cuda/cuda_backend.cu` | stream, cuBLASLt handle/workspace, descriptor cache, error flag, op table | COMPILED-ONLY |
+| `tools/fetch_cuda_toolkit.sh` | reproduces the compile-only toolkit from pinned PyPI wheels + conda packages (sha256-checked) | run once by hand from cached package files (`--from`); never run by tests |
+
+```sh
+make -C rrc clean cpu test                       # includes the new CPU tests and rrc_selftest_host
+make -C rrc asan                                 # C tests + rrc_selftest_host with -fsanitize=address,undefined
+make -C rrc cuda-objs CUDA_HOME=/path/to/cuda    # compile every cuda/*.cu (CI; no GPU, no link)
+make -C rrc cuda CUDA_HOME=/path/to/cuda [ARCH=sm_120]   # build/librrc_cuda.a + build/rrc_selftest
+build/rrc_selftest [--device N] [--tf32] [--sync-each-op] [--gemm-level 0|1|2] [--only OP] [-v]
+```
+
+Link line for users of the backend: `librrc_cuda.a librrc.a -lcublasLt -lcudart -lstdc++ -ldl -lrt`
+(plus `-fopenmp -lm -lpthread` for librrc). `rrc_cuda.h` is in `rrc/cuda/` (add `-Irrc/cuda`); the
+frozen `backend.h` is unchanged. nvcc flags are explicit: `-fmad=false -prec-div=true
+-prec-sqrt=true -ftz=false` (§11.3). The CPU build never needs CUDA.
+
+### 11.2 GEMM: plan, dtype paths, ladder
+
+`rrc_gemm_plan_make` (pure host) turns validated row-major args into column-major cuBLASLt calls:
+row-major X (r × c, ld) is column-major Xᵀ, so `C = op(A) op(B)` is computed as
+`Cᵀ = op(B)ᵀ op(A)ᵀ`: cuBLASLt's A is rrc's B with `transa = trans_b`, cuBLASLt's B is rrc's A with
+`transb = trans_a`, `M = n`, `N = m`, `K = k`, D = C in place with `ld = ldc`, batch strides passed
+through (stride 0 = broadcast, interleaved C slices as given). Alignment for
+`CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_{A,B,C,D}_BYTES` is the largest power of two ≤ 256 dividing the
+byte address, `ld · elsize` and (batched) `stride · elsize` of the actual operand, on every call.
+
+cuBLASLt (CUBLAS_COMPUTE_32F, scale type f32) is expected to support A/B/C = f32/f32/f32,
+bf16/bf16/f32 and bf16/bf16/bf16, and no mixed A/B pair or f32×f32→bf16 (no such row in the
+cuBLASLt type table as recalled; the header has no table; unverified). Paths at the first ladder
+level:
+
+| A | B | C | level 0 (NATIVE) path | cuBLASLt types |
+| --- | --- | --- | --- | --- |
+| f32 | f32 | f32 | native | f32 f32 f32 |
+| f32 | f32 | bf16 | C via f32 scratch, RNE to bf16 once | f32 f32 f32 |
+| f32 | bf16 | f32 | B promoted bf16 → f32 | f32 f32 f32 |
+| f32 | bf16 | bf16 | B promoted, C via f32 scratch | f32 f32 f32 |
+| bf16 | f32 | f32 | A promoted | f32 f32 f32 |
+| bf16 | f32 | bf16 | A promoted, C via f32 scratch | f32 f32 f32 |
+| bf16 | bf16 | f32 | native (tensor cores) | bf16 bf16 f32 |
+| bf16 | bf16 | bf16 | native (tensor cores) | bf16 bf16 bf16 |
+
+Promotion is exact widening; an f32 operand is never narrowed; a bf16 C is rounded once from the
+f32 result, as on the CPU. The ladder (`rrc_gemm_execute`, shared by the CUDA backend and kc-emu):
+level 0 above → level 1 PROMOTE_ALL (every bf16 operand promoted and bf16 C via scratch, i.e. an
+f32×f32→f32 call; skipped when identical to level 0) → level 2 KERNEL (`rrc_kc_item_lt_matmul`, a
+SIMT kernel that executes the unpromoted column-major call; always available). A level is used
+when cuBLASLt's heuristic returns an algorithm for every chunk; `NOT_SUPPORTED`, zero results or a
+failed result state move to the next level (not an error). A scratch allocation failure also moves
+on (logged at warn level). `rrc_cuda_last_gemm` reports the path; `rrc_selftest` prints it per
+dtype combination. Options: `gemm_min_level` (2 = always the kernel), `allow_tf32` (default off;
+env `RRC_CUDA_ALLOW_TF32=1`) selects `CUBLAS_COMPUTE_32F_FAST_TF32` for f32×f32 calls only.
+
+Bounded scratch: promoted operands and the f32 C go through one backend-owned device scratch of at
+most `gemm_scratch_cap_elems` floats (default 16 Mi = 64 MiB). The problem is split into chunks of
+(batch range, row range of C, column range of C), halving the dimension that shrinks the scratch
+most until it fits; broadcast operands are converted once per chunk. Only when a single row or
+column of an operand (k elements) exceeds the cap is the minimum chunk used (`scratch_elems` then
+reports the need). Example (tested): `dh = dlogits[4096, 152064] (f32) × W_lm[152064, 4096] (bf16)`
+promotes W in column chunks within 64 MiB instead of 2.3 GiB. Scratch leading dimensions ≥ 64 are
+padded to multiples of 8 elements (aligned columns).
+
+Semantics-relevant cuBLASLt settings: `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK =
+COMPUTE_TYPE` (split-K partials only in fp32: the `INPLACE` / `OUTPUT_TYPE` schemes would add
+partial sums in the output type, i.e. round to bf16 several times); `beta == 0` on a scratch path
+zero-fills the scratch instead of loading C; on native paths C is the caller's buffer and the
+selftest runs NaN-prefilled C with `beta = 0` on every path. Descriptors, layouts and the heuristic
+result are cached per call geometry (64 entries, keyed on shapes, strides, types, alignment, TF32),
+so repeated calls of one shape use one algorithm.
+
+Determinism of GEMM: the same call geometry uses the same cached algorithm; cuBLAS documents
+bit-wise reproducibility for a given toolkit, architecture and SM count. Calls of equal shape but
+different pointer alignment may pick different algorithms and differ in the last bits. Checked by
+the selftest's run-twice comparison (NOT_TESTED until run).
+
+### 11.3 Kernels and determinism
+
+Every `__global__` kernel is a thin shell (grid-stride index loop + bounds check, or the row
+skeleton below) over a body in `rrc_kc_items.h` built on the existing `rrc_kc_*` math. Element
+items (embedding, bias, rope pair, swiglu (dgate, dup) pair, add/axpy/scale/convert, adamw, GEMM
+conversion and fallback GEMM element) read all inputs before writing and never read another item's
+output, so every exact alias allowed by backend.h is safe in any execution order. `bias_grad` is
+one item per column summing rows sequentially (the CPU f32 order).
+
+Row reductions (rmsnorm fwd/bwd sums, softmax max/sum and p·dp, cross-entropy log-sum-exp) use one
+block of `RRC_KC_LANES = 256` threads per row: lane l accumulates elements l, l+256, … in fp32, then
+a fixed pairwise tree (`part[l] = part[l] ⊕ part[l+s]`, s = 128 … 1, one `__syncthreads` per level),
+lane 0 finalizes the row statistics (rstd, coefficient, max, 1/Z, loss — the loss reads `z[label]`
+before any gradient write), then the element items run. `sum_squares` reduces fixed chunks of 4096
+elements the same way into a partial buffer and reduces the partials in one more block. The order
+depends only on the shape — not on gridDim, blockDim choice or scheduling — so results are
+bit-identical run to run (TESTED on CPU by running every case twice with different item orders;
+on the device checked by `rrc_selftest`). The order differs from the CPU backend's sequential sums,
+so reductions agree with `rrc_backend_cpu_f32acc` within a reassociation tolerance, not bitwise.
+
+Device math: `-fmad=false` (no contraction of `a*b+c`; the bodies call `fmaf` exactly where the
+CPU semantics have one, e.g. AdamW), IEEE `/` and `sqrtf`, denormals kept, `RNE` stores through
+`rrc_f32_to_bf16`. With these, ops without transcendental functions (embedding, bias, rope, add,
+axpy, scale, convert, adamw, the kernel GEMM) are expected bit-identical to the CPU backend.
+CUDA's `expf`/`logf` (≤ 2 / 1 ulp) are not glibc's, so swiglu, softmax and cross entropy differ in
+the last bits.
+
+### 11.4 Execution coverage without a GPU
+
+`kc-emu` (`cuda/kc_emu.c`) is an `rrc_backend` whose ops run the same bodies with the same phases
+as the kernels, each phase over a fresh pseudo-random permutation of its items (the stand-in for GPU
+scheduling), and whose gemm runs `rrc_gemm_execute` with a simulated library (configurable
+refusals by type triple and minimum alignment). Tests (`make test`):
+
+* `gemm_plan.plan_reference_matches_cpu_gemm`: a column-major reference (`rrc_kc_item_lt_matmul`,
+  the device fallback body, in reverse item order) consuming the plan's chunks, conversions and
+  calls reproduces `rrc_gemm` on `rrc_backend_cpu_f32acc` **bit for bit** for 8 dtype combinations
+  × 4 transposes × {plain, batched, broadcast A, broadcast B, interleaved C} × 3 levels × {default
+  cap, 40-element cap (multi-chunk)} × beta {0 with NaN-filled C, 0.75}; scratch is allocated with
+  exactly `scratch_elems` (overruns are caught by the ASan build). Plus the promotion table, the
+  operand swap, bounded scratch for the LM-head case and 2-D chunking, alignment, TF32 propagation,
+  and the ladder with simulated refusals (refused bf16 types → level 1; misaligned bf16 view →
+  promoted into aligned scratch; misaligned f32 → kernel).
+* `kc_items.*`: the selftest harness with kc-emu as the device against `rrc_backend_cpu_f32acc`
+  (all ops, aliases, range errors with immediate and deferred reporting, forced kernel and
+  promote-all GEMM paths with a tiny scratch cap); the same harness with the double-accumulation
+  CPU backend as the device (its tolerances accept a correct backend with different arithmetic);
+  bad token ids neither read out of bounds nor write.
+* `rrc_selftest_host --backend emu --deferred --quick` runs the program's `main` path.
+* Mutation checks done while writing this (not automated): swapping trans flags, a wrong chunk
+  offset, a wrong broadcast stride, a too-small C scratch stride, a dropped post-conversion, and
+  four item-body mutations were each caught.
+
+### 11.5 Errors, memory and stream semantics
+
+One in-order non-blocking stream per backend. Range errors: embedding ids, rope positions and CE
+labels are checked in the item before the dependent read; a failing item writes nothing and sets a
+device flag (first op id, smallest offending row/token via `atomicMin`). `sync` and `memcpy_d2h`
+(both wait for the stream) read and clear the flag and return `RRC_ERR_RANGE` naming the op;
+`sync_each_op` (env `RRC_CUDA_SYNC_EACH_OP=1`) makes every op synchronize, so the op itself
+reports. Unlike the CPU backend, which validates before writing, the outputs of the ops enqueued
+since the previous sync are unspecified after a device range error. Launch failures and CUDA
+errors are `RRC_ERR_BACKEND` (allocation failures `RRC_ERR_OOM`).
+
+`memcpy_h2d` is `cudaMemcpyAsync` followed by a stream synchronize (the contract: the host source
+may be reused on return); the pinned double-buffered staging that would let uploads overlap compute
+(§6) is not implemented. `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` is
+`cudaFree` (implicitly synchronizing). The GEMM scratch and the sum_squares partial buffer grow on
+demand (stream synchronize before freeing the old buffer). All calls on one backend must come from
+one host thread (backend.h); the backend calls `cudaSetDevice` at creation only.
+
+### 11.6 rrc_selftest
+
+The first program to run on the 5090. It prints device name, compute capability, SM count, total
+and free memory, driver / runtime / cuBLASLt versions and the options; then for every op runs random
+inputs (odd sizes, padded leading dimensions, batched/broadcast/interleaved/misaligned/fused-block
+GEMMs, a 256×384×512 GEMM per dtype combination, and the in-place / alias uses: rmsnorm y = x,
+dx = dy, dx = x; rope y = x; softmax p = s, ds = dp, ds = p; swiglu h = gate block, in-place and fused
+[dgate | dup] backward; add out = a; axpy y = x; gemm C as a column block beside A; cross entropy
+in place) on the CUDA
+backend and on `rrc_backend_cpu_f32acc`, prints per-op case counts, the worst error/tolerance ratio
+and PASS/FAIL (every case with `-v`, failing cases always, with max abs/rel error and the worst
+element), prints the GEMM path per dtype combination, checks range-error reporting (op or next
+sync, then a clean sync), and runs every case twice requiring bit-identical results. Exit status 0
+only if everything passes. Tolerances (applied per element, `scale` = max |ref| of the output):
+
+| class | ops | tolerance |
+| --- | --- | --- |
+| EXACT | memory, embedding, add_bias, rope fwd/bwd, add, axpy, scale, convert, adamw | bitwise |
+| ULP | swiglu fwd/bwd (`expf`) | 2e-6 · (\|ref\| + scale) |
+| REDUCE | rmsnorm fwd/bwd, softmax fwd/bwd, cross entropy, sum_squares, bias_grad | (1e-5 + n·2⁻²⁴) · (\|ref\| + scale), n = terms per reduction (the CPU reference's own sequential error bound) |
+| GEMM | gemm (any path) | 2·k·2⁻²⁴ · (\|α\|Σ\|a\|\|b\| + \|β\|\|c\|) (+ 2⁻⁹ of that with `--tf32`) |
+
+plus one bf16 ulp (2⁻⁷ · max(\|ref\|, \|got\|)) for bf16 outputs of non-EXACT ops. It measures and
+prints no timing. Not yet in it: the tiny-model end-to-end comparison and the 20-step training check
+of §7 (they need the model/trainer of the other stage-B line).
+
+### 11.7 Not done / open
+
+* Nothing has run on a GPU: kernel launch code, cuBLASLt calls, the supported-type table, the
+  alignment behaviour of cuBLASLt with 2-byte-aligned views, and determinism on the device are
+  unverified until `rrc_selftest` runs.
+* No performance work: the fallback GEMM kernel is a naive one-thread-per-element kernel, the
+  row kernels use one block per row (inefficient for very short rows such as per-head q/k norm
+  with head_dim 128), no fused attention, no pinned staging for uploads, no CUDA graphs.
+* Single device per process thread (`cudaSetDevice` only at creation).
