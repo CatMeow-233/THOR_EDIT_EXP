@@ -16,8 +16,9 @@
  * Promotion is exact (bf16 -> f32 widening). f32 is never demoted. Promoted operands and C go
  * through a scratch bounded by opts.scratch_cap_elems: the problem is split into chunks of
  * (batch range, row range of C, column range of C); a chunk never needs more than the cap unless
- * a single row/column of an operand (k elements) already exceeds it (then the minimum chunk is
- * used and scratch_elems says how much that needs).
+ * the minimum chunk (one batch slice, one row and one column of C, i.e. a row/column of k elements
+ * of each promoted operand) already exceeds it; then the plan needs exactly what the minimum chunk
+ * needs (possibly with larger chunks of the same padded size) and scratch_elems says how much.
  */
 #ifndef RRC_GEMM_PLAN_H
 #define RRC_GEMM_PLAN_H

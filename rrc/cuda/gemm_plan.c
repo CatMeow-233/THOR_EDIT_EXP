@@ -104,23 +104,41 @@ rrc_status rrc_gemm_plan_make(const rrc_gemm_args *g, const rrc_gemm_plan_opts *
                        (g->b.dtype == RRC_F32 || p->promote_b);
     p->tf32 = opts && opts->allow_tf32 && lt_f32;
 
+    /* Chunk search. layout() is non-decreasing in each of lm, ln, nb (regions are padded, so not
+     * strictly). Batch first: the largest nb whose full-size slices fit (binary search on the
+     * actual layout, not a linear fit, which the 64-element region padding defeats). */
     int64_t lm = g->m, ln = g->n, nb = g->batch;
-    if (layout(p, lm, ln, nb, NULL, NULL, NULL) > cap && nb > 1) {
-        /* E(nb) = F + nb * V with F the broadcast (stride 0) regions */
-        int64_t e1 = layout(p, lm, ln, 1, NULL, NULL, NULL), e2 = layout(p, lm, ln, 2, NULL, NULL, NULL);
-        int64_t v = e2 - e1, f = e1 - v;
-        nb = (v > 0 && cap > f) ? (cap - f) / v : 1;
-        if (nb < 1) nb = 1;
-        if (nb > g->batch) nb = g->batch;
+    if (layout(p, lm, ln, nb, NULL, NULL, NULL) > cap) {
+        int64_t lo = 1, hi = g->batch; /* largest nb in [1, batch] with layout <= cap, else 1 */
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo + 1) / 2;
+            if (layout(p, lm, ln, mid, NULL, NULL, NULL) <= cap) lo = mid;
+            else hi = mid - 1;
+        }
+        nb = lo;
     }
+    /* Then rows/columns of C: halve the dimension that shrinks the scratch most. A halving that
+     * does not shrink it (e.g. 3 -> 2 rows inside one padded region) is still taken when a smaller
+     * extent of that dimension would; the search stops only when no smaller extent of either
+     * dimension helps. Then the scratch equals the minimum chunk's (lm = ln = nb = 1): with a C
+     * scratch region the size is strictly increasing in lm and ln, and without one it is
+     * pad(A(lm)) + pad(B(ln)), so equality at both one-row and one-column extents implies it. */
     for (;;) {
-        int64_t e = layout(p, lm, ln, nb, NULL, NULL, NULL);
+        const int64_t e = layout(p, lm, ln, nb, NULL, NULL, NULL);
         if (e <= cap) break;
-        int64_t em = lm > 1 ? layout(p, (lm + 1) / 2, ln, nb, NULL, NULL, NULL) : INT64_MAX;
-        int64_t en = ln > 1 ? layout(p, lm, (ln + 1) / 2, nb, NULL, NULL, NULL) : INT64_MAX;
-        if (min64(em, en) >= e) break; /* minimum chunk: one row/column of k elements exceeds the cap */
-        if (em <= en) lm = (lm + 1) / 2;
-        else ln = (ln + 1) / 2;
+        const int64_t em_min = lm > 1 ? layout(p, 1, ln, nb, NULL, NULL, NULL) : INT64_MAX;
+        const int64_t en_min = ln > 1 ? layout(p, lm, 1, nb, NULL, NULL, NULL) : INT64_MAX;
+        if (em_min >= e && en_min >= e) break; /* minimum chunk: one row/column of k elements exceeds the cap */
+        const int64_t em = em_min < e ? layout(p, (lm + 1) / 2, ln, nb, NULL, NULL, NULL) : INT64_MAX;
+        const int64_t en = en_min < e ? layout(p, lm, (ln + 1) / 2, nb, NULL, NULL, NULL) : INT64_MAX;
+        if (em < e || en < e) {
+            if (em <= en) lm = (lm + 1) / 2;
+            else ln = (ln + 1) / 2;
+        } else if (em_min <= en_min) { /* no single halving helps yet; a smaller extent does */
+            lm = (lm + 1) / 2;
+        } else {
+            ln = (ln + 1) / 2;
+        }
     }
     p->lm = lm;
     p->ln = ln;

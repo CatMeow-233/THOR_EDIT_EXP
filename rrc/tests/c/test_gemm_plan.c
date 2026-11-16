@@ -311,6 +311,110 @@ RT_TEST(plan_bounded_scratch_lm_head) {
               "minimum chunk: lm %lld ln %lld scratch %lld", (long long)p.lm, (long long)p.ln, (long long)p.scratch_elems);
 }
 
+/* Geometry-only args (pointers are never dereferenced by rrc_gemm_plan_make). */
+static rrc_gemm_args geom(rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, int64_t k, int64_t batch, int bcast,
+                          rrc_dtype da, rrc_dtype db, rrc_dtype dc) {
+    static char fake[64];
+    rrc_gemm_args g;
+    memset(&g, 0, sizeof g);
+    g.trans_a = ta;
+    g.trans_b = tb;
+    g.m = m;
+    g.n = n;
+    g.k = k;
+    g.alpha = 1.0f;
+    g.batch = batch;
+    g.lda = ta == RRC_OP_N ? k : m;
+    g.ldb = tb == RRC_OP_N ? n : k;
+    g.ldc = n;
+    g.stride_a = bcast == 1 ? 0 : m * k;
+    g.stride_b = bcast == 2 ? 0 : k * n;
+    g.stride_c = m * n;
+    g.a.ptr = g.b.ptr = g.c.ptr = fake;
+    g.a.dtype = da;
+    g.b.dtype = db;
+    g.c.dtype = dc;
+    return g;
+}
+
+/* Scratch of the minimum chunk (one batch slice, one row and one column of C), computed
+ * independently of the chunk search: the plan of the 1 x 1 x batch-1 sub-problem. */
+static int64_t min_chunk_need(const rrc_gemm_args *g, rrc_gemm_level level) {
+    rrc_gemm_args s = *g;
+    s.m = s.n = 1;
+    s.batch = 1;
+    rrc_gemm_plan p;
+    if (rrc_gemm_plan_make(&s, NULL, level, &p) != RRC_OK) return -1;
+    return p.scratch_elems;
+}
+
+/* The bound of gemm_plan.h: scratch_elems <= cap whenever the minimum chunk fits in the cap; when
+ * it does not, the plan needs exactly what the minimum chunk needs (it may use larger chunks of the same
+ * padded size). Regression: the batch split (a linear fit of a
+ * 64-padded layout) and an early stop of the halving loop (halving 3 -> 2 does not shrink a padded
+ * region) gave plans many times over the cap. */
+RT_TEST(plan_scratch_bound) {
+    const int64_t k_cap_default = RRC_GEMM_SCRATCH_CAP_DEFAULT;
+    rrc_gemm_plan p;
+    /* review case 1: m=1 n=1 k=20, A bf16 x B f32 -> C bf16, batch 1000, cap 1000 (was 19688) */
+    rrc_gemm_args g = geom(RRC_OP_N, RRC_OP_N, 1, 1, 20, 1000, 0, RRC_BF16, RRC_F32, RRC_BF16);
+    rrc_gemm_plan_opts po = {1000, 0, 0};
+    RT_OK(rrc_gemm_plan_make(&g, &po, RRC_GEMM_LEVEL_NATIVE, &p));
+    RT_EXPECT(p.scratch_elems <= 1000 && p.nb >= 1, "batch split: scratch %lld > cap 1000 (nb %lld)",
+              (long long)p.scratch_elems, (long long)p.nb);
+    /* the same with batch 20,000,000 and the default cap (was 352,320,192 floats) */
+    g = geom(RRC_OP_N, RRC_OP_N, 1, 1, 20, 20000000, 0, RRC_BF16, RRC_F32, RRC_BF16);
+    RT_OK(rrc_gemm_plan_make(&g, NULL, RRC_GEMM_LEVEL_NATIVE, &p));
+    RT_EXPECT(p.scratch_elems <= k_cap_default, "batch split: scratch %lld > default cap", (long long)p.scratch_elems);
+    RT_EXPECT(p.nb > 1000, "large batch chunks are still used (nb %lld)", (long long)p.nb);
+    /* random geometry, dtypes, levels and caps around the minimum chunk */
+    rt_rng rng = {4242};
+    int n_tight = 0, n_min = 0, n_plans = 0;
+    for (int it = 0; it < 40000; it++) {
+        const uint64_t r = rt_next(&rng);
+        const rrc_trans ta = (r & 1) ? RRC_OP_T : RRC_OP_N, tb = (r & 2) ? RRC_OP_T : RRC_OP_N;
+        const rrc_dtype da = k_f[(r >> 2) & 1], db = k_f[(r >> 3) & 1], dc = k_f[(r >> 4) & 1];
+        const rrc_gemm_level level = (r >> 5) & 1 ? RRC_GEMM_LEVEL_PROMOTE_ALL : RRC_GEMM_LEVEL_NATIVE;
+        const int bcast = (int)((r >> 6) % 3);
+        const int64_t m = 1 + (int64_t)(rt_next(&rng) % ((r >> 8) & 1 ? 300 : 8));
+        const int64_t n = 1 + (int64_t)(rt_next(&rng) % ((r >> 9) & 1 ? 300 : 8));
+        const int64_t k = 1 + (int64_t)(rt_next(&rng) % ((r >> 10) & 1 ? 120 : 6));
+        const int64_t batch = (r >> 11) & 1 ? 1 : 1 + (int64_t)(rt_next(&rng) % ((r >> 12) & 1 ? 2000 : 6));
+        g = geom(ta, tb, m, n, k, batch, bcast, da, db, dc);
+        rrc_gemm_plan full;
+        RT_OK(rrc_gemm_plan_make(&g, NULL, level, &full));
+        if (full.scratch_elems == 0) continue; /* nothing promoted */
+        const int64_t need = min_chunk_need(&g, level);
+        RT_ASSERT(need > 0, "minimum chunk");
+        /* caps from below the minimum chunk to above the whole problem */
+        const int64_t span = full.scratch_elems + 2 * need;
+        const int64_t cap = 1 + (int64_t)(rt_next(&rng) % (uint64_t)span);
+        po.scratch_cap_elems = cap;
+        RT_OK(rrc_gemm_plan_make(&g, &po, level, &p));
+        n_plans++;
+        if (need <= cap) {
+            n_tight += cap < full.scratch_elems;
+            RT_EXPECT(p.scratch_elems <= cap,
+                      "it %d: m=%lld n=%lld k=%lld batch=%lld bcast %d ta %d tb %d %s %s %s level %d cap %lld: scratch %lld "
+                      "(min chunk %lld; lm %lld ln %lld nb %lld)",
+                      it, (long long)m, (long long)n, (long long)k, (long long)batch, bcast, (int)ta, (int)tb, rrc_dtype_name(da),
+                      rrc_dtype_name(db), rrc_dtype_name(dc), (int)level, (long long)cap, (long long)p.scratch_elems, (long long)need,
+                      (long long)p.lm, (long long)p.ln, (long long)p.nb);
+        } else {
+            n_min++;
+            RT_EXPECT(p.scratch_elems == need,
+                      "it %d: cap %lld below the minimum chunk %lld: scratch %lld lm %lld ln %lld nb %lld", it,
+                      (long long)cap, (long long)need, (long long)p.scratch_elems, (long long)p.lm, (long long)p.ln,
+                      (long long)p.nb);
+        }
+        RT_EXPECT(p.cm * p.lm >= m && (p.cm - 1) * p.lm < m && p.cn * p.ln >= n && (p.cn - 1) * p.ln < n &&
+                      p.cb * p.nb >= batch && (p.cb - 1) * p.nb < batch,
+                  "it %d: chunks tile the problem", it);
+    }
+    RT_EXPECT(n_plans > 20000 && n_tight > 10000 && n_min > 1000, "coverage: %d plans, %d tight, %d at the minimum", n_plans,
+              n_tight, n_min);
+}
+
 RT_TEST(plan_alignment_and_tf32) {
     char *base = (char *)(uintptr_t)0x10000; /* never dereferenced */
     RT_EXPECT(rrc_gemm_align_bytes(base, 4, 64, 0, 1, 256) == 256, "aligned");
@@ -407,6 +511,6 @@ RT_TEST(ladder_levels) {
 
 const rt_case rt_suite_gemm_plan[] = {
     RT_CASE(plan_reference_matches_cpu_gemm), RT_CASE(plan_padded_ld_and_batch_chunks), RT_CASE(plan_promotion_table), RT_CASE(plan_bounded_scratch_lm_head),
-    RT_CASE(plan_alignment_and_tf32),         RT_CASE(ladder_levels),
+    RT_CASE(plan_alignment_and_tf32),         RT_CASE(ladder_levels), RT_CASE(plan_scratch_bound),
 };
 const size_t rt_suite_gemm_plan_n = sizeof rt_suite_gemm_plan / sizeof rt_suite_gemm_plan[0];
