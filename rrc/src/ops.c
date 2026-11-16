@@ -92,11 +92,78 @@ static rrc_status chk_alias(const char *op, const char *oname, rrc_buf o, int64_
     return RRC_ERROR(RRC_ERR_ALIAS, "%s: %s must not overlap %s", op, oname, iname);
 }
 
+/* Matrix footprint of an operand: `rows` rows of `width` elements starting at ptr, row pitch `ld`
+ * elements (width <= ld), all inside `elems` elements. rows == 0 means "no 2-D footprint known":
+ * only the flat range [ptr, ptr + elems) is used. */
+typedef struct mfp {
+    rrc_buf b;
+    int64_t elems, rows, width, ld;
+} mfp;
+
+static mfp fp_mat(rrc_buf b, int64_t elems, int64_t rows, int64_t width, int64_t ld) {
+    mfp f = {b, elems, rows, width, ld};
+    if (width > ld) f.rows = 0;
+    return f;
+}
+/* `batch` slices (stride elements apart) of a rows x cols matrix: a single matrix when batch == 1 or
+ * stride == 0, a wider matrix when the slices are interleaved within rows, else flat only. */
+static mfp fp_batched(rrc_buf b, int64_t elems, int64_t batch, int64_t stride, int64_t rows, int64_t cols,
+                      int64_t ld) {
+    if (batch <= 1 || stride == 0) return fp_mat(b, elems, rows, cols, ld);
+    int64_t w;
+    if (!__builtin_mul_overflow(batch - 1, stride, &w) && !__builtin_add_overflow(w, cols, &w) && w <= ld)
+        return fp_mat(b, elems, rows, w, ld);
+    return fp_mat(b, elems, 0, 0, 1);
+}
+
+/* Do the elements of x and y share a byte? Exact for two footprints with the same row pitch in
+ * bytes (column blocks of one buffer are disjoint when their column ranges are), conservative (flat
+ * byte ranges) otherwise. */
+static int fp_overlap(mfp x, mfp y) {
+    if (!overlaps(x.b, x.elems, y.b, y.elems)) return 0;
+    if (x.rows <= 0 || y.rows <= 0) return 1;
+    const int64_t sx = (int64_t)rrc_dtype_size(x.b.dtype), sy = (int64_t)rrc_dtype_size(y.b.dtype);
+    int64_t px, py, wx, wy;
+    if (__builtin_mul_overflow(x.ld, sx, &px) || __builtin_mul_overflow(y.ld, sy, &py) || px != py) return 1;
+    wx = x.width * sx;
+    wy = y.width * sy;
+    /* y starts d bytes (mod pitch) after x; x covers [0, wx), y covers [d, d + wy) of every pitch */
+    int64_t diff = (int64_t)((intptr_t)y.b.ptr - (intptr_t)x.b.ptr);
+    int64_t d = diff % px;
+    if (d < 0) d += px;
+    return !(wx <= d && d + wy <= px);
+}
+
+/* chk_alias on footprints (see chk_alias for allow_exact / same_ld). */
+static rrc_status chk_alias_fp(const char *op, const char *oname, mfp o, const char *iname, mfp i, int allow_exact,
+                               int same_ld) {
+    if (!fp_overlap(o, i)) return RRC_OK;
+    return chk_alias(op, oname, o.b, o.elems, iname, i.b, i.elems, allow_exact, same_ld);
+}
+
 /* ------------------------------------------------------------------------------------------ */
 
 rrc_status rrc_sync(const rrc_backend *be) {
     RRC_CHECK(chk_be(be, "sync"));
     return be->sync(be);
+}
+
+/* k == 0 (m, n > 0): C = beta * C, resolved here so that backends never see k == 0 (A and B are
+ * not accessed and may be rrc_buf_none()). beta == 0 zeroes C (memset, so NaN/Inf do not survive). */
+static rrc_status gemm_k0(const rrc_backend *be, const rrc_gemm_args *g) {
+    if (g->beta == 1.0f) return RRC_OK;
+    const size_t es = rrc_dtype_size(g->c.dtype);
+    const int dense = g->ldc == g->n; /* rows of a slice are contiguous */
+    const int64_t runs = dense ? 1 : g->m, len = dense ? g->m * g->n : g->n;
+    for (int64_t b = 0; b < g->batch; b++)
+        for (int64_t r = 0; r < runs; r++) {
+            const int64_t off = b * g->stride_c + r * g->ldc;
+            if (g->beta == 0.0f)
+                RRC_CHECK(be->memset0(be, (char *)g->c.ptr + (size_t)off * es, (size_t)len * es));
+            else
+                RRC_CHECK(be->scale(be, len, g->beta, rrc_view(g->c, off, len)));
+        }
+    return RRC_OK;
 }
 
 rrc_status rrc_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
@@ -109,6 +176,10 @@ rrc_status rrc_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
     RRC_CHECK(chk_nonneg(op, "n", g->n));
     RRC_CHECK(chk_nonneg(op, "k", g->k));
     RRC_REQUIRE(g->batch >= 1, RRC_ERR_SHAPE, "gemm: batch = %lld must be >= 1", (long long)g->batch);
+    /* cuBLASLt: BATCH_COUNT is int32, ROWS/COLS "usually" int32 (cublasLt.h) */
+    RRC_REQUIRE(g->m <= INT32_MAX && g->n <= INT32_MAX && g->k <= INT32_MAX && g->batch <= INT32_MAX, RRC_ERR_SHAPE,
+                "gemm: m = %lld, n = %lld, k = %lld, batch = %lld: each must be <= INT32_MAX", (long long)g->m,
+                (long long)g->n, (long long)g->k, (long long)g->batch);
     RRC_REQUIRE(g->stride_a >= 0 && g->stride_b >= 0 && g->stride_c >= 0, RRC_ERR_SHAPE, "gemm: negative batch stride");
     /* stored shapes */
     int64_t ar = g->trans_a == RRC_OP_N ? g->m : g->k, ac = g->trans_a == RRC_OP_N ? g->k : g->m;
@@ -138,9 +209,11 @@ rrc_status rrc_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
                     "gemm: C batch slices overlap (stride_c = %lld, ldc = %lld, m = %lld, n = %lld, batch = %lld)",
                     (long long)g->stride_c, (long long)g->ldc, (long long)g->m, (long long)g->n, (long long)g->batch);
     }
-    RRC_CHECK(chk_alias(op, "C", g->c, ec, "A", g->a, ea, 0, 0));
-    RRC_CHECK(chk_alias(op, "C", g->c, ec, "B", g->b, eb, 0, 0));
+    const mfp fc = fp_batched(g->c, ec, g->batch, g->stride_c, g->m, g->n, g->ldc);
+    RRC_CHECK(chk_alias_fp(op, "C", fc, "A", fp_batched(g->a, ea, g->batch, g->stride_a, ar, ac, g->lda), 0, 0));
+    RRC_CHECK(chk_alias_fp(op, "C", fc, "B", fp_batched(g->b, eb, g->batch, g->stride_b, br, bc, g->ldb), 0, 0));
     if (ec == 0) return RRC_OK;
+    if (g->k == 0) return gemm_k0(be, g);
     return be->gemm(be, g);
 }
 
@@ -370,8 +443,10 @@ rrc_status rrc_swiglu_fwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc
     RRC_CHECK(chk_buf(be, op, "gate", gate, M_FLT, ei));
     RRC_CHECK(chk_buf(be, op, "up", up, M_FLT, ei));
     RRC_CHECK(chk_buf(be, op, "h", h, M_FLT, eo));
-    RRC_CHECK(chk_alias(op, "h", h, eo, "gate", gate, ei, 1, ld_in == ld_out));
-    RRC_CHECK(chk_alias(op, "h", h, eo, "up", up, ei, 1, ld_in == ld_out));
+    const mfp fh = fp_mat(h, eo, rows, cols, ld_out), fg = fp_mat(gate, ei, rows, cols, ld_in),
+              fu = fp_mat(up, ei, rows, cols, ld_in);
+    RRC_CHECK(chk_alias_fp(op, "h", fh, "gate", fg, 1, ld_in == ld_out));
+    RRC_CHECK(chk_alias_fp(op, "h", fh, "up", fu, 1, ld_in == ld_out));
     return be->swiglu_fwd(be, rows, cols, gate, up, ld_in, h, ld_out);
 }
 
@@ -392,13 +467,16 @@ rrc_status rrc_swiglu_bwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc
     RRC_CHECK(chk_buf(be, op, "dh", dh, M_FLT, ed));
     RRC_CHECK(chk_buf(be, op, "dgate", dgate, M_FLT, eo));
     RRC_CHECK(chk_buf(be, op, "dup", dup, M_FLT, eo));
-    RRC_CHECK(chk_alias(op, "dgate", dgate, eo, "dup", dup, eo, 0, 0));
-    RRC_CHECK(chk_alias(op, "dgate", dgate, eo, "gate", gate, ei, 1, ld_in == ld_out));
-    RRC_CHECK(chk_alias(op, "dgate", dgate, eo, "up", up, ei, 0, 0));
-    RRC_CHECK(chk_alias(op, "dgate", dgate, eo, "dh", dh, ed, 1, ld_dh == ld_out));
-    RRC_CHECK(chk_alias(op, "dup", dup, eo, "up", up, ei, 1, ld_in == ld_out));
-    RRC_CHECK(chk_alias(op, "dup", dup, eo, "gate", gate, ei, 0, 0));
-    RRC_CHECK(chk_alias(op, "dup", dup, eo, "dh", dh, ed, 1, ld_dh == ld_out));
+    const mfp fdg = fp_mat(dgate, eo, rows, cols, ld_out), fdu = fp_mat(dup, eo, rows, cols, ld_out),
+              fg = fp_mat(gate, ei, rows, cols, ld_in), fu = fp_mat(up, ei, rows, cols, ld_in),
+              fd = fp_mat(dh, ed, rows, cols, ld_dh);
+    RRC_CHECK(chk_alias_fp(op, "dgate", fdg, "dup", fdu, 0, 0));
+    RRC_CHECK(chk_alias_fp(op, "dgate", fdg, "gate", fg, 1, ld_in == ld_out));
+    RRC_CHECK(chk_alias_fp(op, "dgate", fdg, "up", fu, 0, 0));
+    RRC_CHECK(chk_alias_fp(op, "dgate", fdg, "dh", fd, 1, ld_dh == ld_out));
+    RRC_CHECK(chk_alias_fp(op, "dup", fdu, "up", fu, 1, ld_in == ld_out));
+    RRC_CHECK(chk_alias_fp(op, "dup", fdu, "gate", fg, 0, 0));
+    RRC_CHECK(chk_alias_fp(op, "dup", fdu, "dh", fd, 1, ld_dh == ld_out));
     return be->swiglu_bwd(be, rows, cols, gate, up, ld_in, dh, ld_dh, dgate, dup, ld_out);
 }
 

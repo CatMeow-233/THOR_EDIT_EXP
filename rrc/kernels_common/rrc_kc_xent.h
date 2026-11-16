@@ -37,6 +37,7 @@ RRC_HD static inline float rrc_kc_xent_row(void *z, rrc_dtype zdt, int64_t vocab
         double m = -INFINITY, s = 0.0;
         for (int64_t j = 0; j < vocab; j++) {
             double x = (double)rrc_kc_ld(z, zdt, j);
+            if (x == -INFINITY) continue; /* exp(-inf) = 0; avoids exp(-inf - (-inf)) = NaN */
             if (x > m) {
                 s = s * exp(m - x) + 1.0;
                 m = x;

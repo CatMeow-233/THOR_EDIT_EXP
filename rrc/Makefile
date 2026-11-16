@@ -74,8 +74,9 @@ $(LIB): $(LIB_OBJS)
 $(BUILD)/rrc_inspect: $(BUILD)/obj/src/rrc_inspect.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
+# --wrap=malloc: tests/c/test_contracts.c counts the allocation sizes of library code.
 $(TEST_BIN): $(TEST_OBJS) $(LIB)
-	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ -Wl,--wrap=malloc $(LDLIBS)
 
 # The C tests use python3 (if present) to produce a safetensors file with the reference package;
 # that sub-test is skipped with a message when python3 / safetensors / torch are unavailable.

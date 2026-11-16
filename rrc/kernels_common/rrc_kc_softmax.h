@@ -19,7 +19,9 @@ RRC_HD static inline int rrc_kc_attn_allowed(int64_t j, int64_t q, int causal, c
     return 1;
 }
 
-/* Online (max, sum-of-exp) state, mergeable in any tree order by a device reduction. */
+/* Online (max, sum-of-exp) state, mergeable in any tree order by a device reduction. Invariant:
+ * m == -INFINITY implies s == 0 (empty, or only -inf pushed), so -inf values never produce
+ * exp(-inf - (-inf)) = NaN. */
 typedef struct rrc_kc_lse {
     float m; /* running max (-INFINITY when empty) */
     float s; /* sum of exp(x - m) */
@@ -32,6 +34,7 @@ RRC_HD static inline rrc_kc_lse rrc_kc_lse_init(void) {
     return a;
 }
 RRC_HD static inline rrc_kc_lse rrc_kc_lse_push(rrc_kc_lse a, float x) {
+    if (x == -INFINITY) return a; /* contributes exp(-inf) = 0; also keeps (-inf, 0) for an empty state */
     if (x > a.m) {
         a.s = a.s * expf(a.m - x) + 1.0f; /* exp(-inf) = 0 for the first element */
         a.m = x;

@@ -108,6 +108,19 @@ an end-to-end tiny-model check; the user's first command on the 5090), `rrc_benc
   rows via (batched) GEMM, fused mask+softmax kernel, then P·V GEMM; backward via the standard
   `dS = P ∘ (dP − rowsum(dP ∘ P))`. Chunk size bounds the fp32 score memory. A fused
   flash-attention kernel is a later optimisation behind the same op.
+  GEMM call pattern per packed row and query chunk (Hq query heads, Hkv KV heads, G = Hq/Hkv,
+  query head `h` uses KV head `h / G` as in HF `repeat_kv`): scores, P·V, dP and dQ are one
+  batched call per KV group (batch G over the group's query heads, K/V broadcast with stride 0,
+  dQ written as interleaved C slices `stride_c = head_dim`, `ldc = Hq·head_dim`). dK and dV sum
+  over the G query heads of a group, and a batched call cannot reduce over its batch
+  (`stride_c = 0` is refused: overlapping C slices). They are instead G calls per chunk, one per
+  in-group head index `u`, each batched over the Hkv groups and accumulating with `beta = 1`:
+  `A = dS` slices of heads `g·G+u` (`stride_a = G·bs`, bs = the per-head score-slice stride),
+  `B = Q` (or `dO`) heads
+  `g·G+u` (`stride_b = G·head_dim`), `C = dK` (or `dV`) heads `g` (`stride_c = head_dim`,
+  `ldc = Hkv·head_dim`). Per layer backward that is `2·G·B·ceil(T/Tc)` GEMMs with `k = Tc` for
+  dK/dV (tested: `contracts.gqa_dk_batched_over_kv_groups`). Stacking the heads along `k` instead
+  would need uniformly strided Q rows, which the `[N, Hq·head_dim]` layout has only for Hkv = 1.
 * **RMSNorm / RoPE / SwiGLU / residual**: computed in fp32 from bf16 (or fp32) inputs, outputs
   stored in the activation dtype. RoPE cos/sin computed in fp32 (double for inv_freq setup) from
   `rope_theta` (+ llama3 scaling) and `position_ids`. Concretely (stage A): `rrc_rope_tables`
@@ -153,6 +166,11 @@ Ops (row-major everywhere; HF `nn.Linear` weight W is [out, in] row-major):
   `cross_entropy_fwd_bwd` (chunk of logits → per-token loss, dlogits in place, ignore_index),
   `convert` (f32↔bf16), `sum_squares` (grad norm), `scale`, `adamw_step` (fused, fp32).
 * All reductions accumulate in fp32 (CPU may use double where noted for reference ops).
+* Contract details settled before the freeze (§9, items 15–18): `gemm` requires m, n, k,
+  batch ≤ INT32_MAX and resolves k = 0 itself (C = beta·C, never dispatched); matrix operands of
+  `gemm` and `swiglu_fwd/bwd` that are disjoint column blocks of one buffer (same row pitch) are not
+  an alias; operand pointers are only element-aligned; ops may use internal scratch and return
+  `RRC_ERR_OOM`.
 
 Frozen signatures (stage A; full contracts, aliasing rules and preconditions are documented per op
 in `include/rrc/backend.h`). Model code calls the `rrc_<op>` wrappers; the table entries take the
@@ -207,6 +225,16 @@ for each projection `dx += dy Wᵀ`-style input gradient through the frozen W, p
 LM head: hidden states of all tokens with a label → chunks of `ce_chunk` tokens →
 `logits = h W_lmᵀ` (bf16/f32) → fused CE fwd+bwd (dlogits in place, already scaled by
 1/total_tokens) → `dh = dlogits W_lm`. lm_head/embeddings are frozen (no LoRA on them in phase 1).
+The op table has no dedicated gather/scatter; both are `embedding_fwd` calls (tested:
+`contracts.lm_head_row_gather_scatter`): the gather is `embedding_fwd(n_sel, D, vocab = N, ids =
+sel, table = h_final [N, D], out = h_sel)`; the scatter of `dh_sel` back to `[N, D]` is
+`embedding_fwd(N, D, vocab = n_sel + 1, ids = inv, table = dh_ext, out = dh)` where `dh_ext` is
+`[n_sel + 1, D]` with a zero last row and `inv[t]` is the row of token `t` in `sel`, or `n_sel` for
+an unlabelled token (both index arrays are built on the host with the micro-batch). Per-token
+losses of all chunks go into one f32 buffer and are summed either on the host (one `memcpy_d2h`
+per micro-batch) or on the device by `gemm(m = 1, n = 1, k = rows, A = ones, B = loss, beta = 1)`.
+Computing the head over all N rows instead (CE zeroes the ignored rows) would cost
+`(N − n_sel)·V·D` multiply-adds in each of the two head GEMMs.
 
 ## 6. Training driver
 
@@ -307,12 +335,55 @@ left open or a place where the implementation differs from the text above, and w
 12. **Extra files not in §2**: `src/rrc_inspect.c` (`build/rrc_inspect`, prints the loader's view
     of a checkpoint as JSON for the pytest comparison), `tests/cuda/headers_check.cu` (the nvcc
     compile check run by `make test` when `CUDA_HOME`/`RRC_NVCC` is set), `tests/c/rt.h` (test
-    runner). `make cuda` currently runs the header check and compiles `cuda/*.cu` when present.
+    runner), `tests/c/test_contracts.c` (interface-contract tests: column-block aliasing, gemm
+    k = 0 and int32 limits through a recording backend, the GQA and LM-head call patterns, bounded
+    CPU gemm scratch; the test binary is linked with `-Wl,--wrap=malloc` for the last one). `make cuda` currently runs the header check and compiles `cuda/*.cu` when present.
 13. **No pinned / asynchronous host-to-device entry in the table** (§6 mentions pinned buffers
     and async copies): `memcpy_h2d` is synchronous with respect to the host buffer, so a CUDA
     backend that wants overlap must stage through its own pinned buffer inside `memcpy_h2d`.
     The per-step uploads (token ids, labels, positions, doc ids) are small.
 14. **RoPE precision vs transformers grows with position**: transformers evaluates `inv_freq` in
-    float32, rrc in double (rounded to f32 for the tables), so the angle `p * inv_freq` differs by
-    up to about `p` times one ulp of `inv_freq`. The pytest comparison covers positions up to 255
-    (cos/sin within 3e-5); long-sequence comparisons in later stages must budget for this.
+    float32 (f32 `pow`, and for llama3 the smoothing arithmetic in f32 too), rrc in double, rounded
+    once to f32 for the tables. The f32 `inv_freq` values differ by up to 1 ulp for default rope
+    (24 of 64 values for theta 1e6, head_dim 128) and up to 3 ulp for llama3 (21 of 64 for theta
+    5e5, factor 8, original 8192; the 3 ulp are in the medium band), so the angle `p * inv_freq`
+    differs by up to about `3p` ulp of `inv_freq`. Measured max |cos/sin difference| against
+    transformers (one-off probe over the full head): llama3 (8B-like) 1.4e-5 at position 255,
+    4.0e-4 at 8191, 1.9e-3 at 32767, 3.9e-3 at 65535, 5.7e-3 at 131071; default rope theta 1e6
+    4.8e-4 at 8191, 1.95e-3 at 32767, 3.0e-3 at 65535. `test_rope_long_positions_bound` checks the
+    ulp bounds and cos/sin within 3e-5 (255), 1e-3 (8191), 4e-3 (32767), 1e-2 (131071);
+    long-sequence comparisons must use tolerances of that size. rrc keeps the correctly rounded
+    values (reproducing transformers' f32 llama3 arithmetic was considered and not done: the
+    default-rope `pow` ulp would remain, and the tables would no longer be reproducible from the
+    formula alone).
+15. **Aliasing is per element for column blocks (gemm, swiglu_fwd/bwd)**: two matrix operands with
+    the same row pitch in bytes whose column ranges are disjoint do not overlap, even though their
+    address ranges interleave. This makes the fused `[gate | up]` layout usable end to end: the
+    swiglu backward may write `[dgate | dup]` into one fused buffer (the A operand of one backward
+    GEMM with `k = 2·I` against the stacked `[W_gate; W_up]`) or in place into `[gate | up]`, and a
+    gemm may write one column block of a buffer while reading another. Batched operands use the
+    columns covered by all their slices when the slices are interleaved within rows. Other ops keep
+    the address-range test (their in-place uses are exact aliases).
+16. **gemm with k = 0** (m, n > 0) is `C = beta·C` (zero when beta = 0, NaN not propagated), computed
+    in `ops.c` with `memset0` / `scale` per contiguous run of C; the backend's gemm is never called
+    with k = 0, and A, B may be `rrc_buf_none()`. It occurs e.g. for the LoRA `dA += dtᵀx` GEMM of
+    a micro-batch with no tokens.
+17. **gemm limits and alignment**: m, n, k and batch must each be ≤ INT32_MAX (`RRC_ERR_SHAPE`),
+    because cuBLASLt's `BATCH_COUNT` is int32 and ROWS/COLS are int32 in practice; leading
+    dimensions and strides stay int64 (they are int64 in cuBLASLt). Operand pointers are only
+    element-aligned (views at per-head offsets), so the CUDA gemm must set
+    `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_*_BYTES` from the actual pointers on every call.
+18. **Internal scratch**: ops may allocate internal scratch and fail with `RRC_ERR_OOM`. The CPU gemm
+    packs one 32-row block of op(A) and one 32-column block of op(B) per thread (2·32·k floats)
+    instead of whole matrices, with the same dot-product order as before; this bound is tested
+    by counting allocation sizes (the test binary wraps `malloc`).
+19. **Rejected additions to the op table** (recorded so the frozen table is a decision, not an
+    omission): a row-scatter op (composable from `embedding_fwd` with an inverse index, §5, one
+    call), a plain sum reduction (per-token losses: host sum or a ones-vector gemm, §5), a gemm
+    that reduces over its batch for GQA dK/dV (G calls batched over the KV groups instead, §3).
+    A fused attention op remains the later optimisation named in §3, behind the same layer code.
+20. **Cross entropy with -inf logits**: the online log-sum-exp ignores -inf values
+    (`rrc_kc_lse_push`, and the double-accumulation row loop), so a -inf logit anywhere in a row,
+    including index 0, contributes 0 and its gradient is 0, as in torch. Before this rule a leading
+    -inf produced `exp(-inf - (-inf)) = NaN` for the whole row. A row of only -inf logits gives
+    NaN (torch does the same).

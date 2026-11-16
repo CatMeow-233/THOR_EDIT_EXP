@@ -53,88 +53,104 @@ static rrc_status cpu_sync(const rrc_backend *be) {
 
 /* ---- gemm ---------------------------------------------------------------------------------- */
 
-/* Pack op(X) (rows x cols in the op's orientation) of a stored matrix into a dense float array
- * with row stride `cols`. trans == T means the stored matrix is cols x rows. */
-static void pack(const void *base, rrc_dtype dt, int64_t ld, rrc_trans trans, int64_t rows, int64_t cols, float *dst) {
-#pragma omp parallel for schedule(static) if (rows * cols > PAR_MIN)
-    for (int64_t r = 0; r < rows; r++)
+/* Pack rows [r0, r1) of op(X) (rows x cols in the op's orientation) of a stored matrix into a dense
+ * float array with row stride `cols`. trans == T means the stored matrix is cols x rows. */
+static void pack_rows(const void *base, rrc_dtype dt, int64_t ld, rrc_trans trans, int64_t r0, int64_t r1, int64_t cols,
+                      float *dst) {
+    for (int64_t r = r0; r < r1; r++)
         for (int64_t c = 0; c < cols; c++)
-            dst[r * cols + c] = trans == RRC_OP_N ? rrc_kc_ld(base, dt, r * ld + c) : rrc_kc_ld(base, dt, c * ld + r);
+            dst[(r - r0) * cols + c] = trans == RRC_OP_N ? rrc_kc_ld(base, dt, r * ld + c) : rrc_kc_ld(base, dt, c * ld + r);
 }
+
+/* Output tiles of TB x TB; each thread packs the TB rows of op(A) and the TB columns of op(B) of its
+ * current tile into its own scratch (2 * TB * k floats per thread), so the scratch does not grow with
+ * m or n. Every dot product runs over p = 0..k-1 in the same order whatever the tiling or thread
+ * count. ops.c never dispatches k == 0. */
+#define GEMM_TB 32
 
 static rrc_status cpu_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
     const int acc64 = acc64_of(be);
     const int64_t m = g->m, n = g->n, k = g->k;
     const size_t ea = rrc_dtype_size(g->a.dtype), eb = rrc_dtype_size(g->b.dtype), ec = rrc_dtype_size(g->c.dtype);
-    float *ap = NULL, *bt = NULL;
-    if (k > 0) {
-        ap = (float *)malloc((size_t)(m * k) * sizeof(float));
-        bt = (float *)malloc((size_t)(n * k) * sizeof(float));
-        if (!ap || !bt) {
-            free(ap);
-            free(bt);
-            return RRC_ERROR(RRC_ERR_OOM, "cpu gemm packing buffers");
-        }
-    }
+    const int64_t TB = GEMM_TB, ti = (m + TB - 1) / TB, tj = (n + TB - 1) / TB;
+    const float alpha = g->alpha, beta = g->beta;
+    const rrc_dtype cdt = g->c.dtype;
+    const int64_t ldc = g->ldc;
     /* op(B) is k x n; we pack its transpose (n x k) so that each dot product is contiguous:
      * op(B)^T = B^T when trans_b == N (B stored k x n), = B when trans_b == T (B stored n x k). */
     const rrc_trans bt_trans = g->trans_b == RRC_OP_N ? RRC_OP_T : RRC_OP_N;
-    for (int64_t b = 0; b < g->batch; b++) {
+    int fail = 0;
+#pragma omp parallel if (m * n * (k + 1) > PAR_MIN)
+    {
+        float *ap = NULL, *bp = NULL;
         if (k > 0) {
-            const char *abase = (const char *)g->a.ptr + (size_t)(b * g->stride_a) * ea;
-            const char *bbase = (const char *)g->b.ptr + (size_t)(b * g->stride_b) * eb;
-            if (b == 0 || g->stride_a != 0) pack(abase, g->a.dtype, g->lda, g->trans_a, m, k, ap);
-            if (b == 0 || g->stride_b != 0) pack(bbase, g->b.dtype, g->ldb, bt_trans, n, k, bt);
-        }
-        char *cbase = (char *)g->c.ptr + (size_t)(b * g->stride_c) * ec;
-        const float alpha = g->alpha, beta = g->beta;
-        const rrc_dtype cdt = g->c.dtype;
-        const int64_t ldc = g->ldc;
-        const int64_t TB = 32; /* output tile */
-        const int64_t ti = (m + TB - 1) / TB, tj = (n + TB - 1) / TB;
-#pragma omp parallel for schedule(static) if (m * n * (k + 1) > PAR_MIN)
-        for (int64_t t = 0; t < ti * tj; t++) {
-            const int64_t i0 = (t / tj) * TB, j0 = (t % tj) * TB;
-            const int64_t i1 = i0 + TB < m ? i0 + TB : m, j1 = j0 + TB < n ? j0 + TB : n;
-            for (int64_t i = i0; i < i1; i++) {
-                const float *arow = ap ? ap + i * k : NULL;
-                for (int64_t j = j0; j < j1; j++) {
-                    float dot = 0.0f;
-                    if (k > 0) {
-                        const float *brow = bt + j * k;
-                        if (acc64) {
-                            double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-                            int64_t p = 0;
-                            for (; p + 4 <= k; p += 4) {
-                                s0 += (double)arow[p] * brow[p];
-                                s1 += (double)arow[p + 1] * brow[p + 1];
-                                s2 += (double)arow[p + 2] * brow[p + 2];
-                                s3 += (double)arow[p + 3] * brow[p + 3];
-                            }
-                            for (; p < k; p++) s0 += (double)arow[p] * brow[p];
-                            dot = (float)((s0 + s1) + (s2 + s3));
-                        } else {
-                            float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-                            int64_t p = 0;
-                            for (; p + 4 <= k; p += 4) {
-                                s0 += arow[p] * brow[p];
-                                s1 += arow[p + 1] * brow[p + 1];
-                                s2 += arow[p + 2] * brow[p + 2];
-                                s3 += arow[p + 3] * brow[p + 3];
-                            }
-                            for (; p < k; p++) s0 += arow[p] * brow[p];
-                            dot = (s0 + s1) + (s2 + s3);
-                        }
-                    }
-                    float r = alpha * dot;
-                    if (beta != 0.0f) r += beta * rrc_kc_ld(cbase, cdt, i * ldc + j);
-                    rrc_kc_st(cbase, cdt, i * ldc + j, r);
-                }
+            ap = (float *)malloc((size_t)(TB * k) * sizeof(float));
+            bp = (float *)malloc((size_t)(TB * k) * sizeof(float));
+            if (!ap || !bp) {
+#pragma omp atomic write
+                fail = 1;
             }
         }
+#pragma omp barrier
+        int failed;
+#pragma omp atomic read
+        failed = fail;
+        if (!failed)
+            for (int64_t b = 0; b < g->batch; b++) {
+                const char *abase = (const char *)g->a.ptr + (size_t)(b * g->stride_a) * ea;
+                const char *bbase = (const char *)g->b.ptr + (size_t)(b * g->stride_b) * eb;
+                char *cbase = (char *)g->c.ptr + (size_t)(b * g->stride_c) * ec;
+                int64_t packed_i0 = -1;
+#pragma omp for schedule(static)
+                for (int64_t t = 0; t < ti * tj; t++) {
+                    const int64_t i0 = (t / tj) * TB, j0 = (t % tj) * TB;
+                    const int64_t i1 = i0 + TB < m ? i0 + TB : m, j1 = j0 + TB < n ? j0 + TB : n;
+                    if (k > 0) {
+                        if (i0 != packed_i0) pack_rows(abase, g->a.dtype, g->lda, g->trans_a, i0, i1, k, ap);
+                        packed_i0 = i0;
+                        pack_rows(bbase, g->b.dtype, g->ldb, bt_trans, j0, j1, k, bp);
+                    }
+                    for (int64_t i = i0; i < i1; i++) {
+                        const float *arow = ap ? ap + (i - i0) * k : NULL;
+                        for (int64_t j = j0; j < j1; j++) {
+                            float dot = 0.0f;
+                            if (k > 0) {
+                                const float *brow = bp + (j - j0) * k;
+                                if (acc64) {
+                                    double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                                    int64_t p = 0;
+                                    for (; p + 4 <= k; p += 4) {
+                                        s0 += (double)arow[p] * brow[p];
+                                        s1 += (double)arow[p + 1] * brow[p + 1];
+                                        s2 += (double)arow[p + 2] * brow[p + 2];
+                                        s3 += (double)arow[p + 3] * brow[p + 3];
+                                    }
+                                    for (; p < k; p++) s0 += (double)arow[p] * brow[p];
+                                    dot = (float)((s0 + s1) + (s2 + s3));
+                                } else {
+                                    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                                    int64_t p = 0;
+                                    for (; p + 4 <= k; p += 4) {
+                                        s0 += arow[p] * brow[p];
+                                        s1 += arow[p + 1] * brow[p + 1];
+                                        s2 += arow[p + 2] * brow[p + 2];
+                                        s3 += arow[p + 3] * brow[p + 3];
+                                    }
+                                    for (; p < k; p++) s0 += arow[p] * brow[p];
+                                    dot = (s0 + s1) + (s2 + s3);
+                                }
+                            }
+                            float r = alpha * dot;
+                            if (beta != 0.0f) r += beta * rrc_kc_ld(cbase, cdt, i * ldc + j);
+                            rrc_kc_st(cbase, cdt, i * ldc + j, r);
+                        }
+                    }
+                }
+            }
+        free(ap);
+        free(bp);
     }
-    free(ap);
-    free(bt);
+    if (fail) return RRC_ERROR(RRC_ERR_OOM, "cpu gemm: packing scratch (2 x %lld floats per thread)", (long long)(TB * k));
     return RRC_OK;
 }
 

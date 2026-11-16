@@ -315,3 +315,50 @@ def test_config_variant_refused(name: str, tmp_path: pathlib.Path, rrc_inspect: 
     if name == "llama_unknown_key":
         rc, out = run_inspect(rrc_inspect, d, "--config-only", "--allow-unknown-keys")
         assert rc == 0 and out["ok"], out
+
+
+# ---------------------------------------------------------------------------------------------
+# RoPE at long positions (DESIGN.md §9, deviation 14): transformers' f32 inv_freq differs from
+# rrc's correctly rounded one by a few ulp, so the cos/sin gap grows with the position.
+# ---------------------------------------------------------------------------------------------
+
+LONG_ROPE = {
+    # name: (config, max inv_freq ulp difference, {position: max |cos/sin difference|})
+    "llama3_8k_x8": (dict(model_type="llama", vocab_size=128, hidden_size=4096, intermediate_size=128,
+                          num_hidden_layers=1, num_attention_heads=32, num_key_value_heads=8,
+                          max_position_embeddings=131072, rope_theta=500000.0,
+                          rope_scaling=dict(rope_type="llama3", factor=8.0, low_freq_factor=1.0,
+                                            high_freq_factor=4.0, original_max_position_embeddings=8192)),
+                     3, {255: 3e-5, 8191: 1e-3, 32767: 4e-3, 131071: 1e-2}),
+    "default_theta_1e6": (dict(model_type="qwen3", vocab_size=128, hidden_size=4096, intermediate_size=128,
+                               num_hidden_layers=1, num_attention_heads=32, num_key_value_heads=8, head_dim=128,
+                               max_position_embeddings=40960, rope_theta=1000000.0),
+                          1, {255: 3e-5, 8191: 1e-3, 32767: 4e-3}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LONG_ROPE))
+def test_rope_long_positions_bound(name: str, tmp_path: pathlib.Path, rrc_inspect: pathlib.Path) -> None:
+    import importlib
+
+    cfg_d, max_ulp, bounds = LONG_ROPE[name]
+    d = write_config(tmp_path / name, {})
+    (d / "config.json").write_text(json.dumps(cfg_d))
+    positions = sorted(bounds)
+    proc = subprocess.run([str(rrc_inspect), "--config-only", "--positions", ",".join(map(str, positions)), str(d)],
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    cfg = transformers.AutoConfig.from_pretrained(d)
+    mod = importlib.import_module(f"transformers.models.{cfg.model_type}.modeling_{cfg.model_type}")
+    rot = getattr(mod, {"llama": "LlamaRotaryEmbedding", "qwen3": "Qwen3RotaryEmbedding"}[cfg.model_type])(cfg)
+    half = out["config"]["head_dim"] // 2
+    inv_rrc = torch.tensor(out["inv_freq"], dtype=torch.float64).float()
+    ulp = (inv_rrc.view(torch.int32) - rot.inv_freq.float().view(torch.int32)).abs()
+    assert int(ulp.max()) <= max_ulp, ulp.tolist()
+    cos, sin = rot(torch.zeros(1), torch.tensor([positions]))
+    for name_t, ref in (("cos", cos), ("sin", sin)):
+        got = torch.tensor(out["rope"][name_t], dtype=torch.float64)
+        for k, p in enumerate(positions):
+            diff = (got[k] - ref[0, k, :half].double()).abs().max().item()
+            assert diff <= bounds[p], f"{name_t} at position {p}: max diff {diff:.3g} > {bounds[p]}"

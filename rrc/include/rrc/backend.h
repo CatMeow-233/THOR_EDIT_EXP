@@ -3,8 +3,8 @@
  * A backend is a `const rrc_backend *`: a name, device-memory functions and one function pointer
  * per op. Model and trainer code call the `rrc_<op>()` wrappers declared below (src/ops.c), which
  * check every precondition on the host (null pointers, backend ownership, dtypes, shapes, extents
- * against rrc_buf.numel, aliasing) and then dispatch to `be-><op>`. Backends may assume that all
- * of these preconditions hold; data-dependent conditions (token ids, labels and position ids in
+ * against rrc_buf.numel, aliasing, the int32 limits of gemm) and then dispatch to `be-><op>`.
+ * Backends may assume that all of these preconditions hold; data-dependent conditions (token ids, labels and position ids in
  * range) are checked by the CPU backend and are documented preconditions for device backends
  * (which report RRC_ERR_RANGE from the op or from the next sync).
  *
@@ -17,7 +17,16 @@
  * Conventions:
  *   - Row-major everywhere. A "rows x cols matrix with leading dimension ld" is the element
  *     (r, c) at offset r*ld + c (ld >= cols). HF nn.Linear weights W are [out, in] row-major.
- *   - Shapes and leading dimensions are int64 element counts. Zero-sized ops are valid no-ops.
+ *   - Shapes and leading dimensions are int64 element counts. Zero-sized ops (no output element)
+ *     are valid no-ops and are not dispatched. gemm with k == 0 but m, n > 0 is not zero-sized: it
+ *     computes C = beta * C and is resolved in ops.c (memset0 / scale), so a backend's gemm never
+ *     sees k == 0.
+ *   - Operand pointers carry no alignment guarantee beyond the element size: a view may start at
+ *     any element (e.g. per-head offsets h * head_dim). A device backend that needs alignment
+ *     (cuBLASLt's PREF_MIN_ALIGNMENT_*_BYTES) must derive it from the actual pointers and leading
+ *     dimensions on every call.
+ *   - Ops may use internal scratch memory (CPU gemm: 2 * 32 * k floats per thread for packing;
+ *     the CUDA backend: its cuBLASLt workspace) and can then fail with RRC_ERR_OOM.
  *   - Float math is fp32; inputs are widened from bf16 exactly; results are rounded to the output
  *     dtype once (round-to-nearest-even). Reductions accumulate in fp32 on device backends; the
  *     CPU reference backend accumulates in double (rrc_backend_cpu) or in fp32
@@ -25,7 +34,12 @@
  *     of threads.
  *   - Aliasing: "exact alias" means same ptr, same dtype and same leading dimension. Where an op
  *     allows an output to exactly alias an input it is stated below; any other overlap between an
- *     output and any operand, or between two outputs, is RRC_ERR_ALIAS.
+ *     output and any operand, or between two outputs, is RRC_ERR_ALIAS. For the matrix operands of
+ *     gemm and swiglu_fwd/bwd, overlap is decided per element, not by address range: two operands
+ *     with the same row pitch in bytes (ld * element size) whose column ranges are disjoint (e.g.
+ *     the [gate | up] column blocks of one fused [rows, 2*cols] buffer) do not overlap. A block
+ *     whose columns run past the end of the pitch, or operands with different pitches, fall back
+ *     to the address-range test.
  */
 #ifndef RRC_BACKEND_H
 #define RRC_BACKEND_H
@@ -48,12 +62,20 @@ typedef enum rrc_trans { RRC_OP_N = 0, RRC_OP_T = 1 } rrc_trans;
  *   op(A) is m x k: trans_a == N -> A stored m x k (lda >= k); T -> A stored k x m (lda >= m).
  *   op(B) is k x n: trans_b == N -> B stored k x n (ldb >= n); T -> B stored n x k (ldb >= k).
  *   C is m x n (ldc >= n). A[b] = a.ptr + b*stride_a (elements), likewise B and C.
+ *   Limits: m, n, k and batch must each be <= INT32_MAX (cuBLASLt's BATCH_COUNT is int32 and its
+ *   ROWS/COLS are int32 in practice); leading dimensions and strides are int64.
+ *   k == 0: C = beta * C (zeroed when beta == 0); A and B are not accessed and may be
+ *   rrc_buf_none(); resolved in ops.c, never dispatched to the backend.
  *   stride_a / stride_b may be 0 (broadcast one matrix over the batch); C slices must not overlap
  *   each other (stride_c >= extent of one C slice, or C slices interleaved within rows with
  *   n <= stride_c and (batch-1)*stride_c + n <= ldc).
  *   dtypes: a, b, c each RRC_F32 or RRC_BF16 independently; fp32 accumulation. beta == 0 means C
  *   is not read (NaN/Inf in C are overwritten).
- *   Aliasing: C must not overlap A or B. */
+ *   Aliasing: C must not overlap A or B (per element for column blocks with the same pitch, see
+ *   the conventions above), so C may be one column block of a buffer whose other block is A or B.
+ *   Patterns (DESIGN.md §3): GQA dK_g = sum_u dS_(g*G+u)^T Q_(g*G+u) is one call per in-group head
+ *   u, batched over the KV groups g with beta = 1 (C interleaved: stride_c = head_dim); a single
+ *   call summing over u (stride_c = 0) is refused because its C slices overlap. */
 typedef struct rrc_gemm_args {
     rrc_trans trans_a, trans_b;
     int64_t m, n, k;
@@ -144,7 +166,9 @@ rrc_status rrc_gemm2d(const rrc_backend *be, rrc_trans ta, rrc_trans tb, int64_t
 
 /* out[t, :] = table[ids[t], :] for t < n_tokens. ids: I32 [n_tokens], each in [0, vocab)
  * (RRC_ERR_RANGE otherwise). table: [vocab, dim] f32|bf16; out: [n_tokens, dim] f32|bf16
- * (converted). out must not overlap table or ids. */
+ * (converted). out must not overlap table or ids. Also the dense row gather / scatter of the LM
+ * head (DESIGN.md §5): table = hidden states [N, dim] with ids = selected rows, and back with
+ * table = [n_sel + 1, dim] (last row zero) and an inverse index. */
 rrc_status rrc_embedding_fwd(const rrc_backend *be, int64_t n_tokens, int64_t dim, int64_t vocab, rrc_buf ids,
                              rrc_buf table, rrc_buf out);
 
@@ -199,12 +223,16 @@ rrc_status rrc_attn_softmax_bwd(const rrc_backend *be, int64_t batch, int64_t ro
                                 int64_t batch_stride, rrc_buf p, rrc_buf dp, float scale, rrc_buf ds);
 
 /* h = silu(gate) * up, elementwise over rows x cols. gate and up share ld_in (they may be two
- * column blocks of one fused buffer); h has ld_out. h may exactly alias gate or up. */
+ * column blocks of one fused buffer); h has ld_out. h may exactly alias gate or up (with a fused
+ * [gate | up] buffer, h = gate writes the gate block in place and leaves the up block intact). */
 rrc_status rrc_swiglu_fwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf gate, rrc_buf up, int64_t ld_in,
                           rrc_buf h, int64_t ld_out);
 /* dgate = dh * up * silu'(gate), dup = dh * silu(gate). gate/up: ld_in; dh: ld_dh; dgate/dup:
  * ld_out. dgate may exactly alias gate or dh; dup may exactly alias up or dh; dgate and dup must
- * not overlap each other. */
+ * not overlap each other. Column blocks of one buffer count as disjoint (conventions above), so
+ * with a fused [gate | up] input the outputs may be the two blocks of a fused [dgate | dup] buffer
+ * (ld_out = 2*cols, the A operand of one backward GEMM with k = 2*cols) or the input blocks
+ * themselves (dgate = gate, dup = up: in place). */
 rrc_status rrc_swiglu_bwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf gate, rrc_buf up, int64_t ld_in,
                           rrc_buf dh, int64_t ld_dh, rrc_buf dgate, rrc_buf dup, int64_t ld_out);
 
@@ -222,6 +250,8 @@ rrc_status rrc_convert(const rrc_backend *be, int64_t n, rrc_buf src, rrc_buf ds
 rrc_status rrc_sum_squares(const rrc_backend *be, int64_t n, rrc_buf x, rrc_buf out, int accumulate);
 
 /* Fused causal-LM cross entropy over a chunk of rows. logits: rows x vocab (ld) f32|bf16;
+ * -inf logits are allowed (they contribute exp(-inf) = 0; a row whose logits are all -inf yields
+ * NaN, as in torch);
  * labels: I32 [rows], each in [0, vocab) or RRC_IGNORE_INDEX (RRC_ERR_RANGE otherwise);
  * loss: f32 [rows] receives (max(z) - z[label]) + log(sum exp(z - max)) = logsumexp(z) - z[label]
  * (0 for ignored rows). If write_grad, logits
