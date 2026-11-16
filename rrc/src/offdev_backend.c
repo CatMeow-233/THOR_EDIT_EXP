@@ -380,11 +380,12 @@ rrc_status rrc_offdev_backend_destroy(const rrc_backend *be, rrc_offdev_stats *f
     if (final) *final = st;
     for (size_t i = 0; i < s->n; i++) s->inner->free(s->inner, s->e[i].real);
     free(s->e);
-    munmap((void *)s->base, s->size);
+    const int unmapped = munmap((void *)s->base, s->size) == 0;
     char name[64];
     snprintf(name, sizeof name, "%s", s->name);
     s->magic = 0;
     free(s);
+    if (!unmapped) return RRC_ERROR(RRC_ERR_BACKEND, "%s: munmap of the address reservation failed", name);
     if (st.live || st.bad_frees || st.bad_ptrs)
         return RRC_ERROR(RRC_ERR_INTERNAL, "%s: %lld allocations (%lld bytes) still live, %lld bad frees, %lld "
                          "refused translations", name, (long long)st.live, (long long)st.live_bytes,

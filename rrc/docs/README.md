@@ -74,7 +74,8 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   backends and the trainer runs on `rrc_train_run_test_offdev`: device pointers are not
   host-mapped, so a host access to backend memory anywhere in the model, LoRA, trainer or
   checkpoint code (or in the tests) is a SIGSEGV. At exit a live allocation, a bad free, a refused
-  translation, or no allocation at all through the wrappers fails the run. TEST ONLY.
+  translation, or no allocation at all through the wrappers fails the run. Without a filter the
+  whole C suite also passes this way (suites that use `rt_backend()` then run off-device). TEST ONLY.
 * `rrc/tests/test_config_loading.py` — tiny random checkpoints from `rrc/tools/make_tiny_model.py`
   (llama, llama tied, llama3 rope scaling, qwen2, qwen2 tied, qwen3, qwen3 tied, qwen3 with
   head_dim != hidden/heads and attention biases, a bf16 sharded checkpoint) loaded by

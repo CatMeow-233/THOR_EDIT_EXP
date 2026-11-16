@@ -1086,7 +1086,12 @@ by reading the code. This section makes it a test.
      chunking / bf16 invariances, workspace reuse, zero-label windows, load failures, the GEMM dtype
      recorder, the fused clip + AdamW step, state files, end-to-end stop + resume, failure-safe
      checkpoint replacement, output-dir guards, init_adapter checks) with every buffer off-device.
-   * Bit-for-bit comparisons (normal `rrc_tests` run, so also under `make asan` / `make tsan`):
+   * The whole C suite also passes with `rrc_tests --offdev` and no filter (every test that uses
+     `rt_backend()` / `rt_cpu()`, e.g. the `grad` and `contracts` suites, then runs off-device);
+     `make test` runs only the three suites above.
+   * Bit-for-bit comparisons (normal `rrc_tests` run, so also under `make asan`; `make tsan` runs
+     only the `data` and `train` suites, so it covers `train_offdev_bit_identical` with the
+     prefetch thread, not the model comparison):
      `model.model_offdev_bit_identical`: qwen3 / llama (upper layers only) / qwen2, f32 and bf16,
      recompute full and none, cpu and (qwen3) cpu-f32acc: LoRA load from safetensors, three
      micro-batches with a larger third one (workspace re-plan), loss-only, no-LoRA, microbatch_mean,

@@ -47,7 +47,8 @@ int rrc_backend_is_offdev(const rrc_backend *be);
 rrc_status rrc_offdev_get_stats(const rrc_backend *be, rrc_offdev_stats *out);
 /* Destroy the wrapper: frees what is still allocated, releases the reservation and, if `final` is
  * non-NULL, stores the final counters. Returns RRC_ERR_INTERNAL (with a message) if allocations
- * were still live or a bad free / refused translation happened, RRC_OK otherwise. NULL is a no-op. */
+ * were still live or a bad free / refused translation happened, RRC_ERR_BACKEND if munmap failed,
+ * RRC_OK otherwise. NULL is a no-op. */
 rrc_status rrc_offdev_backend_destroy(const rrc_backend *be, rrc_offdev_stats *final);
 
 #ifdef __cplusplus
