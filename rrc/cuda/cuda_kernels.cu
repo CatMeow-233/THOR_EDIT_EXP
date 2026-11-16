@@ -10,6 +10,8 @@
 // The same bodies run on the CPU, in shuffled order, in rrc/cuda/kc_emu.c (tests/c/test_kc_items.c).
 // Compiled with -fmad=false -prec-div=true -prec-sqrt=true -ftz=false (Makefile): no contraction of
 // a*b+c into fma (the bodies call fmaf where the CPU semantics have one), IEEE division and sqrt.
+#include <string.h>
+
 #include "cuda_internal.h"
 
 #define LANES RRC_KC_LANES
@@ -276,3 +278,14 @@ cudaError_t rrc_cu_sum_squares(cudaStream_t s, unsigned max_blocks, const rrc_kc
 }
 cudaError_t rrc_cu_xent(cudaStream_t s, unsigned max_blocks, const rrc_kc_xent_p *p, rrc_cuda_err *err) { LAUNCH_ROWS(k_xent, p->rows, *p, err); }
 cudaError_t rrc_cu_adamw(cudaStream_t s, unsigned max_blocks, const rrc_kc_adamw_p *p) { LAUNCH_ELEMS(k_adamw, p->n, *p, p->n); }
+
+// The kernel image the runtime loaded for this device (SASS vs. JIT-compiled PTX), for rrc_selftest's
+// report. Any rrc kernel would do; all are in this translation unit.
+cudaError_t rrc_cu_kernel_versions(int *binary_version, int *ptx_version) {
+    cudaFuncAttributes a;
+    memset(&a, 0, sizeof a);
+    cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void *>(&k_add));
+    *binary_version = a.binaryVersion;
+    *ptx_version = a.ptxVersion;
+    return e;
+}

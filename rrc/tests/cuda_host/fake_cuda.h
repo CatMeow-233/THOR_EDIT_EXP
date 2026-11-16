@@ -20,6 +20,16 @@ void rrc_fake_set_lt_mode(int mode);
 
 /* The n-th cudaMalloc from now (0 = the next one) fails with cudaErrorMemoryAllocation; -1: none. */
 void rrc_fake_fail_malloc_after(int n);
+/* The same for cudaHostAlloc (pinned host memory). */
+void rrc_fake_fail_host_alloc_after(int n);
+
+/* Host -> device copies are LAZY: cudaMemcpyAsync(HostToDevice) only queues (dst, src, n) and
+ * reads the source when the queue is flushed, as a DMA engine reads it some time after the call.
+ * The queue is flushed, in order, before any other stream operation (kernel launch, cuBLASLt
+ * matmul, device/host-bound copy, memset), by cudaStreamSynchronize / cudaDeviceSynchronize, by
+ * cudaEventSynchronize up to the copies enqueued before the event's record, and by cudaFree /
+ * cudaFreeHost. So code that overwrites a host source (e.g. a staging slot) before the copy that
+ * reads it is known complete delivers the overwritten bytes, and a test sees it. */
 
 typedef struct rrc_fake_stats {
     long mallocs, frees;
@@ -30,6 +40,12 @@ typedef struct rrc_fake_stats {
     long lt_matmuls;     /* cublasLtMatmul calls */
     long lt_violations;  /* inconsistent descriptors, unsupported types, broken alignment promises,
                           * a split-K algorithm with a non-fp32 reduction passed to cublasLtMatmul */
+    long h2d_async;      /* cudaMemcpyAsync host -> device calls */
+    long h2d_pageable;   /* ... of them with a source outside every live cudaHostAlloc block */
+    long h2d_pending;    /* host -> device copies queued and not yet executed */
+    long stream_syncs;   /* cudaStreamSynchronize calls */
+    long event_syncs;    /* cudaEventSynchronize calls */
+    long host_allocs_live; /* cudaHostAlloc blocks currently live */
 } rrc_fake_stats;
 void rrc_fake_get_stats(rrc_fake_stats *s);
 

@@ -46,12 +46,35 @@ typedef struct rrc_st_opts {
     int (*gemm_path)(const rrc_backend *dev, char *buf, size_t n);
 } rrc_st_opts;
 
+/* Per-op summary of one run (what rrc_selftest prints per op, kept for --report). */
+typedef struct rrc_st_op_summary {
+    char op[32];
+    int cases, failures;
+    double max_abs, max_rel, worst_ratio; /* worst error / tolerance over the op's cases */
+} rrc_st_op_summary;
+
+#define RRC_ST_MAX_OPS 24
+#define RRC_ST_MAX_NOTES 16
+
 typedef struct rrc_st_result {
     int checks, failures;
     int det_checks, det_failures;
     int range_checks, range_failures;
     int path_checks, path_failures; /* GEMM path requirements (require_lt) */
+    /* for reports (filled by rrc_st_run) */
+    int n_ops;
+    rrc_st_op_summary ops[RRC_ST_MAX_OPS];
+    char gemm_paths[8][160];        /* path of the first plain case per (A, B, C) triple, index 4a + 2b + c (bf16 = 1) */
+    int gemm_tally[8][3];           /* cases per layout (rrc_st_layout_name) and ladder level */
+    int gemm_cases, gemm_chunked_cases, gemm_kernel_cases;
+    int n_kernel_notes;             /* the first RRC_ST_MAX_NOTES cases that ran on the kernel fallback */
+    char kernel_notes[RRC_ST_MAX_NOTES][200];
+    int n_fail_notes;               /* the first RRC_ST_MAX_NOTES failing cases */
+    char fail_notes[RRC_ST_MAX_NOTES][200];
 } rrc_st_result;
+
+/* Name of GEMM layout index l of rrc_st_result.gemm_tally (NULL if out of range). */
+const char *rrc_st_layout_name(int l);
 
 /* Returns the number of failed checks (0 = all PASS). A run in which no check ran at all (e.g. an
  * `only` filter matching no op) counts as one failure. */

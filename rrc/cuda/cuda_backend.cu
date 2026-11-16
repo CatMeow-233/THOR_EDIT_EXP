@@ -32,11 +32,42 @@ struct lt_entry {
     cublasLtMatmulAlgo_t algo;
 };
 
+// One slot of the pinned memcpy_h2d staging ring: `ev` is recorded after the slot -> device copy;
+// `busy` = such a copy was enqueued and its event has not been waited for since.
+struct stage_slot {
+    unsigned char *host;
+    cudaEvent_t ev;
+    int busy;
+};
+
+// Live be->alloc allocations (pointer, bytes) for the memory counters (unordered, swap-remove).
+struct live_alloc {
+    void *p;
+    size_t n;
+};
+
+struct census_entry {
+    int used;
+    rrc_cuda_gemm_shape s;
+};
+
 struct cuda_be {
     rrc_backend table; // first member: the backend handed out
     int device;
     rrc_cuda_options o;
     cudaStream_t stream;
+    // memcpy_h2d staging ring (n_slots == 0: disabled)
+    unsigned char *stage_base;
+    size_t slot_bytes;
+    int n_slots, stage_next;
+    stage_slot slots[RRC_CUDA_MAX_STAGING_SLOTS];
+    // counters
+    rrc_cuda_stats st;
+    live_alloc *live;
+    size_t n_live, cap_live;
+    int census_on;
+    int64_t census_dropped;
+    census_entry *census; // RRC_CUDA_CENSUS_MAX entries when enabled
     cublasLtHandle_t lt;
     void *workspace;
     size_t ws_bytes;
@@ -88,16 +119,29 @@ rrc_status err_reset(cuda_be *c) {
     return RRC_OK;
 }
 
+// Internal device memory changed: refresh the counters' total peak.
+void note_mem(cuda_be *c) {
+    c->st.internal_bytes = c->ws_bytes + c->scratch_bytes + c->ss_part_bytes + (c->err_dev ? sizeof(rrc_cuda_err) : 0);
+    const size_t total = c->st.alloc_bytes + c->st.internal_bytes;
+    if (total > c->st.total_peak_bytes) c->st.total_peak_bytes = total;
+    if (c->st.alloc_bytes > c->st.alloc_peak_bytes) c->st.alloc_peak_bytes = c->st.alloc_bytes;
+}
+
+cudaError_t stream_sync(cuda_be *c) {
+    c->st.stream_syncs++;
+    return cudaStreamSynchronize(c->stream);
+}
+
 // Wait for the stream, then report (and clear) a device range error.
 rrc_status sync_and_check(cuda_be *c) {
     CU(cudaMemcpyAsync(c->err_host, c->err_dev, sizeof(rrc_cuda_err), cudaMemcpyDeviceToHost, c->stream),
        "read error flag");
-    CU(cudaStreamSynchronize(c->stream), "stream synchronize");
+    CU(stream_sync(c), "stream synchronize");
     if (c->err_host->op != RRC_CU_OP_NONE) {
         unsigned op = c->err_host->op;
         unsigned long long idx = c->err_host->index;
         RRC_CHECK(err_reset(c));
-        CU(cudaStreamSynchronize(c->stream), "stream synchronize");
+        CU(stream_sync(c), "stream synchronize");
         return RRC_ERROR(RRC_ERR_RANGE, "cuda: device range error in %s, smallest offending row/token %llu (reported at "
                                         "sync; outputs of the ops since the previous sync are unspecified)",
                          op_name(op), idx);
@@ -115,9 +159,16 @@ rrc_status after(cuda_be *c, cudaError_t launch, const char *what) {
 // ---- memory ---------------------------------------------------------------------------------------
 
 rrc_status cb_alloc(const rrc_backend *be, size_t bytes, void **out) {
-    (void)be;
+    cuda_be *c = CB(be);
     *out = NULL;
     if (bytes == 0) return RRC_OK;
+    if (c->n_live == c->cap_live) { // the tracking entry first: no device memory to undo if it fails
+        const size_t cap = c->cap_live ? 2 * c->cap_live : 64;
+        live_alloc *nl = (live_alloc *)realloc(c->live, cap * sizeof *nl);
+        if (!nl) return RRC_ERROR(RRC_ERR_OOM, "cuda alloc: host tracking table");
+        c->live = nl;
+        c->cap_live = cap;
+    }
     cudaError_t e = cudaMalloc(out, bytes);
     if (e != cudaSuccess) {
         *out = NULL;
@@ -125,20 +176,68 @@ rrc_status cb_alloc(const rrc_backend *be, size_t bytes, void **out) {
         return e == cudaErrorMemoryAllocation ? RRC_ERROR(RRC_ERR_OOM, "cuda alloc of %zu bytes", bytes)
                                               : cu_fail(e, "cudaMalloc");
     }
+    c->live[c->n_live].p = *out;
+    c->live[c->n_live].n = bytes;
+    c->n_live++;
+    c->st.n_allocs++;
+    c->st.alloc_bytes += bytes;
+    note_mem(c);
     return RRC_OK;
 }
 void cb_free(const rrc_backend *be, void *ptr) {
     if (!ptr) return;
+    cuda_be *c = CB(be);
     // work enqueued on the stream may still use ptr: wait for it before freeing (errors of that
     // work, if any, resurface at the next sync)
-    (void)cudaStreamSynchronize(CB(be)->stream);
+    (void)stream_sync(c);
     (void)cudaFree(ptr);
+    for (size_t i = 0; i < c->n_live; i++)
+        if (c->live[i].p == ptr) {
+            c->st.alloc_bytes -= c->live[i].n;
+            c->live[i] = c->live[--c->n_live];
+            c->st.n_frees++;
+            break;
+        }
 }
+
+// memcpy_h2d through the pinned staging ring (DESIGN.md §15.3). Contract (backend.h): returns once
+// the host source may be reused. Each slot-sized chunk is copied into a pinned slot on the host
+// (so the source is free again as soon as that memcpy returns), the slot -> device copy is
+// enqueued on the stream and the slot's event recorded after it. A slot is overwritten only after
+// cudaEventSynchronize of its event, i.e. after the copy that last read it has completed. No full
+// stream synchronize: the device copy is ordered with every other op by the stream.
 rrc_status cb_h2d(const rrc_backend *be, void *dst, const void *src, size_t bytes) {
     cuda_be *c = CB(be);
     if (!bytes) return RRC_OK;
-    CU(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->stream), "memcpy_h2d");
-    CU(cudaStreamSynchronize(c->stream), "memcpy_h2d synchronize"); // the host source may be reused on return
+    c->st.h2d_calls++;
+    c->st.h2d_bytes += (int64_t)bytes;
+    if (c->n_slots == 0) { // ring disabled: pageable copy, then wait so the source may be reused
+        c->st.h2d_direct++;
+        CU(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->stream), "memcpy_h2d");
+        CU(stream_sync(c), "memcpy_h2d synchronize");
+        return RRC_OK;
+    }
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char *d = (unsigned char *)dst;
+    while (bytes) {
+        const size_t n = bytes < c->slot_bytes ? bytes : c->slot_bytes;
+        stage_slot *sl = &c->slots[c->stage_next];
+        c->stage_next = (c->stage_next + 1) % c->n_slots;
+        if (sl->busy) { // the previous copy out of this slot must have read it
+            c->st.h2d_slot_waits++;
+            CU(cudaEventSynchronize(sl->ev), "memcpy_h2d staging slot wait");
+            sl->busy = 0;
+        }
+        memcpy(sl->host, s, n);
+        CU(cudaMemcpyAsync(d, sl->host, n, cudaMemcpyHostToDevice, c->stream), "memcpy_h2d (staged)");
+        CU(cudaEventRecord(sl->ev, c->stream), "memcpy_h2d staging event");
+        sl->busy = 1;
+        c->st.h2d_staged_chunks++;
+        s += n;
+        d += n;
+        bytes -= n;
+    }
+    if (c->o.sync_each_op) return sync_and_check(c);
     return RRC_OK;
 }
 rrc_status cb_d2h(const rrc_backend *be, void *dst, const void *src, size_t bytes) {
@@ -163,10 +262,11 @@ rrc_status cb_sync(const rrc_backend *be) { return sync_and_check(CB(be)); }
 // as (NULL, 0), so no dangling pointer survives.
 rrc_status grow(cuda_be *c, void **buf, size_t *have, size_t need, const char *what) {
     if (need <= *have) return RRC_OK;
-    CU(cudaStreamSynchronize(c->stream), what);
+    CU(stream_sync(c), what);
     if (*buf) CU(cudaFree(*buf), what);
     *buf = NULL;
     *have = 0;
+    note_mem(c);
     cudaError_t e = cudaMalloc(buf, need);
     if (e != cudaSuccess) {
         *buf = NULL;
@@ -174,6 +274,7 @@ rrc_status grow(cuda_be *c, void **buf, size_t *have, size_t need, const char *w
         return cu_fail(e, what);
     }
     *have = need;
+    note_mem(c);
     return RRC_OK;
 }
 
@@ -361,6 +462,49 @@ rrc_status ex_convert(void *ctx, const rrc_kc_conv2d_p *p) {
 }
 const rrc_gemm_exec_ops k_ops = {ex_scratch, ex_supported, ex_lt_run, ex_kernel_run, ex_convert};
 
+void census_note(cuda_be *c, const rrc_gemm_args *g, int level) {
+    census_entry *free_e = NULL;
+    for (int i = 0; i < RRC_CUDA_CENSUS_MAX; i++) {
+        census_entry *e = &c->census[i];
+        if (!e->used) {
+            if (!free_e) free_e = e;
+            break; // entries are filled in order: the first unused one ends the list
+        }
+        const rrc_cuda_gemm_shape *s = &e->s;
+        if (s->trans_a == (int)g->trans_a && s->trans_b == (int)g->trans_b && s->dt_a == (int)g->a.dtype &&
+            s->dt_b == (int)g->b.dtype && s->dt_c == (int)g->c.dtype && s->m == g->m && s->n == g->n && s->k == g->k &&
+            s->batch == g->batch && s->lda == g->lda && s->ldb == g->ldb && s->ldc == g->ldc) {
+            e->s.calls++;
+            e->s.level = level;
+            e->s.chunks = c->rep.n_chunks;
+            snprintf(e->s.path, sizeof e->s.path, "%s", c->rep.desc);
+            return;
+        }
+    }
+    if (!free_e) {
+        c->census_dropped++;
+        return;
+    }
+    free_e->used = 1;
+    rrc_cuda_gemm_shape *s = &free_e->s;
+    s->trans_a = (int)g->trans_a;
+    s->trans_b = (int)g->trans_b;
+    s->dt_a = (int)g->a.dtype;
+    s->dt_b = (int)g->b.dtype;
+    s->dt_c = (int)g->c.dtype;
+    s->m = g->m;
+    s->n = g->n;
+    s->k = g->k;
+    s->batch = g->batch;
+    s->lda = g->lda;
+    s->ldb = g->ldb;
+    s->ldc = g->ldc;
+    s->calls = 1;
+    s->level = level;
+    s->chunks = c->rep.n_chunks;
+    snprintf(s->path, sizeof s->path, "%s", c->rep.desc);
+}
+
 rrc_status cb_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
     cuda_be *c = CB(be);
     rrc_gemm_plan_opts po;
@@ -370,6 +514,13 @@ rrc_status cb_gemm(const rrc_backend *be, const rrc_gemm_args *g) {
     c->have_rep = 0;
     RRC_CHECK(rrc_gemm_execute(g, &po, (rrc_gemm_level)c->o.gemm_min_level, &k_ops, c, &c->rep));
     c->have_rep = 1;
+    const int combo = 4 * (g->a.dtype == RRC_BF16) + 2 * (g->b.dtype == RRC_BF16) + (g->c.dtype == RRC_BF16);
+    int level = (int)c->rep.level;
+    if (level < 0 || level > 2) level = 2;
+    c->st.gemm_calls[combo][level]++;
+    c->st.gemm_flops[combo][level] += 2.0 * (double)g->m * (double)g->n * (double)g->k * (double)g->batch;
+    if (c->rep.n_chunks > 1) c->st.gemm_chunked++;
+    if (c->census_on && c->census) census_note(c, g, level);
     return RRC_OK;
 }
 
@@ -502,6 +653,12 @@ rrc_status cb_adamw(const rrc_backend *be, int64_t n, rrc_buf param, rrc_buf gra
 
 void release(cuda_be *c) {
     if (c->stream) (void)cudaStreamSynchronize(c->stream);
+    // after the stream synchronize: no staged copy still reads a slot
+    for (int i = 0; i < RRC_CUDA_MAX_STAGING_SLOTS; i++)
+        if (c->slots[i].ev) (void)cudaEventDestroy(c->slots[i].ev);
+    if (c->stage_base) (void)cudaFreeHost(c->stage_base);
+    free(c->live);
+    free(c->census);
     for (int i = 0; i < LT_CACHE; i++) entry_release(&c->cache[i]);
     if (c->lt) cublasLtDestroy(c->lt);
     if (c->workspace) (void)cudaFree(c->workspace);
@@ -511,6 +668,35 @@ void release(cuda_be *c) {
     if (c->err_host) (void)cudaFreeHost(c->err_host);
     if (c->stream) (void)cudaStreamDestroy(c->stream);
     free(c);
+}
+
+// The pinned staging ring. A failed pinned allocation disables the ring (warning) instead of failing
+// the backend: memcpy_h2d then takes the synchronizing path.
+rrc_status stage_init(cuda_be *c) {
+    const size_t total = c->o.h2d_staging_bytes;
+    const int n = c->o.h2d_staging_slots;
+    if (total == 0) return RRC_OK;
+    size_t slot = total / (size_t)n;
+    slot &= ~(size_t)255; // slots start 256-byte aligned
+    if (slot == 0) slot = 256;
+    void *base = NULL;
+    cudaError_t e = cudaHostAlloc(&base, slot * (size_t)n, cudaHostAllocDefault);
+    if (e != cudaSuccess || !base) {
+        (void)cudaGetLastError();
+        rrc_log(RRC_LOG_WARN, "cuda: pinned staging ring of %zu bytes unavailable (%s); memcpy_h2d synchronizes the stream",
+                slot * (size_t)n, cudaGetErrorName(e));
+        return RRC_OK;
+    }
+    c->stage_base = (unsigned char *)base;
+    for (int i = 0; i < n; i++) {
+        c->slots[i].host = c->stage_base + (size_t)i * slot;
+        CU(cudaEventCreateWithFlags(&c->slots[i].ev, cudaEventDisableTiming), "staging event");
+    }
+    c->slot_bytes = slot;
+    c->n_slots = n;
+    c->st.staging_bytes = slot * (size_t)n;
+    c->st.staging_slots = n;
+    return RRC_OK;
 }
 
 rrc_status init(cuda_be *c) {
@@ -523,7 +709,8 @@ rrc_status init(cuda_be *c) {
     CU(cudaHostAlloc((void **)&c->err_host, sizeof(rrc_cuda_err), cudaHostAllocDefault), "error flag (host)");
     RRC_CHECK(err_reset(c));
     CU(cudaStreamSynchronize(c->stream), "init synchronize");
-    return RRC_OK;
+    note_mem(c);
+    return stage_init(c);
 }
 
 } // namespace
@@ -535,7 +722,16 @@ void rrc_cuda_options_default(rrc_cuda_options *o) {
     o->gemm_min_level = RRC_GEMM_LEVEL_NATIVE;
     o->gemm_scratch_cap_elems = RRC_GEMM_SCRATCH_CAP_DEFAULT;
     o->workspace_bytes = (size_t)32 << 20;
-    const char *e = getenv("RRC_CUDA_ALLOW_TF32");
+    o->h2d_staging_bytes = (size_t)32 << 20;
+    o->h2d_staging_slots = 4;
+    const char *e = getenv("RRC_CUDA_H2D_STAGING_BYTES");
+    if (e && e[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(e, &end, 0);
+        if (end && *end == '\0') o->h2d_staging_bytes = (size_t)v;
+        else rrc_log(RRC_LOG_WARN, "RRC_CUDA_H2D_STAGING_BYTES='%s' is not a number; ignored", e);
+    }
+    e = getenv("RRC_CUDA_ALLOW_TF32");
     if (e && e[0] == '1') o->allow_tf32 = 1;
     e = getenv("RRC_CUDA_SYNC_EACH_OP");
     if (e && e[0] == '1') o->sync_each_op = 1;
@@ -553,6 +749,11 @@ rrc_status rrc_cuda_backend_create_ex(int device, const rrc_cuda_options *o, con
     if (lvl < RRC_GEMM_LEVEL_NATIVE || lvl > RRC_GEMM_LEVEL_KERNEL) {
         free(c);
         return RRC_ERROR(RRC_ERR_INVALID_ARG, "cuda: gemm_min_level %d not in [0, 2]", lvl);
+    }
+    if (c->o.h2d_staging_bytes && (c->o.h2d_staging_slots < 1 || c->o.h2d_staging_slots > RRC_CUDA_MAX_STAGING_SLOTS)) {
+        const int ns = c->o.h2d_staging_slots;
+        free(c);
+        return RRC_ERROR(RRC_ERR_INVALID_ARG, "cuda: h2d_staging_slots %d not in [1, %d]", ns, RRC_CUDA_MAX_STAGING_SLOTS);
     }
     rrc_status s = init(c);
     if (s != RRC_OK) {
@@ -627,6 +828,149 @@ int rrc_cuda_last_gemm(const rrc_backend *be, rrc_gemm_exec_report *rep) {
     if (!rrc_backend_is_cuda(be) || !CB(be)->have_rep) return 0;
     if (rep) *rep = CB(be)->rep;
     return 1;
+}
+
+#define RRC_STR2(x) #x
+#define RRC_STR(x) RRC_STR2(x)
+
+int rrc_cuda_build_is_host_shim(void) {
+#if defined(RRC_CUDA_HOST_SHIM)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void rrc_cuda_build_info_get(rrc_cuda_build_info *b) {
+    memset(b, 0, sizeof *b);
+    b->host_shim = rrc_cuda_build_is_host_shim();
+#if defined(__CUDACC_VER_MAJOR__)
+    b->nvcc_major = __CUDACC_VER_MAJOR__;
+    b->nvcc_minor = __CUDACC_VER_MINOR__;
+    b->nvcc_build = __CUDACC_VER_BUILD__;
+#endif
+#if defined(CUDART_VERSION)
+    b->cudart_header = CUDART_VERSION;
+#endif
+#if defined(CUBLAS_VERSION)
+    b->cublas_header = CUBLAS_VERSION;
+#endif
+#if defined(__CUDA_ARCH_LIST__)
+    snprintf(b->arch_list, sizeof b->arch_list, "%s", RRC_STR(__CUDA_ARCH_LIST__));
+#endif
+}
+
+rrc_status rrc_cuda_kernel_versions(const rrc_backend *be, int *binary_version, int *ptx_version) {
+    RRC_REQUIRE(rrc_backend_is_cuda(be) && binary_version && ptx_version, RRC_ERR_INVALID_ARG, "cuda: bad argument");
+    CU(rrc_cu_kernel_versions(binary_version, ptx_version), "cudaFuncGetAttributes");
+    return RRC_OK;
+}
+
+rrc_status rrc_cuda_stats_get(const rrc_backend *be, rrc_cuda_stats *s) {
+    RRC_REQUIRE(rrc_backend_is_cuda(be) && s, RRC_ERR_INVALID_ARG, "cuda: not a CUDA backend");
+    *s = CB(be)->st;
+    return RRC_OK;
+}
+
+rrc_status rrc_cuda_stats_reset(const rrc_backend *be) {
+    RRC_REQUIRE(rrc_backend_is_cuda(be), RRC_ERR_INVALID_ARG, "cuda: not a CUDA backend");
+    cuda_be *c = CB(be);
+    rrc_cuda_stats keep = c->st;
+    memset(&c->st, 0, sizeof c->st);
+    c->st.alloc_bytes = keep.alloc_bytes;
+    c->st.n_allocs = keep.n_allocs;
+    c->st.n_frees = keep.n_frees;
+    c->st.staging_bytes = keep.staging_bytes;
+    c->st.staging_slots = keep.staging_slots;
+    c->st.alloc_peak_bytes = 0;
+    c->st.total_peak_bytes = 0;
+    note_mem(c); // peaks = current values
+    if (c->census) memset(c->census, 0, RRC_CUDA_CENSUS_MAX * sizeof *c->census);
+    c->census_dropped = 0;
+    return RRC_OK;
+}
+
+rrc_status rrc_cuda_gemm_census_enable(const rrc_backend *be, int on) {
+    RRC_REQUIRE(rrc_backend_is_cuda(be), RRC_ERR_INVALID_ARG, "cuda: not a CUDA backend");
+    cuda_be *c = CB(be);
+    if (on && !c->census) {
+        c->census = (census_entry *)calloc(RRC_CUDA_CENSUS_MAX, sizeof *c->census);
+        if (!c->census) return RRC_ERROR(RRC_ERR_OOM, "gemm census");
+    }
+    if (c->census) memset(c->census, 0, RRC_CUDA_CENSUS_MAX * sizeof *c->census);
+    c->census_dropped = 0;
+    c->census_on = on ? 1 : 0;
+    return RRC_OK;
+}
+
+size_t rrc_cuda_gemm_census_get(const rrc_backend *be, rrc_cuda_gemm_shape *out, size_t cap, int64_t *dropped) {
+    if (dropped) *dropped = 0;
+    if (!rrc_backend_is_cuda(be)) return 0;
+    cuda_be *c = CB(be);
+    if (dropped) *dropped = c->census_dropped;
+    size_t n = 0;
+    for (int i = 0; c->census && i < RRC_CUDA_CENSUS_MAX && c->census[i].used; i++) {
+        if (out && n < cap) out[n] = c->census[i].s;
+        n++;
+    }
+    return n;
+}
+
+struct rrc_cuda_timer {
+    cuda_be *c;
+    int n;
+    cudaEvent_t *ev;
+    int *recorded;
+};
+
+rrc_status rrc_cuda_timer_create(const rrc_backend *be, int n_marks, rrc_cuda_timer **out) {
+    RRC_REQUIRE(out, RRC_ERR_INVALID_ARG, "cuda timer: out is NULL");
+    *out = NULL;
+    RRC_REQUIRE(rrc_backend_is_cuda(be) && n_marks > 0, RRC_ERR_INVALID_ARG, "cuda timer: bad argument");
+    rrc_cuda_timer *t = (rrc_cuda_timer *)calloc(1, sizeof *t);
+    if (!t) return RRC_ERROR(RRC_ERR_OOM, "cuda timer");
+    t->c = CB(be);
+    t->ev = (cudaEvent_t *)calloc((size_t)n_marks, sizeof *t->ev);
+    t->recorded = (int *)calloc((size_t)n_marks, sizeof *t->recorded);
+    if (!t->ev || !t->recorded) {
+        rrc_cuda_timer_destroy(t);
+        return RRC_ERROR(RRC_ERR_OOM, "cuda timer");
+    }
+    for (int i = 0; i < n_marks; i++) {
+        cudaError_t e = cudaEventCreate(&t->ev[i]);
+        if (e != cudaSuccess) {
+            t->ev[i] = NULL;
+            rrc_cuda_timer_destroy(t);
+            return cu_fail(e, "cudaEventCreate");
+        }
+        t->n = i + 1;
+    }
+    *out = t;
+    return RRC_OK;
+}
+
+rrc_status rrc_cuda_timer_mark(rrc_cuda_timer *t, int i) {
+    RRC_REQUIRE(t && i >= 0 && i < t->n, RRC_ERR_INVALID_ARG, "cuda timer: mark %d out of range", i);
+    CU(cudaEventRecord(t->ev[i], t->c->stream), "cudaEventRecord");
+    t->recorded[i] = 1;
+    return RRC_OK;
+}
+
+rrc_status rrc_cuda_timer_elapsed_ms(rrc_cuda_timer *t, int i, int j, float *ms) {
+    RRC_REQUIRE(t && ms && i >= 0 && j >= 0 && i < t->n && j < t->n, RRC_ERR_INVALID_ARG, "cuda timer: bad mark");
+    RRC_REQUIRE(t->recorded[i] && t->recorded[j], RRC_ERR_INVALID_ARG, "cuda timer: mark %d or %d not recorded", i, j);
+    CU(cudaEventSynchronize(t->ev[j]), "cudaEventSynchronize");
+    CU(cudaEventElapsedTime(ms, t->ev[i], t->ev[j]), "cudaEventElapsedTime");
+    return RRC_OK;
+}
+
+void rrc_cuda_timer_destroy(rrc_cuda_timer *t) {
+    if (!t) return;
+    for (int i = 0; t->ev && i < t->n; i++)
+        if (t->ev[i]) (void)cudaEventDestroy(t->ev[i]);
+    free(t->ev);
+    free(t->recorded);
+    free(t);
 }
 
 } // extern "C"

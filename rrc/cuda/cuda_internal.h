@@ -49,5 +49,7 @@ cudaError_t rrc_cu_convert(cudaStream_t s, unsigned max_blocks, const rrc_kc_ew_
 cudaError_t rrc_cu_sum_squares(cudaStream_t s, unsigned max_blocks, const rrc_kc_ss_p *p);
 cudaError_t rrc_cu_xent(cudaStream_t s, unsigned max_blocks, const rrc_kc_xent_p *p, rrc_cuda_err *err);
 cudaError_t rrc_cu_adamw(cudaStream_t s, unsigned max_blocks, const rrc_kc_adamw_p *p);
+/* cudaFuncGetAttributes of one rrc kernel: binaryVersion / ptxVersion of the loaded image */
+cudaError_t rrc_cu_kernel_versions(int *binary_version, int *ptx_version);
 
 #endif /* RRC_CUDA_INTERNAL_H */

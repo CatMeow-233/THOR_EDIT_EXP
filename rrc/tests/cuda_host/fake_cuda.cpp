@@ -15,13 +15,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <vector>
 
 #include "fake_cuda.h"
 #include "rrc/common.h"
+
+// ---- lazy host -> device copies (fake_cuda.h) ----------------------------------------------------
+
+namespace {
+struct pending_h2d {
+    void *dst;
+    const void *src;
+    size_t n;
+};
+std::vector<pending_h2d> g_pending; // in stream order
+unsigned long long g_h2d_enq = 0, g_h2d_done = 0; // copies enqueued / executed so far
+
+// Execute the queued copies up to (excluding) sequence number `upto` (all: ~0ull).
+void flush_h2d(unsigned long long upto) {
+    size_t i = 0;
+    while (i < g_pending.size() && g_h2d_done < upto) {
+        memmove(g_pending[i].dst, g_pending[i].src, g_pending[i].n);
+        g_h2d_done++;
+        i++;
+    }
+    g_pending.erase(g_pending.begin(), g_pending.begin() + (long)i);
+}
+void flush_all() { flush_h2d(~0ull); }
+} // namespace
 
 // ---- kernel launches ---------------------------------------------------------------------------
 
@@ -96,6 +123,7 @@ void rrc_shim_launch(unsigned grid, unsigned block, int syncs, const std::functi
         abort();
     }
     g_launches++;
+    flush_all(); // the kernel runs after every copy enqueued before it
     rrc_shim_gdim = {grid, 1, 1};
     rrc_shim_bdim = {block, 1, 1};
     if (!syncs) { // no barrier: the block's threads one after the other, on this thread
@@ -143,8 +171,25 @@ extern "C" void rrc_fake_shutdown(void) {
 
 namespace {
 std::set<void *> g_live;
+std::map<uintptr_t, size_t> g_pinned; // live cudaHostAlloc blocks
 long g_mallocs = 0, g_frees = 0, g_bad_frees = 0;
-int g_fail_after = -1;
+long g_h2d_async = 0, g_h2d_pageable = 0, g_stream_syncs = 0, g_event_syncs = 0;
+int g_fail_after = -1, g_fail_host_after = -1;
+bool is_pinned(const void *p, size_t n) {
+    const uintptr_t a = (uintptr_t)p;
+    auto it = g_pinned.upper_bound(a);
+    if (it == g_pinned.begin()) return false;
+    --it;
+    return a >= it->first && a + n <= it->first + it->second;
+}
+struct fake_event {
+    unsigned long long seq; // copies enqueued before the record
+    int recorded;
+    double t_ms;            // host wall clock at the record (timing events only; never GPU time)
+};
+double host_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 int g_lt_mode = -1; // -1: from the environment on first use
 long g_lt_heur = 0, g_lt_runs = 0, g_lt_viol = 0;
 int dummy_handle;
@@ -171,6 +216,7 @@ extern "C" {
 
 void rrc_fake_set_lt_mode(int mode) { g_lt_mode = mode; }
 void rrc_fake_fail_malloc_after(int n) { g_fail_after = n; }
+void rrc_fake_fail_host_alloc_after(int n) { g_fail_host_after = n; }
 void rrc_fake_get_stats(rrc_fake_stats *s) {
     s->mallocs = g_mallocs;
     s->frees = g_frees;
@@ -180,6 +226,12 @@ void rrc_fake_get_stats(rrc_fake_stats *s) {
     s->lt_heuristics = g_lt_heur;
     s->lt_matmuls = g_lt_runs;
     s->lt_violations = g_lt_viol;
+    s->h2d_async = g_h2d_async;
+    s->h2d_pageable = g_h2d_pageable;
+    s->h2d_pending = (long)g_pending.size();
+    s->stream_syncs = g_stream_syncs;
+    s->event_syncs = g_event_syncs;
+    s->host_allocs_live = (long)g_pinned.size();
 }
 
 const char *cudaGetErrorName(cudaError_t e) {
@@ -205,6 +257,7 @@ cudaError_t cudaMalloc(void **p, size_t n) {
     return cudaSuccess;
 }
 cudaError_t cudaFree(void *p) {
+    flush_all(); // cudaFree synchronizes the device
     if (!p) return cudaSuccess;
     if (!g_live.count(p)) {
         g_bad_frees++;
@@ -217,22 +270,82 @@ cudaError_t cudaFree(void *p) {
     return cudaSuccess;
 }
 cudaError_t cudaHostAlloc(void **p, size_t n, unsigned int) {
+    if (g_fail_host_after == 0) {
+        g_fail_host_after = -1;
+        *p = nullptr;
+        return cudaErrorMemoryAllocation;
+    }
+    if (g_fail_host_after > 0) g_fail_host_after--;
     *p = malloc(n ? n : 1);
-    return *p ? cudaSuccess : cudaErrorMemoryAllocation;
+    if (!*p) return cudaErrorMemoryAllocation;
+    g_pinned[(uintptr_t)*p] = n ? n : 1;
+    return cudaSuccess;
 }
 cudaError_t cudaFreeHost(void *p) {
+    flush_all(); // synchronizes the device
+    if (p) g_pinned.erase((uintptr_t)p);
     free(p);
     return cudaSuccess;
 }
 cudaError_t cudaMemsetAsync(void *p, int v, size_t n, cudaStream_t) {
+    flush_all();
     memset(p, v, n);
     return cudaSuccess;
 }
-cudaError_t cudaMemcpyAsync(void *d, const void *s, size_t n, enum cudaMemcpyKind, cudaStream_t) {
+cudaError_t cudaMemcpyAsync(void *d, const void *s, size_t n, enum cudaMemcpyKind k, cudaStream_t) {
+    if (k == cudaMemcpyHostToDevice) { // lazy: the source is read at the next flush
+        g_h2d_async++;
+        if (!is_pinned(s, n)) g_h2d_pageable++;
+        g_pending.push_back(pending_h2d{d, s, n});
+        g_h2d_enq++;
+        return cudaSuccess;
+    }
+    flush_all();
     memmove(d, s, n);
     return cudaSuccess;
 }
-cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+cudaError_t cudaStreamSynchronize(cudaStream_t) {
+    g_stream_syncs++;
+    flush_all();
+    return cudaSuccess;
+}
+cudaError_t cudaDeviceSynchronize(void) {
+    flush_all();
+    return cudaSuccess;
+}
+cudaError_t cudaEventCreateWithFlags(cudaEvent_t *e, unsigned int) {
+    fake_event *f = new (std::nothrow) fake_event{0, 0, 0.0};
+    *e = (cudaEvent_t)f;
+    return f ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+cudaError_t cudaEventCreate(cudaEvent_t *e) { return cudaEventCreateWithFlags(e, 0); }
+cudaError_t cudaEventDestroy(cudaEvent_t e) {
+    delete (fake_event *)e;
+    return cudaSuccess;
+}
+cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
+    fake_event *f = (fake_event *)e;
+    f->seq = g_h2d_enq;
+    f->recorded = 1;
+    f->t_ms = host_ms();
+    return cudaSuccess;
+}
+cudaError_t cudaEventSynchronize(cudaEvent_t e) {
+    g_event_syncs++;
+    fake_event *f = (fake_event *)e;
+    if (f->recorded) flush_h2d(f->seq); // only the copies enqueued before the record
+    return cudaSuccess;
+}
+cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t a, cudaEvent_t b) {
+    const fake_event *x = (const fake_event *)a, *y = (const fake_event *)b;
+    if (!x->recorded || !y->recorded) return cudaErrorInvalidResourceHandle;
+    *ms = (float)(y->t_ms - x->t_ms); // host wall clock: the HOST-ONLY build has no GPU time
+    return cudaSuccess;
+}
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *a, const void *) {
+    memset(a, 0, sizeof *a); // no device image: versions 0
+    return cudaSuccess;
+}
 cudaError_t cudaSetDevice(int) { return cudaSuccess; }
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t *s, unsigned int) {
     *s = (cudaStream_t)&dummy_handle;
@@ -455,6 +568,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t, cublasLtMatmulDesc_t od, const v
                               const void *C, cublasLtMatrixLayout_t oc, void *Dp, cublasLtMatrixLayout_t odd,
                               const cublasLtMatmulAlgo_t *algo, void *, size_t, cudaStream_t) {
     g_lt_runs++;
+    flush_all(); // stream order: after every copy enqueued before it
     const Desc *d = (const Desc *)od;
     const Lay *a = (const Lay *)oa, *b = (const Lay *)ob, *c = (const Lay *)oc, *dd = (const Lay *)odd;
     uint64_t M, N, K;

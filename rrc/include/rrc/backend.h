@@ -6,7 +6,9 @@
  * against rrc_buf.numel, aliasing, the int32 limits of gemm) and then dispatch to `be-><op>`.
  * Backends may assume that all of these preconditions hold; data-dependent conditions (token ids, labels and position ids in
  * range) are checked by the CPU backend and are documented preconditions for device backends
- * (which report RRC_ERR_RANGE from the op or from the next sync).
+ * (which report RRC_ERR_RANGE from the op or from the next sync). On device backends, the outputs
+ * of the ops enqueued after an op that hit such a data-dependent range error are unspecified until
+ * the next sync reports the error.
  *
  * Execution model: there are no stream or handle arguments. Each backend owns one in-order queue
  * (the CUDA backend: one stream, one cuBLASLt handle and workspace). Ops and memcpy_d2d/memset0

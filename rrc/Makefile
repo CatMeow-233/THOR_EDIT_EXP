@@ -37,11 +37,20 @@ BINS      := $(patsubst %,$(BUILD)/%,$(BIN_NAMES))
 
 # Pure-C parts of the CUDA line (GEMM plan, host emulation backend, selftest harness): gcc-built,
 # linked into the C tests, rrc_selftest_host and librrc_cuda.a. No CUDA dependency.
-CUDA_HOST_SRCS := $(RRC_DIR)/cuda/gemm_plan.c $(RRC_DIR)/cuda/kc_emu.c $(RRC_DIR)/cuda/selftest_ops.c
+CUDA_HOST_SRCS := $(RRC_DIR)/cuda/gemm_plan.c $(RRC_DIR)/cuda/kc_emu.c $(RRC_DIR)/cuda/selftest_ops.c \
+                  $(RRC_DIR)/cuda/selftest_e2e.c
 CUDA_HOST_OBJS := $(patsubst $(RRC_DIR)/cuda/%.c,$(BUILD)/obj/cuda_host/%.o,$(CUDA_HOST_SRCS))
 CPPFLAGS += -I$(RRC_DIR)/cuda
 CFLAGS   += $(SAN)
 SELFTEST_HOST := $(BUILD)/rrc_selftest_host
+# Source revision recorded in rrc_selftest / rrc_bench reports (compile time; "unknown" outside git).
+RRC_GIT_REV := $(shell git -C $(RRC_DIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+REV_FLAGS := -DRRC_GIT_REV='"$(RRC_GIT_REV)"' 
+
+# rrc_bench (bench/rrc_bench.c): the CUDA build (make cuda), the host smoke build on the CPU backend
+# (-DRRC_BENCH_HOST, part of `make cpu`) and the HOST-ONLY fake-runtime build (cuda-host-test).
+BENCH_SRC  := $(RRC_DIR)/bench/rrc_bench.c
+BENCH_HOST := $(BUILD)/rrc_bench_host
 
 TEST_SRCS := $(wildcard $(RRC_DIR)/tests/c/*.c)
 TEST_OBJS := $(patsubst $(RRC_DIR)/tests/c/%.c,$(BUILD)/obj/tests/%.o,$(TEST_SRCS))
@@ -87,7 +96,7 @@ CUDA_LDLIBS := $(if $(CUDA_LIBDIR),-L$(CUDA_LIBDIR) -Wl$(comma)-rpath$(comma)$(C
 .PHONY: all cpu test cuda cuda-objs asan tsan clean nvcc-check nvcc-missing cuda-host-test cuda-host-train cuda-host-missing
 all: cpu
 
-cpu: $(LIB) $(BINS)
+cpu: $(LIB) $(BINS) $(BENCH_HOST) $(SELFTEST_HOST)
 
 $(BUILD)/obj/src/%.o: $(RRC_DIR)/src/%.c
 	@mkdir -p $(dir $@)
@@ -117,9 +126,16 @@ $(TEST_BIN): $(TEST_OBJS) $(CUDA_HOST_OBJS) $(LIB)
 # rrc_selftest with a host backend as the device (kc-emu by default): runs the harness without a GPU.
 $(BUILD)/obj/cuda_host/selftest_host.o: $(RRC_DIR)/cuda/selftest.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DRRC_SELFTEST_HOST -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(REV_FLAGS) -DRRC_SELFTEST_HOST -c $< -o $@
 
 $(SELFTEST_HOST): $(BUILD)/obj/cuda_host/selftest_host.o $(CUDA_HOST_OBJS) $(LIB)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BUILD)/obj/bench/rrc_bench_host.o: $(BENCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(REV_FLAGS) -DRRC_BENCH_HOST -c $< -o $@
+
+$(BENCH_HOST): $(BUILD)/obj/bench/rrc_bench_host.o $(CUDA_HOST_OBJS) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # expect_fail(command, log, what): the selftest must report FAIL itself (exit status 1 and a last log
@@ -133,8 +149,14 @@ expect_fail = st=0; $(1) > $(2) 2>&1 || st=$$?; \
 test: cpu $(TEST_BIN) $(SELFTEST_HOST)
 	@rm -rf $(BUILD)/test_tmp && mkdir -p $(BUILD)/test_tmp
 	RRC_TEST_TMPDIR=$(BUILD)/test_tmp $(TEST_BIN)
-	$(SELFTEST_HOST) --backend emu --deferred --quick > $(BUILD)/test_tmp/selftest_host.log || { cat $(BUILD)/test_tmp/selftest_host.log; exit 1; }
-	@tail -n 1 $(BUILD)/test_tmp/selftest_host.log
+	$(SELFTEST_HOST) --backend emu --deferred --quick --report $(BUILD)/test_tmp/selftest_host_report.json > $(BUILD)/test_tmp/selftest_host.log || { cat $(BUILD)/test_tmp/selftest_host.log; exit 1; }
+	@grep -E "^end-to-end summary" $(BUILD)/test_tmp/selftest_host.log; tail -n 1 $(BUILD)/test_tmp/selftest_host.log
+	@# end-to-end tolerance controls (DESIGN.md §15.1): a correct device that rounds differently (every GEMM
+	@# output perturbed by up to k * 2^-24) must pass; a subtly wrong backward (softmax bwd * (1 + 1e-3)) must fail
+	$(SELFTEST_HOST) --backend jitter --only e2e > $(BUILD)/test_tmp/selftest_jitter.log || { cat $(BUILD)/test_tmp/selftest_jitter.log; exit 1; }
+	@echo "rrc_selftest_host e2e control: jitter device PASS"
+	@$(call expect_fail,$(SELFTEST_HOST) --backend fault --only e2e --e2e-filter f32,$(BUILD)/test_tmp/selftest_fault.log,a subtly wrong attention backward)
+	@echo "rrc_selftest_host e2e control: fault device FAIL ($$(grep -c '^  FAIL' $(BUILD)/test_tmp/selftest_fault.log) failing checks), as required"
 	@# negative checks of the program's exit status: no cuBLASLt (simulated: every triple refused) and
 	@# an --only filter matching nothing must both fail
 	@$(call expect_fail,$(SELFTEST_HOST) --quick --only gemm --reject-mask 0xFF,$(BUILD)/test_tmp/selftest_reject.log,every GEMM on the kernel fallback)
@@ -168,8 +190,8 @@ nvcc-missing:
 
 # librrc_cuda.a (kernels + backend + the pure-C plan/harness objects) and rrc_selftest. Linking needs
 # libcudart and libcublasLt from $(CUDA_HOME)/lib64 (or lib); running needs a GPU and its driver.
-cuda: cuda-objs $(CUDA_LIB) $(BUILD)/rrc_selftest $(BUILD)/rrc_train_cuda
-	@echo "make cuda: built $(CUDA_LIB), $(BUILD)/rrc_selftest and $(BUILD)/rrc_train_cuda (run on the GPU: $(BUILD)/rrc_selftest)"
+cuda: cuda-objs $(CUDA_LIB) $(BUILD)/rrc_selftest $(BUILD)/rrc_train_cuda $(BUILD)/rrc_bench
+	@echo "make cuda: built $(CUDA_LIB), $(BUILD)/rrc_selftest, $(BUILD)/rrc_train_cuda and $(BUILD)/rrc_bench (run on the GPU: $(BUILD)/rrc_selftest --report selftest.json; see bench/README.md)"
 
 $(CUDA_LIB): $(CUDA_OBJS) $(CUDA_HOST_OBJS)
 	@mkdir -p $(dir $@)
@@ -178,7 +200,7 @@ $(CUDA_LIB): $(CUDA_OBJS) $(CUDA_HOST_OBJS)
 
 $(BUILD)/obj/cuda_host/selftest.o: $(RRC_DIR)/cuda/selftest.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(NVCC_INC) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(REV_FLAGS) $(NVCC_INC) -c $< -o $@
 
 $(BUILD)/rrc_selftest: $(BUILD)/obj/cuda_host/selftest.o $(CUDA_LIB) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(CUDA_LDLIBS) $(LDLIBS)
@@ -190,6 +212,13 @@ $(BUILD)/obj/cuda_host/rrc_train_cuda.o: $(RRC_DIR)/src/rrc_train.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DRRC_WITH_CUDA -c $< -o $@
 
 $(BUILD)/rrc_train_cuda: $(BUILD)/obj/cuda_host/rrc_train_cuda.o $(CUDA_LIB) $(LIB)
+	$(CC) $(CFLAGS) $^ -o $@ $(CUDA_LDLIBS) $(LDLIBS)
+
+$(BUILD)/obj/bench/rrc_bench.o: $(BENCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(REV_FLAGS) $(NVCC_INC) -c $< -o $@
+
+$(BUILD)/rrc_bench: $(BUILD)/obj/bench/rrc_bench.o $(CUDA_LIB) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(CUDA_LDLIBS) $(LDLIBS)
 
 $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
@@ -208,6 +237,7 @@ SHIM_CXXFLAGS := -std=c++17 -O2 -g -Wall -Wextra -Werror -pthread $(RRC_SAN_FLAG
 SHIM_OBJS := $(BUILD)/obj/cuda_shim/cuda_kernels.o $(BUILD)/obj/cuda_shim/cuda_backend.o $(BUILD)/obj/cuda_shim/fake_cuda.o
 SHIM_TEST := $(BUILD)/test_cuda_host
 SHIM_SELFTEST := $(BUILD)/rrc_selftest_shim
+SHIM_BENCH := $(BUILD)/rrc_bench_shim
 
 $(BUILD)/obj/cuda_shim/%.o: $(RRC_DIR)/cuda/%.cu $(SHIM_DIR)/shim.h
 	@mkdir -p $(dir $@)
@@ -237,12 +267,23 @@ $(SHIM_TRAIN): $(BUILD)/obj/cuda_host/rrc_train_cuda.o $(SHIM_OBJS) $(CUDA_HOST_
 
 cuda-host-train: $(if $(CUDA_HOST_OK),$(SHIM_TRAIN),cuda-host-missing)
 
-cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST),cuda-host-missing)
+# rrc_bench's CUDA main on the fake runtime (HOST-ONLY: timings are host wall clock and reported as such)
+$(SHIM_BENCH): $(BUILD)/obj/bench/rrc_bench.o $(SHIM_OBJS) $(CUDA_HOST_OBJS) $(LIB)
+	$(CXX_HOST) $(RRC_SAN_FLAGS) $(SAN) -pthread $^ -o $@ -fopenmp -lm
+
+cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST) $(SHIM_BENCH),cuda-host-missing)
 	@mkdir -p $(BUILD)/test_tmp
 	RRC_TEST_TMPDIR=$(BUILD)/test_tmp $(SHIM_TEST)
 	@# the program's CUDA main (pass logic, options) on one cheap op; test_cuda_host ran every op already
 	$(SHIM_SELFTEST) --quick --only convert > $(BUILD)/test_tmp/selftest_shim.log || { cat $(BUILD)/test_tmp/selftest_shim.log; exit 1; }
 	@grep -E "^(capped|grid) pass" $(BUILD)/test_tmp/selftest_shim.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim.log
+	@# the end-to-end checks (tiny qwen3, f32 + bf16: model, LoRA, trainer, staging ring) through the real backend
+	$(SHIM_SELFTEST) --only e2e --e2e-size tiny --e2e-filter qwen3 --report $(BUILD)/test_tmp/selftest_shim_report.json > $(BUILD)/test_tmp/selftest_shim_e2e.log || { cat $(BUILD)/test_tmp/selftest_shim_e2e.log; exit 1; }
+	@grep -E "^end-to-end summary" $(BUILD)/test_tmp/selftest_shim_e2e.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim_e2e.log
+	@# rrc_bench's CUDA main (timer, counters, census, JSON): must not claim a measurement on the fake runtime
+	$(SHIM_BENCH) --synthetic-model qwen3 --dtype f32 --seq-len 8 --micro-batch 1 --grad-accum 2 --warmup 1 --steps 1 --lora-r 4 --attn-chunk 4 --ce-chunk 4 --out $(BUILD)/test_tmp/bench_shim.json 2> $(BUILD)/test_tmp/bench_shim.log || { cat $(BUILD)/test_tmp/bench_shim.log; exit 1; }
+	@grep -q '"measured_on": null' $(BUILD)/test_tmp/bench_shim.json && grep -q '"tokens_per_s": null' $(BUILD)/test_tmp/bench_shim.json || { echo "rrc_bench_shim claimed a measurement"; exit 1; }
+	@echo "rrc_bench_shim: JSON written, no measurement claimed (HOST-ONLY)"
 	@$(call expect_fail,RRC_FAKE_LT=reject $(SHIM_SELFTEST) --quick --only gemm,$(BUILD)/test_tmp/selftest_shim_reject.log,cuBLASLt refusing everything)
 	@$(call expect_fail,$(SHIM_SELFTEST) --only nonexistent_op,$(BUILD)/test_tmp/selftest_shim_nomatch.log,no check run)
 	@echo "cuda-host-test: OK (HOST-ONLY: real cuda/*.cu sources on a fake runtime and host threads; no GPU)"
@@ -276,4 +317,5 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(patsubst %,$(BUILD)/obj/src/%.d,$(BIN_NAMES)) \
-         $(BUILD)/obj/cuda_host/rrc_train_cuda.d $(BUILD)/obj/cuda_host/selftest.d $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(SHIM_OBJS:.o=.d) $(BUILD)/obj/cuda_shim/test_cuda_host.d
+         $(BUILD)/obj/cuda_host/rrc_train_cuda.d $(BUILD)/obj/cuda_host/selftest.d $(BUILD)/obj/cuda_host/selftest_host.d \
+         $(BUILD)/obj/bench/rrc_bench.d $(BUILD)/obj/bench/rrc_bench_host.d $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(SHIM_OBJS:.o=.d) $(BUILD)/obj/cuda_shim/test_cuda_host.d
