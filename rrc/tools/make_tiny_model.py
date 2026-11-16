@@ -46,6 +46,9 @@ VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
     "llama": ("llama", {}),
     "llama_tied": ("llama", {"tie_word_embeddings": True}),
     "llama3_rope": ("llama", {"rope_parameters": LLAMA3_ROPE}),
+    # attention layouts at both ends of GQA: MHA (one query head per kv head) and MQA (one kv head)
+    "llama_mha": ("llama", {"num_key_value_heads": 4}),
+    "llama_mqa": ("llama", {"num_key_value_heads": 1}),
     "qwen2": ("qwen2", {"rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}}),
     "qwen2_tied": ("qwen2", {"tie_word_embeddings": True}),
     "qwen3": ("qwen3", {"head_dim": 16}),

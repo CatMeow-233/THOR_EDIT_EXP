@@ -3,9 +3,12 @@
 #   make cpu                 static library + binaries with the CPU backend
 #   make test                build and run the C unit tests (+ nvcc header check if CUDA is set)
 #   make cuda CUDA_HOME=...  compile cuda/*.cu with nvcc (CUDA_ARCH, default sm_120)
+#   make asan                C tests under AddressSanitizer + UBSan (build/asan)
+#   make tsan                data + train C tests (prefetch thread) under ThreadSanitizer (build/tsan)
 #   make clean
 #
-# Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH.
+# Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH,
+# RRC_SAN_FLAGS (extra compile + link flags, used by `make asan`).
 
 RRC_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 BUILD   ?= $(RRC_DIR)/build
@@ -16,16 +19,16 @@ endif
 
 CPPFLAGS += -I$(RRC_DIR)/include -I$(RRC_DIR)/kernels_common -D_POSIX_C_SOURCE=200809L
 CFLAGS   ?= -O2
-CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP
-LDLIBS   += -fopenmp -lm -lpthread
+CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP $(RRC_SAN_FLAGS)
+LDLIBS   += -fopenmp -lm -lpthread $(RRC_SAN_FLAGS)
 
 LIB_SRCS  := $(wildcard $(RRC_DIR)/src/*.c)
-LIB_SRCS  := $(filter-out $(RRC_DIR)/src/rrc_inspect.c,$(LIB_SRCS))
+BIN_NAMES := rrc_inspect rrc_fwdbwd rrc_train rrc_data
+LIB_SRCS  := $(filter-out $(patsubst %,$(RRC_DIR)/src/%.c,$(BIN_NAMES)),$(LIB_SRCS))
 LIB_OBJS  := $(patsubst $(RRC_DIR)/src/%.c,$(BUILD)/obj/src/%.o,$(LIB_SRCS))
 LIB       := $(BUILD)/librrc.a
 
-BIN_SRCS  := $(RRC_DIR)/src/rrc_inspect.c
-BINS      := $(BUILD)/rrc_inspect
+BINS      := $(patsubst %,$(BUILD)/%,$(BIN_NAMES))
 
 TEST_SRCS := $(wildcard $(RRC_DIR)/tests/c/*.c)
 TEST_OBJS := $(patsubst $(RRC_DIR)/tests/c/%.c,$(BUILD)/obj/tests/%.o,$(TEST_SRCS))
@@ -53,7 +56,7 @@ NVCCFLAGS += -std=c++17 -ccbin $(CC) -arch=$(CUDA_ARCH) -gencode arch=$(CUDA_COM
 CUDA_SRCS := $(wildcard $(RRC_DIR)/cuda/*.cu)
 CUDA_OBJS := $(patsubst $(RRC_DIR)/cuda/%.cu,$(BUILD)/obj/cuda/%.o,$(CUDA_SRCS))
 
-.PHONY: all cpu test cuda clean nvcc-check
+.PHONY: all cpu test cuda clean nvcc-check asan tsan
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -71,12 +74,13 @@ $(LIB): $(LIB_OBJS)
 	rm -f $@
 	ar rcs $@ $^
 
-$(BUILD)/rrc_inspect: $(BUILD)/obj/src/rrc_inspect.o $(LIB)
+$(BINS): $(BUILD)/%: $(BUILD)/obj/src/%.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # --wrap=malloc: tests/c/test_contracts.c counts the allocation sizes of library code.
+# --wrap=rename: tests/c/test_train.c injects rename failures into checkpoint publishing.
 $(TEST_BIN): $(TEST_OBJS) $(LIB)
-	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ -Wl,--wrap=malloc $(LDLIBS)
+	$(CC) $(CFLAGS) $(TEST_OBJS) $(LIB) -o $@ -Wl,--wrap=malloc -Wl,--wrap=rename $(LDLIBS)
 
 # The C tests use python3 (if present) to produce a safetensors file with the reference package;
 # that sub-test is skipped with a message when python3 / safetensors / torch are unavailable.
@@ -110,7 +114,29 @@ $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
+# C tests under AddressSanitizer + UndefinedBehaviorSanitizer, built in a separate directory
+# ($(BUILD)/asan) with the normal warning/OpenMP flags plus RRC_SAN_FLAGS; any UBSan report aborts
+# the run. OMP_NUM_THREADS defaults to 2 here.
+ASAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+asan:
+	@$(MAKE) --no-print-directory BUILD=$(BUILD)/asan RRC_SAN_FLAGS="$(ASAN_FLAGS)" cpu $(BUILD)/asan/rrc_tests
+	@mkdir -p $(BUILD)/asan/test_tmp
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} \
+	  RRC_TEST_TMPDIR=$(BUILD)/asan/test_tmp $(BUILD)/asan/rrc_tests
+
+# The data / train suites (the prefetch thread next to the training loop) under ThreadSanitizer.
+# OMP_NUM_THREADS=1: libgomp is not TSan-instrumented, so OpenMP regions would report false races.
+# setarch -R disables ASLR, which some kernels need for TSan's memory layout.
+TSAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+tsan:
+	@$(MAKE) --no-print-directory BUILD=$(BUILD)/tsan RRC_SAN_FLAGS="$(TSAN_FLAGS)" $(BUILD)/tsan/rrc_tests
+	@mkdir -p $(BUILD)/tsan/test_tmp
+	for s in data train; do \
+	  RRC_TEST_TMPDIR=$(BUILD)/tsan/test_tmp OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 \
+	    setarch $$(uname -m) -R $(BUILD)/tsan/rrc_tests $$s || exit 1; \
+	done
+
 clean:
 	rm -rf $(BUILD)
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(BUILD)/obj/src/rrc_inspect.d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(patsubst %,$(BUILD)/obj/src/%.d,$(BIN_NAMES))
