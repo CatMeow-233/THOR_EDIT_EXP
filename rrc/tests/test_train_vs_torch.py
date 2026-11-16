@@ -569,7 +569,7 @@ def test_trajectory_fp32_other_settings_match_torch(case, tiny, train_exe, tmp_p
         assert any(clipped) and not all(clipped), [m["grad_norm"] for m in met]
     if cfg_kw["lr_scheduler_type"] == "linear":
         assert met[0]["lr"] == 0.0 and met[2]["lr"] > 0  # ceil(0.3 * 7) = 3 warmup steps
-    # every packing edge occurred in the windows rrc trained on
+    # the generated data has the packing edges (length 1 and longer than seq_len)
     lens = [len(t) for t, _ in docs]
     assert 1 in lens and max(lens) > cfg_kw["seq_len"]
 
@@ -596,8 +596,8 @@ def test_all_ignored_window_matches_adamw_with_zero_grads(reduction, tiny, train
         weight_decay=0.1,
         warmup_steps=0,
         lr_scheduler_type="constant",
-        # microbatch_mean at eps 1e-8 measured params 1.5e-5 (m 6.1e-6): a few elements with |g| near
-        # eps make Adam's m / (sqrt(v) + eps) ill-conditioned; at eps 1e-4 the error is 5.1e-7
+        # microbatch_mean at eps 1e-8 measured params 1.5e-5 (m 6.1e-6), 7.7e-6 at eps 1e-6 and 5.1e-7 at
+        # eps 1e-4: inferred to be elements with |g| near eps (Adam's m / (sqrt(v) + eps) ill-conditioned)
         adam_epsilon=1e-8 if reduction == "window_tokens" else 1e-4,
     )
     met, ref, _ = run_and_compare_trajectory(

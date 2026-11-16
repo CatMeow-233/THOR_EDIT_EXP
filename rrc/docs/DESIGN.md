@@ -629,8 +629,9 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
 ### Step 3: review repairs (coverage, loader, robustness)
 
 28. **Fail-first evidence**. Each defect below got a regression test that failed on the code before
-    the fix (recorded in the commit message): the loader test hung with prefetch (killed by
-    `timeout`); the state, cursor, checkpoint, resume and adapter-config tests returned the wrong
+    the fix (recorded in the commit message): the loader test failed without prefetch
+    (`RRC_ERR_INTERNAL: loader slot not free` on the second batch) and hung with prefetch (killed
+    by `timeout`); the state, cursor, checkpoint, resume and adapter-config tests returned the wrong
     status; the RoPE test crashed (SIGSEGV after a wrapped allocation size) and, under `make asan`,
     reported the signed overflow at the old `model.c:165`; the permutation call reported the signed
     overflow at the old `data.c:200` under UBSan; the CLI tests got exit 0 (`rrc_fwdbwd`, an empty
@@ -643,8 +644,9 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     same value for every valid epoch (the Python reference is unchanged).
 30. **Coverage added (no defect found)**: tiny `llama_mha` (4 / 4 heads) and `llama_mqa` (4 / 1)
     variants in `make_tiny_model.VARIANTS`, in `LORA_CASES` (both backends) and in a test over
-    attention chunks 1, 6 and T; a layout with eight length-1 documents (at 0..5, 10, 15: every
-    attention chunk boundary of chunk 5) and a length-2 document on a boundary, over attention
+    attention chunks 1, 6 and T; a layout with eight length-1 documents (at 0..5, 10 and 15, i.e. on
+    the attention chunk boundaries 5, 10 and 15 of chunk 5; 20 is not covered) and a length-2
+    document starting on 10, over attention
     chunks 1, 2, 5, T and CE chunks 1, 7; rows with T = 1 (counts 0, loss 0, gradients exactly 0,
     logits against HF); the layer sets of item 13.
 31. **Loader slots are claimed by stream position**, not `index % ring size`: each slot carries the
@@ -666,9 +668,10 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
     grad norm 7.9e-7, parameters 8.9e-7, m 3.5e-6, v 4.2e-6. The all-ignored window (item 21):
     `window_tokens` at eps 1e-8 parameters 5.8e-7, m 1.2e-6; `microbatch_mean` at eps 1e-4
     parameters 5.1e-7, m 1.9e-6. At eps 1e-8 `microbatch_mean` measured parameters 1.5e-5 (m 6.1e-6),
-    which falls to 7.7e-6 at eps 1e-6 and 5.1e-7 at eps 1e-4: elements with |g| near eps make Adam's
-    `m / (√v + eps)` ill-conditioned, so the test uses eps 1e-4 there rather than a looser
-    tolerance. All use the existing tolerances (1e-6, 3e-6, 5e-6, 2e-5).
+    which falls to 7.7e-6 at eps 1e-6 and 5.1e-7 at eps 1e-4. That points to elements with |g| near
+    eps, where Adam's `m / (√v + eps)` is ill-conditioned (inferred from this eps sweep and the
+    agreement of loss / grad norm / m / v; the per-element analysis was not repeated here), so the
+    test uses eps 1e-4 there rather than a looser tolerance. All use the existing tolerances (1e-6, 3e-6, 5e-6, 2e-5).
 33. **Checkpoint replacement**: see item 23. Tested with `-Wl,--wrap=rename` on the C test binary
     (the `.tmp → checkpoint-<step>` rename of a replacing save fails; then the state a crash between
     the two renames leaves): the previous checkpoint stays byte-identical and resumable. If the
@@ -688,12 +691,16 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
 36. **RoPE table size**: `max_position_embeddings` from config.json bounds no tensor; with
     `max_positions = 0` (the trainer's default) the table had `n_pos · head_dim` floats without an
     overflow check. Now `n_pos > 2^31 − 1` or an overflowing byte count is `RRC_ERR_UNSUPPORTED`
-    before any allocation (the message names `max_positions`, which bounds the table). The stage A
+    before any allocation (the message names `max_positions`, which bounds the table); the
+    multiplication by `head_dim` is overflow-checked too, since config.json bounds `head_dim` only
+    to be positive and even (tested with `head_dim` 2^60). The stage A
     config parser is unchanged. The table is still built for all `n_pos` positions even when
     `seq_len` is smaller (a few MB at 8B shapes; not changed).
-37. **Debug CLIs**: `rrc_fwdbwd` refuses a batch with an empty dimension or `M · B · T ≥ 2^31`
-    (an empty batch used to write an output file with exit 0); `rrc_data` checks `T ≤ 2^31 − 1` and
-    `B ≤ (2^31 − 1) / T` before forming `T · B`.
+37. **Debug CLIs**: `rrc_fwdbwd` refuses a batch with an empty dimension (tested, including
+    `[0, 2^32, 2^32]`; an empty batch used to write an output file with exit 0) or `M · B · T ≥ 2^31`
+    (not tested: such a batch file is 8 GB); `rrc_data` checks `T ≤ 2^31 − 1` and
+    `B ≤ (2^31 − 1) / T` before forming `T · B` (tested). Both were also run by hand under ASan /
+    UBSan with the reviewer's inputs: no report.
 38. **`adapter_config.json` checks** (init_adapter / resume): a root that is not an object and a
     `target_modules` that is not a list (PEFT writes a string for a regex target) are refused,
     because the alpha / rslora / dropout / DoRA / layer checks could not run on them. The training

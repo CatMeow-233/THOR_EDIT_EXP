@@ -111,7 +111,8 @@ rrc_status rrc_model_load(const rrc_backend *be, const char *dir, const rrc_mode
     {
         int64_t bytes = 0;
         if (m->n_pos > INT32_MAX ||
-            __builtin_mul_overflow(m->n_pos, cfg->head_dim / 2 * 2 * (int64_t)sizeof(float), &bytes) ||
+            __builtin_mul_overflow(m->n_pos, cfg->head_dim, &bytes) || /* 2 tables x head_dim / 2 */
+            __builtin_mul_overflow(bytes, (int64_t)sizeof(float), &bytes) ||
             (uint64_t)bytes > (uint64_t)SIZE_MAX) {
             st = RRC_ERROR(RRC_ERR_UNSUPPORTED,
                            "RoPE tables for %lld positions (config.json max_position_embeddings) x head_dim %lld: "

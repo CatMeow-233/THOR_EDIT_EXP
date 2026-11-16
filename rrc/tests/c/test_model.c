@@ -607,20 +607,23 @@ RT_TEST(model_load_refuses_huge_rope_table) {
     RT_OK(write_ckpt("huge_pos", k_cfg_qwen2, 3, &dir));
     char file[1400];
     snprintf(file, sizeof file, "%s/config.json", dir);
-    const char *values[] = {"4611686018427387904", "2147483648", "9223372036854775807"};
-    for (int i = 0; i < 3; i++) {
+    const char *values[] = {"4611686018427387904", "2147483648", "9223372036854775807", "2147483647"};
+    for (int i = 0; i < 4; i++) {
         char cfg[1024];
+        /* the last case: 2^31 - 1 positions with head_dim 2^60 (the tensor check would refuse the
+         * head_dim later; the table size must not overflow first) */
         snprintf(cfg, sizeof cfg,
                  "{\"model_type\": \"qwen2\", \"vocab_size\": 24, \"hidden_size\": 16, \"intermediate_size\": 16, "
                  "\"num_hidden_layers\": 2, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, "
-                 "\"max_position_embeddings\": %s, \"rms_norm_eps\": 1e-6, \"tie_word_embeddings\": false}",
-                 values[i]);
+                 "\"max_position_embeddings\": %s, \"rms_norm_eps\": 1e-6, \"tie_word_embeddings\": false%s}",
+                 values[i], i == 3 ? ", \"head_dim\": 1152921504606846976" : "");
         RT_OK(rrc_write_file_atomic(file, cfg, strlen(cfg)));
         rrc_model *m = NULL;
         rrc_model_opts mo;
         rrc_model_opts_default(&mo); /* max_positions 0: the table size comes from config.json */
         RT_STATUS(rrc_model_load(be, dir, &mo, &m), RRC_ERR_UNSUPPORTED);
         RT_EXPECT(m == NULL && strstr(rrc_last_error(), "max_position") != NULL, "%s", rrc_last_error());
+        if (i == 3) continue;
         /* an explicit max_positions bounds the table and the model loads */
         mo.max_positions = 32;
         RT_OK(rrc_model_load(be, dir, &mo, &m));
