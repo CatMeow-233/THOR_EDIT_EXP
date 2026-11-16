@@ -238,10 +238,10 @@ static void ws_layout(exec *e, arena *a, int with_grad) {
         w->dp = take(a, RRC_F32, mul3(e->Hq, arows, e->T));
         w->dh_ext = take(a, adt, (N + 1) * H);
         w->dres = take(a, adt, N * H);
-        w->dxn = take(a, adt, N * H);
+        w->dxn = take(a, RRC_F32, N * H);
         w->dq = take(a, adt, N * e->Q);
-        w->dk = take(a, adt, N * e->KV);
-        w->dv = take(a, adt, N * e->KV);
+        w->dk = take(a, RRC_F32, N * e->KV);
+        w->dv = take(a, RRC_F32, N * e->KV);
         w->dob = take(a, adt, N * e->Q);
         w->dgu = take(a, adt, mul3(N, 2, e->I));
         w->dact = take(a, adt, N * e->I);
