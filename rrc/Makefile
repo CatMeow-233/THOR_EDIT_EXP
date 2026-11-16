@@ -5,6 +5,8 @@
 #   make cuda CUDA_HOME=...  build librrc_cuda.a + rrc_selftest with nvcc (CUDA_ARCH or ARCH, default sm_120)
 #   make cuda-objs CUDA_HOME=...  compile every cuda/*.cu to an object only (CI, no GPU, no link)
 #   make asan                build and run the C tests (+ rrc_selftest_host) with -fsanitize=address,undefined
+#   make cuda-host-test CUDA_HOME=...  HOST-ONLY: the real cuda/*.cu built with g++ on a fake CUDA runtime
+#                            (tests/cuda_host; needs only the toolkit headers; part of `test` when CUDA_HOME is set)
 #   make clean
 #
 # Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH / ARCH,
@@ -77,7 +79,7 @@ comma := ,
 CUDA_LDLIBS := $(if $(CUDA_LIBDIR),-L$(CUDA_LIBDIR) -Wl$(comma)-rpath$(comma)$(CUDA_LIBDIR)) \
                -lcublasLt -lcudart -lstdc++ -ldl -lrt
 
-.PHONY: all cpu test cuda cuda-objs asan clean nvcc-check nvcc-missing
+.PHONY: all cpu test cuda cuda-objs asan clean nvcc-check nvcc-missing cuda-host-test cuda-host-missing
 all: cpu
 
 cpu: $(LIB) $(BINS)
@@ -133,6 +135,11 @@ ifneq ($(strip $(NVCC)),)
 else
 	@echo "nvcc header check: SKIPPED (set CUDA_HOME or RRC_NVCC to enable)"
 endif
+ifneq ($(CUDA_HOST_OK),)
+	@$(MAKE) --no-print-directory cuda-host-test
+else
+	@echo "cuda-host-test (real cuda/*.cu on a fake runtime, HOST-ONLY): SKIPPED (set CUDA_HOME for the toolkit headers)"
+endif
 
 # Compiles every RRC_HD helper into a __global__ kernel for $(CUDA_ARCH) (COMPILED-ONLY check).
 nvcc-check:
@@ -170,6 +177,54 @@ $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
+# ---- HOST-ONLY test build of the real CUDA sources (tests/cuda_host) ---------------------------------
+# cuda_kernels.cu and cuda_backend.cu compiled by g++ as C++ (no __CUDACC__) with tests/cuda_host/shim.h
+# force-included, linked with a fake CUDA runtime / cuBLASLt stand-in that runs kernel launches on host
+# threads. Needs the toolkit headers only (no nvcc, no CUDA libraries, no GPU). Never part of librrc_cuda.
+CXX_HOST ?= g++
+CUDA_HOST_OK := $(if $(CUDA_ROOT),$(wildcard $(CUDA_ROOT)/include/cublasLt.h))
+SHIM_DIR := $(RRC_DIR)/tests/cuda_host
+SHIM_CXXFLAGS := -std=c++17 -O2 -g -Wall -Wextra -Werror -pthread $(SAN) -DRRC_CUDA_HOST_SHIM \
+                 -I$(RRC_DIR)/include -I$(RRC_DIR)/kernels_common -I$(RRC_DIR)/cuda -I$(SHIM_DIR) \
+                 $(if $(CUDA_ROOT),-isystem $(CUDA_ROOT)/include) -MMD -MP
+SHIM_OBJS := $(BUILD)/obj/cuda_shim/cuda_kernels.o $(BUILD)/obj/cuda_shim/cuda_backend.o $(BUILD)/obj/cuda_shim/fake_cuda.o
+SHIM_TEST := $(BUILD)/test_cuda_host
+SHIM_SELFTEST := $(BUILD)/rrc_selftest_shim
+
+$(BUILD)/obj/cuda_shim/%.o: $(RRC_DIR)/cuda/%.cu $(SHIM_DIR)/shim.h
+	@mkdir -p $(dir $@)
+	$(CXX_HOST) $(SHIM_CXXFLAGS) -include $(SHIM_DIR)/shim.h -x c++ -c $< -o $@
+
+$(BUILD)/obj/cuda_shim/fake_cuda.o: $(SHIM_DIR)/fake_cuda.cpp $(SHIM_DIR)/shim.h $(SHIM_DIR)/fake_cuda.h
+	@mkdir -p $(dir $@)
+	$(CXX_HOST) $(SHIM_CXXFLAGS) -c $< -o $@
+
+$(BUILD)/obj/cuda_shim/test_cuda_host.o: $(SHIM_DIR)/test_cuda_host.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -I$(SHIM_DIR) $(CFLAGS) -c $< -o $@
+
+$(SHIM_TEST): $(BUILD)/obj/cuda_shim/test_cuda_host.o $(SHIM_OBJS) $(CUDA_HOST_OBJS) $(LIB)
+	$(CXX_HOST) $(SAN) -pthread $^ -o $@ -fopenmp -lm
+
+# rrc_selftest's CUDA main (selftest.c without RRC_SELFTEST_HOST) on the fake runtime
+$(SHIM_SELFTEST): $(BUILD)/obj/cuda_host/selftest.o $(SHIM_OBJS) $(CUDA_HOST_OBJS) $(LIB)
+	$(CXX_HOST) $(SAN) -pthread $^ -o $@ -fopenmp -lm
+
+cuda-host-test: $(if $(CUDA_HOST_OK),$(SHIM_TEST) $(SHIM_SELFTEST),cuda-host-missing)
+	@mkdir -p $(BUILD)/test_tmp
+	RRC_TEST_TMPDIR=$(BUILD)/test_tmp $(SHIM_TEST)
+	@# the program's CUDA main (pass logic, options) on one cheap op; test_cuda_host ran every op already
+	$(SHIM_SELFTEST) --quick --only convert > $(BUILD)/test_tmp/selftest_shim.log || { cat $(BUILD)/test_tmp/selftest_shim.log; exit 1; }
+	@grep -E "^(capped|grid) pass" $(BUILD)/test_tmp/selftest_shim.log; tail -n 1 $(BUILD)/test_tmp/selftest_shim.log
+	@if RRC_FAKE_LT=reject $(SHIM_SELFTEST) --quick --only gemm > $(BUILD)/test_tmp/selftest_shim_reject.log; then \
+	  echo "rrc_selftest (fake runtime): PASS with cuBLASLt refusing everything (must FAIL)"; exit 1; fi
+	@if $(SHIM_SELFTEST) --only nonexistent_op > $(BUILD)/test_tmp/selftest_shim_nomatch.log; then \
+	  echo "rrc_selftest (fake runtime): PASS with no check run (must FAIL)"; exit 1; fi
+	@echo "cuda-host-test: OK (HOST-ONLY: real cuda/*.cu sources on a fake runtime and host threads; no GPU)"
+
+cuda-host-missing:
+	@echo "make cuda-host-test: set CUDA_HOME=/path/to/cuda (only its include/ is used)"; exit 1
+
 # C tests and rrc_selftest_host under AddressSanitizer + UBSan, in a separate build directory.
 asan:
 	$(MAKE) --no-print-directory BUILD=$(BUILD)/asan SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" test
@@ -177,4 +232,5 @@ asan:
 clean:
 	rm -rf $(BUILD)
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(BUILD)/obj/src/rrc_inspect.d $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(BUILD)/obj/src/rrc_inspect.d $(CUDA_HOST_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) \
+         $(SHIM_OBJS:.o=.d) $(BUILD)/obj/cuda_shim/test_cuda_host.d

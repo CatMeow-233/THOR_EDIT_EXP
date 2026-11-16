@@ -16,20 +16,39 @@
 
 static_assert((LANES & (LANES - 1)) == 0, "RRC_KC_LANES must be a power of two");
 
-static unsigned grid_elems(int64_t n) {
-    const int64_t b = (n + 255) / 256;
-    return (unsigned)(b < 1 ? 1 : (b > (1 << 20) ? (1 << 20) : b));
+static unsigned grid_cap(unsigned max_blocks) {
+    return max_blocks == 0 || max_blocks > RRC_CU_MAX_BLOCKS ? RRC_CU_MAX_BLOCKS : max_blocks;
 }
-static unsigned grid_rows(int64_t rows) {
-    return (unsigned)(rows < 1 ? 1 : (rows > (1 << 20) ? (1 << 20) : rows));
+static unsigned grid_elems(int64_t n, unsigned max_blocks) {
+    const int64_t b = (n + 255) / 256, cap = grid_cap(max_blocks);
+    return (unsigned)(b < 1 ? 1 : (b > cap ? cap : b));
 }
+static unsigned grid_rows(int64_t rows, unsigned max_blocks) {
+    const int64_t cap = grid_cap(max_blocks);
+    return (unsigned)(rows < 1 ? 1 : (rows > cap ? cap : rows));
+}
+
+// Kernel launch. The host test build (rrc/tests/cuda_host, -DRRC_CUDA_HOST_SHIM, HOST-ONLY) runs
+// the same kernels on host threads instead; nvcc always takes the <<<>>> form for both macros.
+// RRC_CU_LAUNCH_NOSYNC marks kernels without __syncthreads (the element kernels), which the host
+// build may run one CUDA thread after the other (it aborts if such a kernel synchronizes).
+#if defined(RRC_CUDA_HOST_SHIM) && !defined(__CUDACC__)
+#define RRC_CU_LAUNCH(kernel, grid, block, s, ...) ((void)(s), rrc_shim_launch((grid), (block), 1, [=] { kernel(__VA_ARGS__); }))
+#define RRC_CU_LAUNCH_NOSYNC(kernel, grid, block, s, ...) ((void)(s), rrc_shim_launch((grid), (block), 0, [=] { kernel(__VA_ARGS__); }))
+#else
+#define RRC_CU_LAUNCH(kernel, grid, block, s, ...) kernel<<<(grid), (block), 0, (s)>>>(__VA_ARGS__)
+#define RRC_CU_LAUNCH_NOSYNC(kernel, grid, block, s, ...) kernel<<<(grid), (block), 0, (s)>>>(__VA_ARGS__)
+#endif
 
 #define GRID_STRIDE(i, n) for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += (int64_t)gridDim.x * blockDim.x)
 #define ROW_STRIDE(row, rows) for (int64_t row = blockIdx.x; row < (rows); row += gridDim.x)
 
+// Records a range error: the first failing op wins the CAS, and only items of that op lower the
+// index (an item of a later failing op must not put its index under the first op's name). Ops on
+// one stream run in order, so every item of the recorded op has done its CAS before a later op's.
 __device__ static void dev_range(rrc_cuda_err *err, unsigned op, int64_t index) {
-    atomicCAS(&err->op, 0u, op);
-    atomicMin(&err->index, (unsigned long long)index);
+    const unsigned prev = atomicCAS(&err->op, 0u, op);
+    if (prev == 0u || prev == op) atomicMin(&err->index, (unsigned long long)index);
 }
 
 // Fixed trees over shared memory (all LANES threads call them; they end synchronized).
@@ -194,66 +213,66 @@ __global__ void __launch_bounds__(LANES) k_ss_final(rrc_kc_ss_p p) {
 #define LAUNCH_ELEMS(kernel, n, ...)                                                                    \
     do {                                                                                                \
         if ((n) <= 0) return cudaSuccess;                                                               \
-        kernel<<<grid_elems(n), 256, 0, s>>>(__VA_ARGS__);                                              \
+        RRC_CU_LAUNCH_NOSYNC(kernel, grid_elems(n, max_blocks), 256, s, __VA_ARGS__);                   \
         return cudaGetLastError();                                                                      \
     } while (0)
 #define LAUNCH_ROWS(kernel, rows, ...)                                                                  \
     do {                                                                                                \
         if ((rows) <= 0) return cudaSuccess;                                                            \
-        kernel<<<grid_rows(rows), LANES, 0, s>>>(__VA_ARGS__);                                          \
+        RRC_CU_LAUNCH(kernel, grid_rows(rows, max_blocks), LANES, s, __VA_ARGS__);                      \
         return cudaGetLastError();                                                                      \
     } while (0)
 
-cudaError_t rrc_cu_lt_matmul(cudaStream_t s, const rrc_kc_lt_p *p) {
+cudaError_t rrc_cu_lt_matmul(cudaStream_t s, unsigned max_blocks, const rrc_kc_lt_p *p) {
     const int64_t n = p->batch * p->m * p->n;
     LAUNCH_ELEMS(k_lt_matmul, n, *p, n);
 }
-cudaError_t rrc_cu_conv2d(cudaStream_t s, const rrc_kc_conv2d_p *p) {
+cudaError_t rrc_cu_conv2d(cudaStream_t s, unsigned max_blocks, const rrc_kc_conv2d_p *p) {
     const int64_t n = p->batch * p->rows * p->cols;
     LAUNCH_ELEMS(k_conv2d, n, *p, n);
 }
-cudaError_t rrc_cu_embedding(cudaStream_t s, const rrc_kc_embed_p *p, rrc_cuda_err *err) {
+cudaError_t rrc_cu_embedding(cudaStream_t s, unsigned max_blocks, const rrc_kc_embed_p *p, rrc_cuda_err *err) {
     const int64_t n = p->n_tokens * p->dim;
     LAUNCH_ELEMS(k_embedding, n, *p, n, err);
 }
-cudaError_t rrc_cu_add_bias(cudaStream_t s, const rrc_kc_bias_p *p) {
+cudaError_t rrc_cu_add_bias(cudaStream_t s, unsigned max_blocks, const rrc_kc_bias_p *p) {
     const int64_t n = p->rows * p->cols;
     LAUNCH_ELEMS(k_add_bias, n, *p, n);
 }
-cudaError_t rrc_cu_bias_grad(cudaStream_t s, const rrc_kc_bias_p *p) { LAUNCH_ELEMS(k_bias_grad, p->cols, *p, p->cols); }
-cudaError_t rrc_cu_rmsnorm_fwd(cudaStream_t s, const rrc_kc_rmsnorm_p *p) { LAUNCH_ROWS(k_rmsnorm_fwd, p->rows, *p); }
-cudaError_t rrc_cu_rmsnorm_bwd(cudaStream_t s, const rrc_kc_rmsnorm_p *p) { LAUNCH_ROWS(k_rmsnorm_bwd, p->rows, *p); }
-cudaError_t rrc_cu_rope(cudaStream_t s, const rrc_kc_rope_p *p, rrc_cuda_err *err) {
+cudaError_t rrc_cu_bias_grad(cudaStream_t s, unsigned max_blocks, const rrc_kc_bias_p *p) { LAUNCH_ELEMS(k_bias_grad, p->cols, *p, p->cols); }
+cudaError_t rrc_cu_rmsnorm_fwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_rmsnorm_p *p) { LAUNCH_ROWS(k_rmsnorm_fwd, p->rows, *p); }
+cudaError_t rrc_cu_rmsnorm_bwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_rmsnorm_p *p) { LAUNCH_ROWS(k_rmsnorm_bwd, p->rows, *p); }
+cudaError_t rrc_cu_rope(cudaStream_t s, unsigned max_blocks, const rrc_kc_rope_p *p, rrc_cuda_err *err) {
     const int64_t n = p->n_tokens * p->n_heads * (p->head_dim / 2);
     LAUNCH_ELEMS(k_rope, n, *p, n, err);
 }
-cudaError_t rrc_cu_softmax_fwd(cudaStream_t s, const rrc_kc_softmax_p *p) {
+cudaError_t rrc_cu_softmax_fwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_softmax_p *p) {
     LAUNCH_ROWS(k_softmax_fwd, p->batch * p->rows, *p);
 }
-cudaError_t rrc_cu_softmax_bwd(cudaStream_t s, const rrc_kc_softmax_p *p) {
+cudaError_t rrc_cu_softmax_bwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_softmax_p *p) {
     LAUNCH_ROWS(k_softmax_bwd, p->batch * p->rows, *p);
 }
-cudaError_t rrc_cu_swiglu_fwd(cudaStream_t s, const rrc_kc_swiglu_p *p) {
+cudaError_t rrc_cu_swiglu_fwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_swiglu_p *p) {
     const int64_t n = p->rows * p->cols;
     LAUNCH_ELEMS(k_swiglu_fwd, n, *p, n);
 }
-cudaError_t rrc_cu_swiglu_bwd(cudaStream_t s, const rrc_kc_swiglu_p *p) {
+cudaError_t rrc_cu_swiglu_bwd(cudaStream_t s, unsigned max_blocks, const rrc_kc_swiglu_p *p) {
     const int64_t n = p->rows * p->cols;
     LAUNCH_ELEMS(k_swiglu_bwd, n, *p, n);
 }
-cudaError_t rrc_cu_add(cudaStream_t s, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_add, p->n, *p, p->n); }
-cudaError_t rrc_cu_axpy(cudaStream_t s, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_axpy, p->n, *p, p->n); }
-cudaError_t rrc_cu_scale(cudaStream_t s, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_scale, p->n, *p, p->n); }
-cudaError_t rrc_cu_convert(cudaStream_t s, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_convert, p->n, *p, p->n); }
-cudaError_t rrc_cu_sum_squares(cudaStream_t s, const rrc_kc_ss_p *p) {
+cudaError_t rrc_cu_add(cudaStream_t s, unsigned max_blocks, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_add, p->n, *p, p->n); }
+cudaError_t rrc_cu_axpy(cudaStream_t s, unsigned max_blocks, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_axpy, p->n, *p, p->n); }
+cudaError_t rrc_cu_scale(cudaStream_t s, unsigned max_blocks, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_scale, p->n, *p, p->n); }
+cudaError_t rrc_cu_convert(cudaStream_t s, unsigned max_blocks, const rrc_kc_ew_p *p) { LAUNCH_ELEMS(k_convert, p->n, *p, p->n); }
+cudaError_t rrc_cu_sum_squares(cudaStream_t s, unsigned max_blocks, const rrc_kc_ss_p *p) {
     const int64_t nc = rrc_kc_ss_chunks(p->n);
     if (nc > 0) {
-        k_ss_chunks<<<grid_rows(nc), LANES, 0, s>>>(*p, nc);
+        RRC_CU_LAUNCH(k_ss_chunks, grid_rows(nc, max_blocks), LANES, s, *p, nc);
         cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) return e;
     }
-    k_ss_final<<<1, LANES, 0, s>>>(*p);
+    RRC_CU_LAUNCH(k_ss_final, 1, LANES, s, *p);
     return cudaGetLastError();
 }
-cudaError_t rrc_cu_xent(cudaStream_t s, const rrc_kc_xent_p *p, rrc_cuda_err *err) { LAUNCH_ROWS(k_xent, p->rows, *p, err); }
-cudaError_t rrc_cu_adamw(cudaStream_t s, const rrc_kc_adamw_p *p) { LAUNCH_ELEMS(k_adamw, p->n, *p, p->n); }
+cudaError_t rrc_cu_xent(cudaStream_t s, unsigned max_blocks, const rrc_kc_xent_p *p, rrc_cuda_err *err) { LAUNCH_ROWS(k_xent, p->rows, *p, err); }
+cudaError_t rrc_cu_adamw(cudaStream_t s, unsigned max_blocks, const rrc_kc_adamw_p *p) { LAUNCH_ELEMS(k_adamw, p->n, *p, p->n); }

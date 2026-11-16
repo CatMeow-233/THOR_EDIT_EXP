@@ -32,6 +32,8 @@ typedef struct rrc_cuda_options {
     int gemm_min_level;             /* rrc_gemm_level to start the ladder at (default 0 = native; 2 = always the kernel) */
     int64_t gemm_scratch_cap_elems; /* promotion scratch cap in f32 elements (default RRC_GEMM_SCRATCH_CAP_DEFAULT) */
     size_t workspace_bytes;         /* cuBLASLt workspace (default 32 MiB) */
+    unsigned max_grid_blocks;       /* cap on the kernels' grid size (0 = default 2^20 blocks); a small value makes every
+                                     * grid-stride / row-stride loop wrap at small sizes (rrc_selftest's grid pass) */
 } rrc_cuda_options;
 
 /* Defaults, then the environment overrides named above. */

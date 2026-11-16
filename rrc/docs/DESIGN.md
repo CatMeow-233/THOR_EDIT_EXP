@@ -407,8 +407,9 @@ an expectation, not a measurement, until `rrc_selftest` has run on the device.
 | `cuda/selftest_ops.{h,c}` | backend-agnostic op self-test (the body of `rrc_selftest`) | executed on CPU against kc-emu and the CPU backend |
 | `cuda/selftest.c` | `rrc_selftest` (CUDA) and `rrc_selftest_host` (`-DRRC_SELFTEST_HOST`) | host build executed in `make test`; CUDA build linked only |
 | `cuda/rrc_cuda.h` | public API: `rrc_cuda_backend_create[_ex](device, [opts,] &be)`, `rrc_cuda_backend_destroy`, options, device info, last GEMM path | — |
-| `cuda/cuda_kernels.cu`, `cuda/cuda_internal.h` | the `__global__` shells and their launchers | COMPILED-ONLY |
-| `cuda/cuda_backend.cu` | stream, cuBLASLt handle/workspace, descriptor cache, error flag, op table | COMPILED-ONLY |
+| `cuda/cuda_kernels.cu`, `cuda/cuda_internal.h` | the `__global__` shells and their launchers | COMPILED-ONLY (+ HOST-ONLY execution, §11.4) |
+| `cuda/cuda_backend.cu` | stream, cuBLASLt handle/workspace, descriptor cache, error flag, op table | COMPILED-ONLY (+ HOST-ONLY execution, below) |
+| `tests/cuda_host/{shim.h,fake_cuda.{h,cpp},test_cuda_host.c}` | HOST-ONLY test build: the real `cuda_kernels.cu` / `cuda_backend.cu` compiled by g++ against a fake CUDA runtime and a cuBLASLt stand-in, kernels on host threads (§11.4) | executed by `make test` / `make asan` when `CUDA_HOME` is set (headers only) |
 | `tools/fetch_cuda_toolkit.sh` | reproduces the compile-only toolkit from pinned PyPI wheels + conda packages (sha256-checked) | run once by hand from cached package files (`--from`); never run by tests |
 
 ```sh
@@ -416,8 +417,13 @@ make -C rrc clean cpu test                       # includes the new CPU tests an
 make -C rrc asan                                 # C tests + rrc_selftest_host with -fsanitize=address,undefined
 make -C rrc cuda-objs CUDA_HOME=/path/to/cuda    # compile every cuda/*.cu (CI; no GPU, no link)
 make -C rrc cuda CUDA_HOME=/path/to/cuda [ARCH=sm_120]   # build/librrc_cuda.a + build/rrc_selftest
-build/rrc_selftest [--device N] [--tf32] [--sync-each-op] [--gemm-level 0|1|2] [--only OP] [-v]
+make -C rrc cuda-host-test CUDA_HOME=/path/to/cuda       # HOST-ONLY: real cuda/*.cu on a fake runtime (also in test/asan)
+build/rrc_selftest [--device N] [--tf32] [--sync-each-op] [--gemm-level 0|1|2] [--only OP] [--quick]
+                   [--scratch-cap N] [--max-grid N] [--no-capped-pass] [--no-grid-pass] [--allow-fallback] [-v]
 ```
+
+`make -C rrc clean cpu test` without `CUDA_HOME` skips both the nvcc header check and
+`cuda-host-test` (it says so); with `CUDA_HOME` both run (`make asan` likewise, under ASan/UBSan).
 
 Link line for users of the backend: `librrc_cuda.a librrc.a -lcublasLt -lcudart -lstdc++ -ldl -lrt`
 (plus `-fopenmp -lm -lpthread` for librrc). `rrc_cuda.h` is in `rrc/cuda/` (add `-Irrc/cuda`); the
@@ -466,16 +472,25 @@ env `RRC_CUDA_ALLOW_TF32=1`) selects `CUBLAS_COMPUTE_32F_FAST_TF32` for f32×f32
 
 Bounded scratch: promoted operands and the f32 C go through one backend-owned device scratch of at
 most `gemm_scratch_cap_elems` floats (default 16 Mi = 64 MiB). The problem is split into chunks of
-(batch range, row range of C, column range of C), halving the dimension that shrinks the scratch
-most until it fits; broadcast operands are converted once per chunk. Only when a single row or
-column of an operand (k elements) exceeds the cap is the minimum chunk used (`scratch_elems` then
-reports the need). Example (tested): `dh = dlogits[4096, 152064] (f32) × W_lm[152064, 4096] (bf16)`
+(batch range, row range of C, column range of C): the batch extent is the largest whose full-size
+slices fit (binary search on the actual padded layout), then the row or column extent is halved,
+the one that shrinks the scratch most, until it fits; a halving that does not shrink a padded
+region is still taken when a smaller extent of that dimension would. Broadcast operands are
+converted once per chunk. Bound (TESTED, `gemm_plan.plan_scratch_bound`, 40 000 random plans):
+`scratch_elems <= cap` whenever the minimum chunk (one batch slice, one row and one column of C)
+fits; otherwise the plan needs exactly what the minimum chunk needs (`scratch_elems` reports it). Example (tested): `dh = dlogits[4096, 152064] (f32) × W_lm[152064, 4096] (bf16)`
 promotes W in column chunks within 64 MiB instead of 2.3 GiB. Scratch leading dimensions ≥ 64 are
 padded to multiples of 8 elements (aligned columns).
 
 Semantics-relevant cuBLASLt settings: `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK =
 COMPUTE_TYPE` (split-K partials only in fp32: the `INPLACE` / `OUTPUT_TYPE` schemes would add
-partial sums in the output type, i.e. round to bf16 several times); `beta == 0` on a scratch path
+partial sums in the output type, i.e. round to bf16 several times). cublasLt.h does not say
+whether a mask without a bit for `NONE` (= 0) still admits the non-split-K algorithms, so when
+that query returns nothing a second query with the default mask takes the first of up to 8
+results whose own configuration is non-split (`CUBLASLT_ALGO_CONFIG_SPLITK_NUM <= 1`) or uses
+`REDUCTION_SCHEME_COMPUTE_TYPE` (read with `cublasLtMatmulAlgoConfigGetAttribute`). The selection
+logic is HOST-ONLY tested against a stand-in whose masked query finds nothing and whose unmasked
+query lists a split-K `INPLACE` algorithm first; the real library's mask semantics are NOT_TESTED; `beta == 0` on a scratch path
 zero-fills the scratch instead of loading C; on native paths C is the caller's buffer and the
 selftest runs NaN-prefilled C with `beta = 0` on every path. Descriptors, layouts and the heuristic
 result are cached per call geometry (64 entries, keyed on shapes, strides, types, alignment, TF32),
@@ -537,7 +552,27 @@ refusals by type triple and minimum alignment). Tests (`make test`):
   promote-all GEMM paths with a tiny scratch cap); the same harness with the double-accumulation
   CPU backend as the device (its tolerances accept a correct backend with different arithmetic);
   bad token ids neither read out of bounds nor write.
-* `rrc_selftest_host --backend emu --deferred --quick` runs the program's `main` path.
+* `rrc_selftest_host --backend emu --deferred --quick` runs the program's `main` path; `make test`
+  also checks that `--reject-mask 0xFF` (no library) and `--only nonexistent_op` exit non-zero.
+
+HOST-ONLY execution of the real CUDA sources (`tests/cuda_host`, run by `make test` / `make asan`
+when `CUDA_HOME` is set; needs the toolkit headers only). `cuda_kernels.cu` and `cuda_backend.cu`
+are compiled by g++ as C++ with `shim.h` force-included; `fake_cuda.cpp` implements the runtime
+entry points on host memory (live-pointer tracking, injectable `cudaMalloc` failure) and a
+cuBLASLt stand-in (documented column-major semantics, the assumed type table, checks of the
+promised alignment and of descriptor consistency). Kernel launches go through `RRC_CU_LAUNCH`
+(nvcc: exactly `<<<grid, block, 0, s>>>`): row kernels run one host thread per CUDA thread with
+a barrier for `__syncthreads` and function-local statics for `__shared__` (blocks in order);
+element kernels (`RRC_CU_LAUNCH_NOSYNC`) run their threads one after the other. This executes the
+kernel shells (grid/row-stride loops, shared-memory trees, lane-0 finalizers, the error flag),
+the launch geometry and the whole backend (descriptor cache, ladder, chunking, scratch, error
+paths) — not device code generation, the real cuBLASLt, concurrency between blocks, or timing.
+`test_cuda_host`: sum_squares partial-buffer growth failure (no dangling pointer, no double
+free), the error flag naming one op with that op's index, the reduction-scheme query fallback,
+and the whole selftest harness through the backend (default grid; a 3-block grid with a
+1024-float scratch cap, where every grid-stride and row-stride loop wraps and GEMMs chunk; the
+stand-in refusing everything, which must fail). `rrc_selftest_shim` is `selftest.c`'s CUDA `main`
+on the fake runtime (pass logic, options, failing exit statuses).
 * Mutation checks done while writing this (not automated): swapping trans flags, a wrong chunk
   offset, a wrong broadcast stride, a too-small C scratch stride, a dropped post-conversion, and
   four item-body mutations were each caught.
@@ -546,7 +581,9 @@ refusals by type triple and minimum alignment). Tests (`make test`):
 
 One in-order non-blocking stream per backend. Range errors: embedding ids, rope positions and CE
 labels are checked in the item before the dependent read; a failing item writes nothing and sets a
-device flag (first op id, smallest offending row/token via `atomicMin`). `sync` and `memcpy_d2h`
+device flag (first op id via `atomicCAS`, then the smallest offending row/token of that op via
+`atomicMin`, taken only by items whose CAS returned 0 or the same op: an item of a later failing op
+never lowers the index reported under the first op's name). `sync` and `memcpy_d2h`
 (both wait for the stream) read and clear the flag and return `RRC_ERR_RANGE` naming the op;
 `sync_each_op` (env `RRC_CUDA_SYNC_EACH_OP=1`) makes every op synchronize, so the op itself
 reports. Unlike the CPU backend, which validates before writing, the outputs of the ops enqueued
@@ -557,7 +594,8 @@ errors are `RRC_ERR_BACKEND` (allocation failures `RRC_ERR_OOM`).
 may be reused on return); the pinned double-buffered staging that would let uploads overlap compute
 (§6) is not implemented. `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` synchronizes the stream, then
 calls `cudaFree`. The GEMM scratch and the sum_squares partial buffer grow on
-demand (stream synchronize before freeing the old buffer). All calls on one backend must come from
+demand (stream synchronize before freeing the old buffer); `grow()` always updates the owning
+backend members, so after a failed growth they are (NULL, 0), never a freed pointer. All calls on one backend must come from
 one host thread (backend.h); the backend calls `cudaSetDevice` at creation only.
 
 ### 11.6 rrc_selftest
@@ -576,7 +614,24 @@ batched, broadcast A/B, interleaved C, misaligned, fused column blocks, aligned)
 that fell back to the kernel GEMM (a correct but slow path that would otherwise be invisible
 behind a PASS), checks range-error reporting (op or next
 sync, then a clean sync), and runs every case twice requiring bit-identical results. Exit status 0
-only if everything passes. Tolerances (applied per element, `scale` = max |ref| of the output):
+only if everything passes, and never when no check ran (e.g. `--only` matching no op).
+
+GEMM path requirement (`rrc_st_opts.require_lt`, on unless `--gemm-level` > 0 or
+`--allow-fallback`): the dense aligned case of every dtype combination must not run on the kernel
+fallback, that of f32/f32/f32, bf16/bf16/f32 and bf16/bf16/bf16 must run natively (level 0), and
+at least one GEMM case must reach cuBLASLt; a violation is a FAIL. This turns the note of a
+correct-but-naive fallback into a failure for exactly the cases cuBLASLt is expected to serve, so a
+broken integration (wrong preference attribute, alignment, an unexpected type table) cannot pass
+on the first GPU run; misaligned, interleaved and other layouts may still fall back with a note.
+Extra passes after the main one: a *capped pass* (every GEMM case again with a 1024-float scratch
+cap, which must chunk at least one case: per-chunk offsets, alignment and descriptor keys, scratch
+reuse on one stream, the bf16 post-conversion; skipped with `--scratch-cap N` or
+`--no-capped-pass`) and, in the CUDA build, a *grid pass* (every op with at most 3 blocks per
+launch via `rrc_cuda_options.max_grid_blocks`, so every grid-stride and row-stride loop wraps at the
+selftest's sizes; `--max-grid N` / `--no-grid-pass`). Softmax cases include -inf scores (about
+10%, a row of all -inf, -inf on the causal diagonal so row 0 of a causal case has only -inf
+allowed) for f32 and bf16 s, and sum_squares includes n = 2²⁰ + 4097 (257 partials: the final
+block's lane loop wraps). Tolerances (applied per element, `scale` = max |ref| of the output):
 
 | class | ops | tolerance |
 | --- | --- | --- |
@@ -598,3 +653,28 @@ of §7 (they need the model/trainer of the other stage-B line).
   row kernels use one block per row (inefficient for very short rows such as per-head q/k norm
   with head_dim 128), no fused attention, no pinned staging for uploads, no CUDA graphs.
 * Single device per process thread (`cudaSetDevice` only at creation).
+* Not executed anywhere: element kernels with more than 2²⁸ items or row kernels with more than
+  2²⁰ rows at the default grid cap (the wrap paths themselves run through the grid pass and the
+  HOST-ONLY build with a 3-block cap; the int64 index arithmetic beyond 2³¹ only by reading).
+* The HOST-ONLY build's cuBLASLt stand-in encodes the same type table and alignment rules the plan
+  assumes, so its passes are no evidence for them; the reduction-scheme mask semantics of the real
+  library are NOT_TESTED.
+
+### 11.8 Review fixes of the CUDA line (decisions)
+
+* sum_squares partials: `grow()` is called on the backend members themselves (`ss_part`,
+  `ss_part_bytes`), as for the GEMM scratch. Before, a failed growth left the freed pointer and its
+  old capacity in the backend (use-after-free by the next call's kernel, second `cudaFree` at
+  destroy). Regression: `cuda_host.sum_squares_grow_failure` (fails on the old code with a
+  `cudaFree` of a dead pointer; ASan reports the use-after-free).
+* Error flag: the index is lowered only by items of the recorded op (`cuda_host.error_flag_op_and_index`).
+* NaN logits in cross entropy: `rrc_kc_lse_push` poisons the state with a NaN input and
+  `rrc_kc_lse_merge` returns a NaN state before its -inf shortcuts, so the device tree keeps a NaN
+  that the CPU's serial reduction (and torch) propagate; non-NaN inputs take the same branches as
+  before (CPU results unchanged). Regression: `kc_items.emu_xent_nan_propagates`.
+* GEMM plan bound: see §11.2 (`gemm_plan.plan_scratch_bound`; the old linear fit and early stop
+  gave up to 21x the cap).
+* Selftest: path requirement, capped and grid passes, -inf softmax cases, empty-run failure (§11.6).
+  This replaces the earlier decision that fallback notes are warnings only.
+* `rrc_cuda_options.max_grid_blocks` (default 0 = 2²⁰ blocks) and the launch macros are additions
+  to the CUDA line's own API; `backend.h` and the op wrappers are unchanged.

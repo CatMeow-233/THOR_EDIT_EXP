@@ -40,6 +40,9 @@ static void usage(void) {
     fprintf(stderr,
             "usage: rrc_selftest [--device N] [--seed S] [--tf32] [--sync-each-op] [--gemm-level 0|1|2] [--only OP] [--quick]\n"
             "                    [--scratch-cap N] [--no-capped-pass] [--allow-fallback] [-v]\n"
+#ifndef RRC_SELFTEST_HOST
+            "                    [--max-grid N] [--no-grid-pass]\n"
+#endif
 #ifdef RRC_SELFTEST_HOST
             "       (host build) [--backend emu|cpu] [--deferred] [--reject-mask M] [--min-align A]\n"
 #endif
@@ -49,6 +52,7 @@ static void usage(void) {
 typedef struct cfg {
     int device, tf32, sync_each, level;
     int64_t scratch_cap; /* 0: the backend default */
+    unsigned max_grid;   /* CUDA: rrc_cuda_options.max_grid_blocks of the first pass (0: default) */
 #ifdef RRC_SELFTEST_HOST
     const char *backend;
     rrc_emu_options eo;
@@ -56,8 +60,10 @@ typedef struct cfg {
 } cfg;
 
 /* Creates the device backend for one pass; prints its description once (`describe`). */
-static rrc_status make_dev(const cfg *c, int64_t scratch_cap, int describe, const rrc_backend **dev, int *tf32_out) {
+static rrc_status make_dev(const cfg *c, int64_t scratch_cap, unsigned max_grid, int describe, const rrc_backend **dev,
+                           int *tf32_out) {
 #ifdef RRC_SELFTEST_HOST
+    (void)max_grid;
     *tf32_out = 0;
     if (!strcmp(c->backend, "cpu")) {
         *dev = rrc_backend_cpu();
@@ -77,6 +83,7 @@ static rrc_status make_dev(const cfg *c, int64_t scratch_cap, int describe, cons
     if (c->sync_each) co.sync_each_op = 1;
     co.gemm_min_level = c->level;
     if (scratch_cap > 0) co.gemm_scratch_cap_elems = scratch_cap;
+    co.max_grid_blocks = max_grid;
     *tf32_out = co.allow_tf32;
     rrc_status s = rrc_cuda_backend_create_ex(c->device, &co, dev);
     if (s != RRC_OK) return s;
@@ -93,9 +100,10 @@ static rrc_status make_dev(const cfg *c, int64_t scratch_cap, int describe, cons
         printf("device info unavailable: %s\n", rrc_last_error());
         rrc_clear_error();
     }
-    printf("options: tf32 %s, sync_each_op %s, gemm ladder starts at level %d, gemm scratch cap %lld floats\n",
+    printf("options: tf32 %s, sync_each_op %s, gemm ladder starts at level %d, gemm scratch cap %lld floats, max grid %u "
+           "blocks%s\n",
            co.allow_tf32 ? "on" : "off", co.sync_each_op ? "on" : "off", co.gemm_min_level,
-           (long long)co.gemm_scratch_cap_elems);
+           (long long)co.gemm_scratch_cap_elems, co.max_grid_blocks, co.max_grid_blocks ? "" : " (default)");
     return RRC_OK;
 #endif
 }
@@ -111,12 +119,16 @@ static void destroy_dev(const rrc_backend *dev) {
 /* Scratch cap of the extra GEMM pass: small enough that most promoted cases run in several
  * chunks (per-chunk pointer offsets, alignment and descriptor-cache keys, scratch reuse across
  * chunks on one stream, the post-conversion into a bf16 C). */
-#define CAPPED_PASS_SCRATCH 40
+#define CAPPED_PASS_SCRATCH 1024
+/* Grid cap of the extra CUDA pass: every element kernel's grid-stride loop and every row kernel's
+ * row-stride loop runs several iterations per block even at the selftest's small sizes (with the
+ * default cap of 2^20 blocks that needs more than 2^28 elements or 2^20 rows). */
+#define GRID_PASS_BLOCKS 3u
 
 int main(int argc, char **argv) {
     cfg c;
     memset(&c, 0, sizeof c);
-    int verbose = 0, quick = 0, allow_fallback = 0, capped_pass = 1;
+    int verbose = 0, quick = 0, allow_fallback = 0, capped_pass = 1, grid_pass = 1;
     uint64_t seed = 0x5E1F7E57ull;
     const char *only = NULL;
 #ifdef RRC_SELFTEST_HOST
@@ -137,6 +149,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--scratch-cap") && v) c.scratch_cap = strtoll(argv[++i], NULL, 0);
         else if (!strcmp(a, "--no-capped-pass")) capped_pass = 0;
         else if (!strcmp(a, "--allow-fallback")) allow_fallback = 1;
+#ifndef RRC_SELFTEST_HOST
+        else if (!strcmp(a, "--max-grid") && v) c.max_grid = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--no-grid-pass")) grid_pass = 0;
+#endif
 #ifdef RRC_SELFTEST_HOST
         else if (!strcmp(a, "--backend") && v) c.backend = argv[++i];
         else if (!strcmp(a, "--deferred")) c.eo.deferred_errors = 1;
@@ -162,12 +178,14 @@ int main(int argc, char **argv) {
     c.eo.seed = seed ^ 0xA5A5u;
     const int strict = !strcmp(c.backend, "emu"); /* the emulator uses the CPU's arithmetic */
     const int has_paths = !strcmp(c.backend, "emu");
+    grid_pass = 0; /* host backends have no grid */
 #else
     const int strict = 0, has_paths = 1;
+    if (c.max_grid) grid_pass = 0; /* the first pass already runs with a grid cap */
 #endif
     const rrc_backend *dev = NULL;
     int tf32 = 0;
-    rrc_status s = make_dev(&c, c.scratch_cap, 1, &dev, &tf32);
+    rrc_status s = make_dev(&c, c.scratch_cap, c.max_grid, 1, &dev, &tf32);
     if (s != RRC_OK) {
         fprintf(stderr, "rrc_selftest: cannot create the device backend (device %d): %s\n", c.device, rrc_last_error());
         return 1;
@@ -191,7 +209,7 @@ int main(int argc, char **argv) {
     const int want_gemm = !only || strstr("gemm", only) != NULL; /* the harness filter: op name contains `only` */
     if (capped_pass && c.scratch_cap == 0 && want_gemm && c.level < 2 && has_paths) {
         printf("capped pass: gemm with a %d-float scratch cap (multi-chunk paths)\n", CAPPED_PASS_SCRATCH);
-        s = make_dev(&c, CAPPED_PASS_SCRATCH, 0, &dev, &tf32);
+        s = make_dev(&c, CAPPED_PASS_SCRATCH, c.max_grid, 0, &dev, &tf32);
         if (s != RRC_OK) {
             fprintf(stderr, "rrc_selftest: cannot create the capped-pass backend: %s\n", rrc_last_error());
             return 1;
@@ -201,6 +219,20 @@ int main(int argc, char **argv) {
          * requirement is checked by the first pass; this one must chunk */
         o.require_lt = 0;
         o.require_chunked = !allow_fallback; /* everything on the kernel level never chunks */
+        fails += rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
+        destroy_dev(dev);
+    }
+    /* third pass (CUDA): every op again with a grid of at most GRID_PASS_BLOCKS blocks */
+    if (grid_pass) {
+        printf("grid pass: every op with at most %u blocks per launch (grid-stride / row-stride wrap)\n", GRID_PASS_BLOCKS);
+        s = make_dev(&c, c.scratch_cap, GRID_PASS_BLOCKS, 0, &dev, &tf32);
+        if (s != RRC_OK) {
+            fprintf(stderr, "rrc_selftest: cannot create the grid-pass backend: %s\n", rrc_last_error());
+            return 1;
+        }
+        o.only = only;
+        o.require_lt = has_paths && c.level == 0 && !allow_fallback;
+        o.require_chunked = 0;
         fails += rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
         destroy_dev(dev);
     }

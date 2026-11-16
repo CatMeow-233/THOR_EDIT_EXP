@@ -97,9 +97,15 @@ make -C rrc cuda CUDA_HOME=/usr/local/cuda      # build/librrc_cuda.a, build/rrc
 rrc/build/rrc_selftest                          # every op vs the CPU backend; exit 0 = PASS
 ```
 
+`rrc_selftest` fails (exit 1) if the dense aligned GEMM cases do not reach cuBLASLt (natively for
+f32/f32/f32, bf16/bf16/f32, bf16/bf16/bf16), if no check ran, or if any value, determinism or
+range check fails; `--allow-fallback` turns the GEMM path requirement off.
+
 Without a GPU: `make -C rrc cuda-objs CUDA_HOME=...` compiles every `.cu` (CI);
 `rrc/tools/fetch_cuda_toolkit.sh DEST` assembles a compile-only CUDA 12.9 toolkit from pinned
 PyPI wheels and conda packages (not needed for the CPU build; not run by tests). `make -C rrc test`
 also runs the kernel bodies, the GEMM plan and the selftest harness on CPU through the host
-emulation backend (`build/rrc_selftest_host`); `make -C rrc asan` runs the C tests under
-AddressSanitizer + UBSan.
+emulation backend (`build/rrc_selftest_host`); with `CUDA_HOME` set it also builds the real
+`cuda/*.cu` sources with g++ against a fake CUDA runtime and runs them on host threads
+(`make -C rrc cuda-host-test`, HOST-ONLY: no GPU, no real cuBLASLt); `make -C rrc asan` runs the
+C tests (and, with `CUDA_HOME`, that host build) under AddressSanitizer + UBSan.

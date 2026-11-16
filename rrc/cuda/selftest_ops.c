@@ -1095,8 +1095,9 @@ done:
 static void test_sum_squares(st *t) {
     if (!want(t, "sum_squares")) return;
     op_begin(t, "sum_squares");
-    static const int64_t ns[] = {1, 255, 4095, 4097, 100003};
-    for (int i = 0; i < 5; i++)
+    /* (1 << 20) + 4097: 257 partials, more than the 256 lanes of the final block (its lane loop wraps) */
+    static const int64_t ns[] = {1, 255, 4095, 4097, 100003, ((int64_t)1 << 20) + 4097};
+    for (int i = 0; i < 6; i++)
         for (int c = 0; c < 3; c++) {
             qcase k = {ns[i], (c & 1) ? RRC_BF16 : RRC_F32, c == 2, NULL, 1.5f};
             k.x = hrand(t, k.n, 1.0f, k.dt);

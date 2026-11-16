@@ -44,8 +44,8 @@ struct cuda_be {
     rrc_cuda_err *err_host; // pinned
     void *scratch;
     size_t scratch_bytes;
-    float *ss_part;
-    int64_t ss_part_n;
+    void *ss_part; // sum_squares partials (f32)
+    size_t ss_part_bytes;
     lt_entry cache[LT_CACHE];
     int cache_next;
     int have_rep;
@@ -158,7 +158,9 @@ rrc_status cb_memset0(const rrc_backend *be, void *ptr, size_t bytes) {
 }
 rrc_status cb_sync(const rrc_backend *be) { return sync_and_check(CB(be)); }
 
-// Grow a backend-owned device buffer (waits for the stream before freeing the old one).
+// Grow a backend-owned device buffer (waits for the stream before freeing the old one). `buf` and
+// `have` must be the owning members: on any failure after the old buffer is freed they are left
+// as (NULL, 0), so no dangling pointer survives.
 rrc_status grow(cuda_be *c, void **buf, size_t *have, size_t need, const char *what) {
     if (need <= *have) return RRC_OK;
     CU(cudaStreamSynchronize(c->stream), what);
@@ -226,28 +228,32 @@ rrc_status make_layout(cublasLtMatrixLayout_t *l, rrc_dtype dt, int64_t rows, in
     return RRC_OK;
 }
 
-// Build descriptors and query the heuristic for one column-major call; e->ok = an algorithm exists.
-rrc_status entry_build(cuda_be *c, const rrc_lt_call *call, lt_entry *e) {
-    const rrc_kc_lt_p *p = &call->p;
-    e->used = 1;
-    e->key = make_key(call);
-    const cublasComputeType_t ct = call->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    LT(cublasLtMatmulDescCreate(&e->desc, ct, CUDA_R_32F), "matmul desc");
-    cublasOperation_t ta = p->transa ? CUBLAS_OP_T : CUBLAS_OP_N, tb = p->transb ? CUBLAS_OP_T : CUBLAS_OP_N;
-    LT(cublasLtMatmulDescSetAttribute(e->desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta), "transa");
-    LT(cublasLtMatmulDescSetAttribute(e->desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb), "transb");
-    RRC_CHECK(make_layout(&e->la, p->adt, p->transa ? p->k : p->m, p->transa ? p->m : p->k, p->lda, p->batch, p->sa));
-    RRC_CHECK(make_layout(&e->lb, p->bdt, p->transb ? p->n : p->k, p->transb ? p->k : p->n, p->ldb, p->batch, p->sb));
-    RRC_CHECK(make_layout(&e->lc, p->cdt, p->m, p->n, p->ldc, p->batch, p->sc));
+// An algorithm whose partial sums (if any) are reduced in the compute type (fp32).
+bool algo_reduces_fp32(const cublasLtMatmulAlgo_t *algo) {
+    int32_t splitk = 1;
+    uint32_t scheme = CUBLASLT_REDUCTION_SCHEME_NONE;
+    size_t w = 0;
+    if (cublasLtMatmulAlgoConfigGetAttribute(algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof splitk, &w) !=
+        CUBLAS_STATUS_SUCCESS)
+        return false;
+    if (splitk <= 1) return true;
+    if (cublasLtMatmulAlgoConfigGetAttribute(algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &scheme, sizeof scheme, &w) !=
+        CUBLAS_STATUS_SUCCESS)
+        return false;
+    return scheme == CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+}
+
+// One heuristic query for e's descriptors; *found = an acceptable algorithm was stored in e->algo.
+// NOT_SUPPORTED, no result or failed result states are not errors (the ladder moves on).
+rrc_status lt_query(cuda_be *c, const rrc_lt_call *call, lt_entry *e, bool fp32_mask, bool *found) {
+    *found = false;
     cublasLtMatmulPreference_t pref;
     LT(cublasLtMatmulPreferenceCreate(&pref), "preference");
     uint64_t ws = c->ws_bytes;
-    // INPLACE / OUTPUT_TYPE split-K reductions accumulate in the output type (bf16 for a bf16 C):
-    // only reductions in the compute type (fp32) are allowed, so the result is rounded once.
     uint32_t red = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
     uint32_t aa = call->align_a, ab = call->align_b, ac = call->align_c;
     cublasStatus_t st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof ws);
-    if (st == CUBLAS_STATUS_SUCCESS)
+    if (st == CUBLAS_STATUS_SUCCESS && fp32_mask)
         st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof red);
     if (st == CUBLAS_STATUS_SUCCESS)
         st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &aa, sizeof aa);
@@ -261,14 +267,45 @@ rrc_status entry_build(cuda_be *c, const rrc_lt_call *call, lt_entry *e) {
         cublasLtMatmulPreferenceDestroy(pref);
         return RRC_ERROR(RRC_ERR_BACKEND, "cublasLt: preference attribute: status %d", (int)st);
     }
-    cublasLtMatmulHeuristicResult_t res;
-    memset(&res, 0, sizeof res);
+    enum { NREQ = 8 };
+    cublasLtMatmulHeuristicResult_t res[NREQ];
+    memset(res, 0, sizeof res);
     int nres = 0;
-    st = cublasLtMatmulAlgoGetHeuristic(c->lt, e->desc, e->la, e->lb, e->lc, e->lc, pref, 1, &res, &nres);
+    st = cublasLtMatmulAlgoGetHeuristic(c->lt, e->desc, e->la, e->lb, e->lc, e->lc, pref, fp32_mask ? 1 : NREQ, res, &nres);
     cublasLtMatmulPreferenceDestroy(pref);
-    // NOT_SUPPORTED, no result or a failed result state: not an error, the ladder moves on
-    e->ok = st == CUBLAS_STATUS_SUCCESS && nres > 0 && res.state == CUBLAS_STATUS_SUCCESS;
-    if (e->ok) e->algo = res.algo;
+    if (st != CUBLAS_STATUS_SUCCESS) return RRC_OK;
+    for (int i = 0; i < nres && i < NREQ; i++)
+        if (res[i].state == CUBLAS_STATUS_SUCCESS && (fp32_mask || algo_reduces_fp32(&res[i].algo))) {
+            e->algo = res[i].algo;
+            *found = true;
+            break;
+        }
+    return RRC_OK;
+}
+
+// Build descriptors and query the heuristic for one column-major call; e->ok = an algorithm exists.
+rrc_status entry_build(cuda_be *c, const rrc_lt_call *call, lt_entry *e) {
+    const rrc_kc_lt_p *p = &call->p;
+    e->used = 1;
+    e->key = make_key(call);
+    const cublasComputeType_t ct = call->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    LT(cublasLtMatmulDescCreate(&e->desc, ct, CUDA_R_32F), "matmul desc");
+    cublasOperation_t ta = p->transa ? CUBLAS_OP_T : CUBLAS_OP_N, tb = p->transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    LT(cublasLtMatmulDescSetAttribute(e->desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta), "transa");
+    LT(cublasLtMatmulDescSetAttribute(e->desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb), "transb");
+    RRC_CHECK(make_layout(&e->la, p->adt, p->transa ? p->k : p->m, p->transa ? p->m : p->k, p->lda, p->batch, p->sa));
+    RRC_CHECK(make_layout(&e->lb, p->bdt, p->transb ? p->n : p->k, p->transb ? p->k : p->n, p->ldb, p->batch, p->sb));
+    RRC_CHECK(make_layout(&e->lc, p->cdt, p->m, p->n, p->ldc, p->batch, p->sc));
+    // INPLACE / OUTPUT_TYPE split-K reductions accumulate in the output type (bf16 for a bf16 C):
+    // only reductions in the compute type (fp32) are allowed, so the result is rounded once.
+    // First query: REDUCTION_SCHEME_MASK = COMPUTE_TYPE. cublasLt.h does not say whether such a
+    // mask (no bit for NONE = 0) still admits the non-split-K algorithms; if that query finds
+    // nothing, a second one with the default mask takes the first of up to 8 results whose own
+    // configuration is non-split (SPLITK_NUM <= 1) or reduces in the compute type.
+    bool found = false;
+    RRC_CHECK(lt_query(c, call, e, true, &found));
+    if (!found) RRC_CHECK(lt_query(c, call, e, false, &found));
+    e->ok = found ? 1 : 0;
     return RRC_OK;
 }
 
@@ -316,11 +353,11 @@ rrc_status ex_lt_run(void *ctx, const rrc_lt_call *call) {
 }
 rrc_status ex_kernel_run(void *ctx, const rrc_kc_lt_p *p) {
     cuda_be *c = (cuda_be *)ctx;
-    return after(c, rrc_cu_lt_matmul(c->stream, p), "gemm kernel");
+    return after(c, rrc_cu_lt_matmul(c->stream, c->o.max_grid_blocks, p), "gemm kernel");
 }
 rrc_status ex_convert(void *ctx, const rrc_kc_conv2d_p *p) {
     cuda_be *c = (cuda_be *)ctx;
-    return after(c, rrc_cu_conv2d(c->stream, p), "gemm convert");
+    return after(c, rrc_cu_conv2d(c->stream, c->o.max_grid_blocks, p), "gemm convert");
 }
 const rrc_gemm_exec_ops k_ops = {ex_scratch, ex_supported, ex_lt_run, ex_kernel_run, ex_convert};
 
@@ -342,38 +379,38 @@ rrc_status cb_embedding_fwd(const rrc_backend *be, int64_t n_tokens, int64_t dim
                             rrc_buf table, rrc_buf out) {
     cuda_be *c = CB(be);
     rrc_kc_embed_p p = {n_tokens, dim, vocab, (const int32_t *)ids.ptr, table.ptr, table.dtype, out.ptr, out.dtype};
-    return after(c, rrc_cu_embedding(c->stream, &p, c->err_dev), "embedding_fwd");
+    return after(c, rrc_cu_embedding(c->stream, c->o.max_grid_blocks, &p, c->err_dev), "embedding_fwd");
 }
 rrc_status cb_add_bias(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf x, int64_t ldx, rrc_buf bias) {
     cuda_be *c = CB(be);
     rrc_kc_bias_p p = {rows, cols, ldx, x.ptr, x.dtype, bias.ptr, bias.dtype, 0};
-    return after(c, rrc_cu_add_bias(c->stream, &p), "add_bias");
+    return after(c, rrc_cu_add_bias(c->stream, c->o.max_grid_blocks, &p), "add_bias");
 }
 rrc_status cb_bias_grad(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf dy, int64_t ldy, rrc_buf dbias,
                         int accumulate) {
     cuda_be *c = CB(be);
     rrc_kc_bias_p p = {rows, cols, ldy, dy.ptr, dy.dtype, dbias.ptr, dbias.dtype, accumulate};
-    return after(c, rrc_cu_bias_grad(c->stream, &p), "bias_grad");
+    return after(c, rrc_cu_bias_grad(c->stream, c->o.max_grid_blocks, &p), "bias_grad");
 }
 rrc_status cb_rmsnorm_fwd(const rrc_backend *be, int64_t rows, int64_t dim, int64_t ld, rrc_buf x, rrc_buf w, float eps,
                           rrc_buf y) {
     cuda_be *c = CB(be);
     rrc_kc_rmsnorm_p p = {rows, dim, ld, x.ptr, x.dtype, w.ptr, w.dtype, NULL, RRC_F32, y.ptr, y.dtype, eps, 0};
-    return after(c, rrc_cu_rmsnorm_fwd(c->stream, &p), "rmsnorm_fwd");
+    return after(c, rrc_cu_rmsnorm_fwd(c->stream, c->o.max_grid_blocks, &p), "rmsnorm_fwd");
 }
 rrc_status cb_rmsnorm_bwd(const rrc_backend *be, int64_t rows, int64_t dim, int64_t ld, rrc_buf x, rrc_buf w, float eps,
                           rrc_buf dy, rrc_buf dx, int accumulate) {
     cuda_be *c = CB(be);
     rrc_kc_rmsnorm_p p = {rows, dim, ld, x.ptr, x.dtype, w.ptr, w.dtype, dy.ptr, dy.dtype, dx.ptr, dx.dtype, eps,
                           accumulate};
-    return after(c, rrc_cu_rmsnorm_bwd(c->stream, &p), "rmsnorm_bwd");
+    return after(c, rrc_cu_rmsnorm_bwd(c->stream, c->o.max_grid_blocks, &p), "rmsnorm_bwd");
 }
 rrc_status cb_rope(const rrc_backend *be, int64_t n_tokens, int64_t n_heads, int64_t head_dim, int64_t ld, rrc_buf x,
                    rrc_buf pos, rrc_buf cos_tab, rrc_buf sin_tab, int64_t n_pos, rrc_buf y, int backward) {
     cuda_be *c = CB(be);
     rrc_kc_rope_p p = {n_tokens, n_heads, head_dim, ld, n_pos, x.ptr, x.dtype, y.ptr, y.dtype, (const int32_t *)pos.ptr,
                        (const float *)cos_tab.ptr, (const float *)sin_tab.ptr, backward};
-    return after(c, rrc_cu_rope(c->stream, &p, c->err_dev), backward ? "rope_bwd" : "rope_fwd");
+    return after(c, rrc_cu_rope(c->stream, c->o.max_grid_blocks, &p, c->err_dev), backward ? "rope_bwd" : "rope_fwd");
 }
 rrc_status cb_rope_fwd(const rrc_backend *be, int64_t n_tokens, int64_t n_heads, int64_t head_dim, int64_t ld, rrc_buf x,
                        rrc_buf pos, rrc_buf cos_tab, rrc_buf sin_tab, int64_t n_pos, rrc_buf y) {
@@ -389,43 +426,43 @@ rrc_status cb_softmax_fwd(const rrc_backend *be, int64_t batch, int64_t rows, in
     cuda_be *c = CB(be);
     rrc_kc_softmax_p q = {batch, rows, cols, ld, batch_stride, row_offset, s.ptr, s.dtype, NULL, RRC_F32, p.ptr,
                           p.dtype, scale, causal, rrc_buf_is_none(doc_ids) ? NULL : (const int32_t *)doc_ids.ptr};
-    return after(c, rrc_cu_softmax_fwd(c->stream, &q), "attn_softmax_fwd");
+    return after(c, rrc_cu_softmax_fwd(c->stream, c->o.max_grid_blocks, &q), "attn_softmax_fwd");
 }
 rrc_status cb_softmax_bwd(const rrc_backend *be, int64_t batch, int64_t rows, int64_t cols, int64_t ld,
                           int64_t batch_stride, rrc_buf p, rrc_buf dp, float scale, rrc_buf ds) {
     cuda_be *c = CB(be);
     rrc_kc_softmax_p q = {batch, rows, cols, ld, batch_stride, 0, p.ptr, p.dtype, dp.ptr, dp.dtype, ds.ptr, ds.dtype,
                           scale, 0, NULL};
-    return after(c, rrc_cu_softmax_bwd(c->stream, &q), "attn_softmax_bwd");
+    return after(c, rrc_cu_softmax_bwd(c->stream, c->o.max_grid_blocks, &q), "attn_softmax_bwd");
 }
 rrc_status cb_swiglu_fwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf gate, rrc_buf up, int64_t ld_in,
                          rrc_buf h, int64_t ld_out) {
     cuda_be *c = CB(be);
     rrc_kc_swiglu_p p = {rows, cols, ld_in, 0, ld_out, gate.ptr, gate.dtype, up.ptr, up.dtype, NULL, RRC_F32,
                          h.ptr, h.dtype, NULL, RRC_F32};
-    return after(c, rrc_cu_swiglu_fwd(c->stream, &p), "swiglu_fwd");
+    return after(c, rrc_cu_swiglu_fwd(c->stream, c->o.max_grid_blocks, &p), "swiglu_fwd");
 }
 rrc_status cb_swiglu_bwd(const rrc_backend *be, int64_t rows, int64_t cols, rrc_buf gate, rrc_buf up, int64_t ld_in,
                          rrc_buf dh, int64_t ld_dh, rrc_buf dgate, rrc_buf dup, int64_t ld_out) {
     cuda_be *c = CB(be);
     rrc_kc_swiglu_p p = {rows, cols, ld_in, ld_dh, ld_out, gate.ptr, gate.dtype, up.ptr, up.dtype, dh.ptr, dh.dtype,
                          dgate.ptr, dgate.dtype, dup.ptr, dup.dtype};
-    return after(c, rrc_cu_swiglu_bwd(c->stream, &p), "swiglu_bwd");
+    return after(c, rrc_cu_swiglu_bwd(c->stream, c->o.max_grid_blocks, &p), "swiglu_bwd");
 }
 rrc_status cb_add(const rrc_backend *be, int64_t n, rrc_buf a, rrc_buf b, rrc_buf out) {
     cuda_be *c = CB(be);
     rrc_kc_ew_p p = {n, 0.0f, a.ptr, a.dtype, b.ptr, b.dtype, out.ptr, out.dtype};
-    return after(c, rrc_cu_add(c->stream, &p), "add");
+    return after(c, rrc_cu_add(c->stream, c->o.max_grid_blocks, &p), "add");
 }
 rrc_status cb_axpy(const rrc_backend *be, int64_t n, float alpha, rrc_buf x, rrc_buf y) {
     cuda_be *c = CB(be);
     rrc_kc_ew_p p = {n, alpha, x.ptr, x.dtype, NULL, RRC_F32, y.ptr, y.dtype};
-    return after(c, rrc_cu_axpy(c->stream, &p), "axpy");
+    return after(c, rrc_cu_axpy(c->stream, c->o.max_grid_blocks, &p), "axpy");
 }
 rrc_status cb_scale(const rrc_backend *be, int64_t n, float alpha, rrc_buf x) {
     cuda_be *c = CB(be);
     rrc_kc_ew_p p = {n, alpha, NULL, RRC_F32, NULL, RRC_F32, x.ptr, x.dtype};
-    return after(c, rrc_cu_scale(c->stream, &p), "scale");
+    return after(c, rrc_cu_scale(c->stream, c->o.max_grid_blocks, &p), "scale");
 }
 rrc_status cb_convert(const rrc_backend *be, int64_t n, rrc_buf src, rrc_buf dst) {
     cuda_be *c = CB(be);
@@ -437,32 +474,30 @@ rrc_status cb_convert(const rrc_backend *be, int64_t n, rrc_buf src, rrc_buf dst
                      "convert (copy)");
     }
     rrc_kc_ew_p p = {n, 0.0f, src.ptr, src.dtype, NULL, RRC_F32, dst.ptr, dst.dtype};
-    return after(c, rrc_cu_convert(c->stream, &p), "convert");
+    return after(c, rrc_cu_convert(c->stream, c->o.max_grid_blocks, &p), "convert");
 }
 rrc_status cb_sum_squares(const rrc_backend *be, int64_t n, rrc_buf x, rrc_buf out, int accumulate) {
     cuda_be *c = CB(be);
     const int64_t nc = rrc_kc_ss_chunks(n);
-    size_t have = (size_t)c->ss_part_n * sizeof(float);
-    void *buf = c->ss_part;
-    RRC_CHECK(grow(c, &buf, &have, (size_t)(nc > 0 ? nc : 1) * sizeof(float), "sum_squares partials"));
-    c->ss_part = (float *)buf;
-    c->ss_part_n = (int64_t)(have / sizeof(float));
-    rrc_kc_ss_p p = {n, x.ptr, x.dtype, c->ss_part, (float *)out.ptr, accumulate};
-    return after(c, rrc_cu_sum_squares(c->stream, &p), "sum_squares");
+    // grow() updates the members themselves: after a failed growth they are (NULL, 0), never a
+    // freed pointer with its old capacity
+    RRC_CHECK(grow(c, &c->ss_part, &c->ss_part_bytes, (size_t)(nc > 0 ? nc : 1) * sizeof(float), "sum_squares partials"));
+    rrc_kc_ss_p p = {n, x.ptr, x.dtype, (float *)c->ss_part, (float *)out.ptr, accumulate};
+    return after(c, rrc_cu_sum_squares(c->stream, c->o.max_grid_blocks, &p), "sum_squares");
 }
 rrc_status cb_xent(const rrc_backend *be, int64_t rows, int64_t vocab, rrc_buf logits, int64_t ld, rrc_buf labels,
                    rrc_buf loss, float grad_scale, rrc_buf row_scale, int write_grad) {
     cuda_be *c = CB(be);
     rrc_kc_xent_p p = {rows, vocab, ld, logits.ptr, logits.dtype, (const int32_t *)labels.ptr, (float *)loss.ptr,
                        rrc_buf_is_none(row_scale) ? NULL : (const float *)row_scale.ptr, grad_scale, write_grad};
-    return after(c, rrc_cu_xent(c->stream, &p, c->err_dev), "cross_entropy_fwd_bwd");
+    return after(c, rrc_cu_xent(c->stream, c->o.max_grid_blocks, &p, c->err_dev), "cross_entropy_fwd_bwd");
 }
 rrc_status cb_adamw(const rrc_backend *be, int64_t n, rrc_buf param, rrc_buf grad, rrc_buf m, rrc_buf v,
                     const rrc_adamw_hparams *h) {
     cuda_be *c = CB(be);
     rrc_kc_adamw_p p = {n, (float *)param.ptr, (const float *)grad.ptr, (float *)m.ptr, (float *)v.ptr,
                         rrc_kc_adamw_prepare(h->lr, h->beta1, h->beta2, h->eps, h->weight_decay, h->step, h->grad_scale)};
-    return after(c, rrc_cu_adamw(c->stream, &p), "adamw_step");
+    return after(c, rrc_cu_adamw(c->stream, c->o.max_grid_blocks, &p), "adamw_step");
 }
 
 void release(cuda_be *c) {
