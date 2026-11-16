@@ -235,6 +235,202 @@ static void t_harness_through_backend(void) {
            s1.lt_matmuls - s0.lt_matmuls);
 }
 
+static const rrc_backend *make_be_staging(size_t bytes, int slots, int sync_each) {
+    rrc_cuda_options o;
+    rrc_cuda_options_default(&o);
+    o.h2d_staging_bytes = bytes;
+    o.h2d_staging_slots = slots;
+    o.sync_each_op = sync_each;
+    const rrc_backend *be = NULL;
+    if (rrc_cuda_backend_create_ex(0, &o, &be) != RRC_OK) {
+        fprintf(stderr, "cannot create the CUDA backend on the fake runtime: %s\n", rrc_last_error());
+        exit(2);
+    }
+    return be;
+}
+
+/* Uploads `nb` buffers of the given sizes from ONE host array that is overwritten right after each
+ * memcpy_h2d returns (the contract: the source may be reused on return), without any sync in
+ * between, then downloads and compares. With the fake's lazy host->device copies (fake_cuda.h), a
+ * copy that still read the caller's source, or a staging slot overwritten before the copy out of
+ * it completed, delivers wrong bytes. Returns the number of wrong elements. */
+static long upload_burst(const rrc_backend *be, const int64_t *sizes, int nb, rrc_fake_stats *mid) {
+    rrc_buf bufs[16];
+    int64_t maxn = 0;
+    for (int i = 0; i < nb; i++) maxn = sizes[i] > maxn ? sizes[i] : maxn;
+    float *src = (float *)malloc((size_t)maxn * sizeof(float)), *got = (float *)malloc((size_t)maxn * sizeof(float));
+    long bad = 0;
+    if (!src || !got || nb > 16) {
+        free(src);
+        free(got);
+        return -1;
+    }
+    for (int i = 0; i < nb; i++) {
+        if (rrc_buf_alloc(be, RRC_F32, sizes[i], &bufs[i]) != RRC_OK) {
+            bad = -1;
+            nb = i;
+            break;
+        }
+    }
+    for (int i = 0; bad == 0 && i < nb; i++) {
+        for (int64_t j = 0; j < sizes[i]; j++) src[j] = (float)(1000 * i + j);
+        if (rrc_buf_upload(bufs[i], src, sizes[i]) != RRC_OK) bad = -1;
+        for (int64_t j = 0; j < maxn; j++) src[j] = -7.0f; /* reuse the source at once */
+    }
+    if (mid) rrc_fake_get_stats(mid);
+    for (int i = 0; bad >= 0 && i < nb; i++) {
+        if (rrc_buf_download(bufs[i], got, sizes[i]) != RRC_OK) {
+            bad = -1;
+            break;
+        }
+        for (int64_t j = 0; j < sizes[i]; j++) bad += got[j] != (float)(1000 * i + j);
+    }
+    for (int i = 0; i < nb; i++) rrc_buf_free(&bufs[i]);
+    free(src);
+    free(got);
+    return bad;
+}
+
+/* memcpy_h2d through the pinned staging ring (DESIGN.md §15.3): correct data with the source
+ * reused at once, chunking of large copies through a small ring that wraps several times, no full
+ * stream synchronize, no pageable async copy, stream order with ops in between, and the fallbacks
+ * (ring disabled, pinned allocation failure, sync_each_op). */
+static void t_h2d_staging_ring(void) {
+    static const int64_t sizes[] = {37, 1000, 5, 64, 64, 65, 3, 700, 1, 129}; /* floats; slot = 64 floats */
+    const int nb = (int)(sizeof sizes / sizeof sizes[0]);
+    int64_t chunks = 0;
+    for (int i = 0; i < nb; i++) chunks += (sizes[i] * 4 + 255) / 256;
+    rrc_fake_stats f0, f1, f2;
+    rrc_cuda_stats cs;
+    /* 4 slots x 256 bytes */
+    const rrc_backend *be = make_be_staging(1024, 4, 0);
+    OK(rrc_cuda_stats_get(be, &cs));
+    EXPECT(cs.staging_bytes == 1024 && cs.staging_slots == 4, "ring %zu bytes, %d slots", cs.staging_bytes, cs.staging_slots);
+    OK(rrc_cuda_stats_reset(be));
+    rrc_fake_get_stats(&f0);
+    long bad = upload_burst(be, sizes, nb, &f1);
+    rrc_fake_get_stats(&f2);
+    OK(rrc_cuda_stats_get(be, &cs));
+    EXPECT(bad == 0, "%ld wrong elements after staged uploads", bad);
+    EXPECT(f1.h2d_pending > 0, "the fake deferred the last copies (%ld pending): the check is not vacuous", f1.h2d_pending);
+    EXPECT(f1.stream_syncs == f0.stream_syncs, "%ld stream synchronizes during the uploads (want 0)",
+           f1.stream_syncs - f0.stream_syncs);
+    EXPECT(f1.event_syncs > f0.event_syncs, "the ring wrapped and waited on slot events (%ld)", f1.event_syncs - f0.event_syncs);
+    EXPECT(f2.h2d_pageable == f0.h2d_pageable, "%ld async copies from pageable memory", f2.h2d_pageable - f0.h2d_pageable);
+    EXPECT(cs.h2d_calls == nb && cs.h2d_staged_chunks == chunks && cs.h2d_direct == 0,
+           "calls %lld (want %d), chunks %lld (want %lld), direct %lld", (long long)cs.h2d_calls, nb,
+           (long long)cs.h2d_staged_chunks, (long long)chunks, (long long)cs.h2d_direct);
+    EXPECT(cs.h2d_slot_waits == chunks - 4, "slot waits %lld (want %lld)", (long long)cs.h2d_slot_waits,
+           (long long)(chunks - 4));
+
+    /* stream order with ops in between: y = 2 x1 + 2 x2, x re-uploaded into the same buffer */
+    {
+        const int64_t n = 300;
+        float *h = (float *)malloc((size_t)n * sizeof(float)), *y = (float *)malloc((size_t)n * sizeof(float));
+        rrc_buf xb, yb;
+        OK(rrc_buf_alloc(be, RRC_F32, n, &xb));
+        OK(rrc_buf_alloc(be, RRC_F32, n, &yb));
+        for (int64_t j = 0; j < n; j++) h[j] = (float)j;
+        OK(rrc_buf_upload(xb, h, n));
+        OK(rrc_axpy(be, n, 2.0f, xb, yb));
+        for (int64_t j = 0; j < n; j++) h[j] = (float)(3 * j);
+        OK(rrc_buf_upload(xb, h, n));
+        for (int64_t j = 0; j < n; j++) h[j] = -1.0f;
+        OK(rrc_axpy(be, n, 2.0f, xb, yb));
+        OK(rrc_buf_download(yb, y, n));
+        long wrong = 0;
+        for (int64_t j = 0; j < n; j++) wrong += y[j] != (float)(8 * j);
+        EXPECT(wrong == 0, "%ld wrong elements of y = 2 x1 + 2 x2", wrong);
+        rrc_buf_free(&xb);
+        rrc_buf_free(&yb);
+        free(h);
+        free(y);
+    }
+    rrc_cuda_backend_destroy(be);
+
+    /* ring disabled: every upload is copy + stream synchronize */
+    be = make_be_staging(0, 4, 0);
+    rrc_fake_get_stats(&f0);
+    bad = upload_burst(be, sizes, nb, &f1);
+    OK(rrc_cuda_stats_get(be, &cs));
+    EXPECT(bad == 0 && cs.staging_bytes == 0 && cs.h2d_direct == nb && cs.h2d_staged_chunks == 0,
+           "disabled ring: %ld wrong, direct %lld", bad, (long long)cs.h2d_direct);
+    EXPECT(f1.stream_syncs - f0.stream_syncs == nb, "disabled ring: %ld syncs (want %d)", f1.stream_syncs - f0.stream_syncs, nb);
+    rrc_cuda_backend_destroy(be);
+
+    /* pinned allocation failure at creation: the backend works without the ring */
+    rrc_fake_fail_host_alloc_after(1); /* the error flag's pinned word first, then the ring */
+    be = make_be_staging(1024, 4, 0);
+    bad = upload_burst(be, sizes, nb, NULL);
+    OK(rrc_cuda_stats_get(be, &cs));
+    EXPECT(bad == 0 && cs.staging_bytes == 0 && cs.h2d_direct == nb, "pinned failure: %ld wrong, ring %zu bytes", bad,
+           cs.staging_bytes);
+    rrc_cuda_backend_destroy(be);
+    rrc_fake_fail_host_alloc_after(-1);
+
+    /* sync_each_op: the ring is used and every upload also synchronizes */
+    be = make_be_staging(1024, 4, 1);
+    rrc_fake_get_stats(&f0);
+    bad = upload_burst(be, sizes, nb, &f1);
+    EXPECT(bad == 0 && f1.stream_syncs - f0.stream_syncs >= nb, "sync_each_op: %ld wrong, %ld syncs", bad,
+           f1.stream_syncs - f0.stream_syncs);
+    rrc_cuda_backend_destroy(be);
+    rrc_fake_get_stats(&f2);
+    EXPECT(f2.h2d_pending == 0 && f2.host_allocs_live == 0, "after destroy: %ld copies pending, %ld pinned blocks live",
+           f2.h2d_pending, f2.host_allocs_live);
+}
+
+/* Memory counters, GEMM tally and census of the backend. */
+static void t_stats_and_census(void) {
+    const rrc_backend *be = make_be(0, 0);
+    rrc_cuda_stats s;
+    OK(rrc_cuda_stats_get(be, &s));
+    const size_t internal0 = s.internal_bytes;
+    EXPECT(s.alloc_bytes == 0 && internal0 >= ((size_t)32 << 20), "fresh backend: alloc %zu, internal %zu", s.alloc_bytes,
+           internal0);
+    rrc_buf a, b, c;
+    OK(rrc_buf_alloc(be, RRC_F32, 1000, &a));
+    OK(rrc_buf_alloc(be, RRC_F32, 24 * 16, &b));
+    OK(rrc_buf_alloc(be, RRC_F32, 1000, &c));
+    OK(rrc_cuda_stats_get(be, &s));
+    EXPECT(s.alloc_bytes == 4 * (2000 + 384) && s.alloc_peak_bytes == s.alloc_bytes && s.n_allocs == 3,
+           "alloc %zu peak %zu n %lld", s.alloc_bytes, s.alloc_peak_bytes, (long long)s.n_allocs);
+    OK(rrc_cuda_gemm_census_enable(be, 1));
+    OK(rrc_gemm2d(be, RRC_OP_N, RRC_OP_N, 10, 16, 24, 1.0f, a, 24, b, 16, 0.0f, c, 16));
+    OK(rrc_gemm2d(be, RRC_OP_N, RRC_OP_N, 10, 16, 24, 1.0f, a, 24, b, 16, 1.0f, c, 16));
+    OK(rrc_gemm2d(be, RRC_OP_N, RRC_OP_T, 10, 10, 24, 1.0f, a, 24, a, 24, 0.0f, c, 10));
+    OK(rrc_sync(be));
+    OK(rrc_cuda_stats_get(be, &s));
+    EXPECT(s.gemm_calls[0][0] == 3 && s.gemm_flops[0][0] == 2.0 * (2 * 10 * 16 * 24 + 10 * 10 * 24),
+           "tally f32 level 0: %lld calls, %g flops", (long long)s.gemm_calls[0][0], s.gemm_flops[0][0]);
+    rrc_cuda_gemm_shape sh[4];
+    int64_t dropped = -1;
+    size_t ne = rrc_cuda_gemm_census_get(be, sh, 4, &dropped);
+    EXPECT(ne == 2 && dropped == 0 && sh[0].calls == 2 && sh[0].m == 10 && sh[0].n == 16 && sh[0].k == 24 &&
+               sh[1].calls == 1 && sh[1].trans_b == 1 && sh[0].level == 0 && sh[0].path[0],
+           "census: %zu entries, first %lld calls", ne, ne ? (long long)sh[0].calls : -1LL);
+    rrc_buf_free(&a);
+    OK(rrc_cuda_stats_get(be, &s));
+    EXPECT(s.alloc_bytes == 4 * (1000 + 384) && s.alloc_peak_bytes == 4 * (2000 + 384) && s.n_frees == 1,
+           "after a free: alloc %zu peak %zu", s.alloc_bytes, s.alloc_peak_bytes);
+    OK(rrc_cuda_stats_reset(be));
+    OK(rrc_cuda_stats_get(be, &s));
+    EXPECT(s.alloc_peak_bytes == s.alloc_bytes && s.gemm_calls[0][0] == 0 && rrc_cuda_gemm_census_get(be, NULL, 0, NULL) == 0,
+           "reset: peak %zu, calls %lld", s.alloc_peak_bytes, (long long)s.gemm_calls[0][0]);
+    rrc_cuda_timer *tm = NULL;
+    OK(rrc_cuda_timer_create(be, 2, &tm));
+    float ms = -1.0f;
+    OK(rrc_cuda_timer_mark(tm, 0));
+    OK(rrc_cuda_timer_mark(tm, 1));
+    OK(rrc_cuda_timer_elapsed_ms(tm, 0, 1, &ms));
+    EXPECT(ms >= 0.0f, "timer %g ms", (double)ms);
+    EXPECT(rrc_cuda_build_is_host_shim() == 1, "the HOST-ONLY build says so");
+    rrc_cuda_timer_destroy(tm);
+    rrc_buf_free(&b);
+    rrc_buf_free(&c);
+    rrc_cuda_backend_destroy(be);
+}
+
 typedef struct {
     const char *name;
     void (*fn)(void);
@@ -246,6 +442,8 @@ int main(int argc, char **argv) {
         {"sum_squares_grow_failure", t_sum_squares_grow_failure},
         {"error_flag_op_and_index", t_error_flag_op_and_index},
         {"reduction_scheme_fallback", t_reduction_scheme_fallback},
+        {"h2d_staging_ring", t_h2d_staging_ring},
+        {"stats_and_census", t_stats_and_census},
         {"harness_through_backend", t_harness_through_backend},
     };
     int n_run = 0, n_failed = 0;

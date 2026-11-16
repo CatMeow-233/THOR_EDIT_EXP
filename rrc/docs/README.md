@@ -8,7 +8,7 @@ driver `rrc_train` with its data tools (stage B, model line); the CUDA backend a
 DESIGN.md §13); and their tests.
 
 Status: the CPU parts are **TESTED (CPU)**. Everything that runs on a GPU (the CUDA backend,
-`rrc_selftest`, `rrc_train_cuda`) is **COMPILED-ONLY** (no GPU in the development environment);
+`rrc_selftest`, `rrc_train_cuda`, `rrc_bench`) is **COMPILED-ONLY** (no GPU in the development environment);
 parts of it are additionally exercised **HOST-ONLY** on a fake CUDA runtime (see the CUDA line
 section). Nothing here makes a performance claim; every performance figure is NOT_TESTED.
 
@@ -22,12 +22,13 @@ section). Nothing here makes a performance claim; every performance figure is NO
 ## Build
 
 ```sh
-make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_train, rrc_data, rrc_census (CPU backend)
+make -C rrc cpu                 # build/librrc.a, rrc_inspect, rrc_fwdbwd, rrc_train, rrc_data, rrc_census (CPU backend),
+                                #   rrc_selftest_host and rrc_bench_host (host builds of the GPU tools, smoke only)
 make -C rrc test                # build and run the C unit tests (build/rrc_tests), then the model /
                                 # train suites on the off-device test backend (rrc_tests --offdev)
 make -C rrc test CUDA_HOME=/usr/local/cuda        # + nvcc compile check of all headers (sm_120)
 make -C rrc test RRC_NVCC=/path/to/bin/nvcc       # same, with an explicit nvcc
-make -C rrc cuda CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_120   # librrc_cuda.a, rrc_selftest, rrc_train_cuda
+make -C rrc cuda CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_120   # librrc_cuda.a, rrc_selftest, rrc_train_cuda, rrc_bench
 make -C rrc cuda-objs CUDA_HOME=/usr/local/cuda  # compile cuda/*.cu only (no link; CI)
 make -C rrc clean
 ```
@@ -123,6 +124,18 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   transformers for tiny variants, refusals, and `build/rrc_train`'s memory pre-flight refusing a run
   over a small fake budget. The C suite `census` checks the dry run against a real CPU run of tiny
   models (identical GEMM sequence, FLOPs, peak bytes, layout).
+* `rrc/tests/test_gpu_tools_smoke.py` — smoke tests of the GPU first-run tools on CPU (DESIGN.md
+  §15): the `rrc_selftest --report` JSON (through `rrc_selftest_host`: end-to-end PASS, op passes
+  and GEMM paths, a recorded FAIL from the fault device), `rrc_bench_host` argument errors and JSON
+  shape (status "smoke", no timing claims), `bench/torch_baseline.py --device cpu` for one step on a
+  tiny model with gradient checkpointing on and off (non-zero LoRA gradient, the same JSON keys,
+  tokens per step and trainable parameter count as rrc_bench). Not benchmarks.
+* `make test` also runs the end-to-end checks of `rrc_selftest_host` (kc-emu, tiny llama / qwen2 /
+  qwen3 models written in C, logits, loss, LoRA grads, a 20-step trainer run, determinism; JSON
+  report in `build/test_tmp/selftest_host_report.json`) and their two controls: the `jitter`
+  device (correct, rounds differently) must PASS, the `fault` device (attention backward off by
+  1e-3) must FAIL. With `CUDA_HOME` the HOST-ONLY part adds the staging-ring tests, the end-to-end
+  checks through the real `cuda/*.cu` (tiny qwen3) and `rrc_bench`'s CUDA main on the fake runtime.
 * `make -C rrc asan` — `make test` under AddressSanitizer + UBSan (build/asan): the C tests,
   `rrc_selftest_host` and its negative checks, and with `CUDA_HOME` the HOST-ONLY `cuda-host-test`.
 * `make -C rrc tsan` — the `data` and `train` C suites (prefetch thread next to the training loop)
@@ -332,6 +345,8 @@ machine add `"backend": "cuda"` and run `rrc/build/rrc_train_cuda`; COMPILED-ONL
 | `include/rrc/census.h`, `src/census.c`, `src/rrc_census.c` | GEMM census + memory of one step by a dry run; presets; `build/rrc_census`; the trainer's memory pre-flight uses it |
 | `tools/prepare_sft.py` | JSONL -> `.rrcbin` with a local tokenizer |
 | `tools/torch_reference.py` | PyTorch + PEFT reference training loop and the packing spec in Python (tests) |
+| `cuda/selftest_e2e.{h,c}` | end-to-end checks of a device backend: tiny checkpoints written in C, logits / loss / LoRA grads / training / determinism vs cpu-f32acc (DESIGN.md §15.1) |
+| `bench/rrc_bench.c`, `bench/torch_baseline.py`, `bench/README.md` | training-step benchmark (cudaEvent timing, JSON), the PyTorch + PEFT baseline with the same keys, the commands for the first GPU run (DESIGN.md §15.4, §15.5) |
 
 ## CUDA line (stage B, COMPILED-ONLY)
 
@@ -340,10 +355,19 @@ frozen op table with cuBLASLt GEMMs and item-body kernels. It has been compiled 
 never executed (no GPU here). On the GPU machine:
 
 ```sh
-make -C rrc cuda CUDA_HOME=/usr/local/cuda      # build/librrc_cuda.a, build/rrc_selftest (ARCH=sm_120 default)
-rrc/build/rrc_selftest                          # every op vs the CPU backend; exit 0 = PASS
+make -C rrc cuda CUDA_HOME=/usr/local/cuda      # build/librrc_cuda.a, rrc_selftest, rrc_train_cuda, rrc_bench (ARCH=sm_120 default)
+rrc/build/rrc_selftest --report selftest.json   # every op vs the CPU backend, then the end-to-end checks; exit 0 = PASS
 rrc/build/rrc_train_cuda --config train.json    # rrc_train with "backend": "cuda" available
+rrc/build/rrc_bench --model /models/x --seq-len 2048 --out bench.json   # cudaEvent-timed training steps (JSON)
 ```
+
+The complete first-run procedure (build, selftest with report, rrc_bench and the PyTorch baseline
+in the same configurations, what to send back) is [bench/README.md](../bench/README.md); the design
+is DESIGN.md §15. `rrc_selftest` options added there: `--report FILE` (one JSON document, rewritten
+after every stage), `--no-e2e`, `--only e2e`, `--e2e-size full|quick|tiny`, `--e2e-steps N`,
+`--e2e-filter family/dtype`, `--e2e-dir DIR`, `--e2e-keep`. The backend's `memcpy_h2d` stages
+through a pinned ring and returns without a stream synchronize (`RRC_CUDA_H2D_STAGING_BYTES=0`
+restores copy + synchronize).
 
 `rrc_selftest` fails (exit 1) if the dense aligned GEMM cases do not reach cuBLASLt (natively for
 f32/f32/f32, bf16/bf16/f32, bf16/bf16/bf16), if no check ran, or if any value, determinism or

@@ -119,8 +119,21 @@ static void op_begin(st *t, const char *op) {
     t->op_checks = t->op_fail = 0;
     t->op_worst = t->op_abs = t->op_rel = 0.0;
 }
+static void note(char (*notes)[200], int *n, const char *what) {
+    if (*n < RRC_ST_MAX_NOTES) snprintf(notes[*n], 200, "%s", what);
+    (*n)++;
+}
 static void op_end(st *t) {
     if (t->op_checks == 0) return;
+    if (t->res->n_ops < RRC_ST_MAX_OPS) {
+        rrc_st_op_summary *os = &t->res->ops[t->res->n_ops++];
+        snprintf(os->op, sizeof os->op, "%s", t->op);
+        os->cases = t->op_checks;
+        os->failures = t->op_fail;
+        os->max_abs = t->op_abs;
+        os->max_rel = t->op_rel;
+        os->worst_ratio = t->op_worst;
+    }
     fprintf(t->out, "  %-22s %4d cases  max_abs %-9.3g max_rel %-9.3g worst err/tol %-9.3g %s\n", t->op, t->op_checks,
             t->op_abs, t->op_rel, t->op_worst, t->op_fail ? "FAIL" : "PASS");
 }
@@ -221,6 +234,11 @@ static void check(st *t, const char *name, int cls, double n_red, const double *
     if (worst > t->op_worst) t->op_worst = worst;
     if (max_abs > t->op_abs) t->op_abs = max_abs;
     if (max_rel > t->op_rel) t->op_rel = max_rel;
+    if (fail || det_fail) {
+        char nb[200];
+        snprintf(nb, sizeof nb, "%.150s%s: err/tol %.3g", name, det_fail ? " (nondeterministic)" : "", worst);
+        note(t->res->fail_notes, &t->res->n_fail_notes, nb);
+    }
     if (fail || det_fail || t->o->verbose) {
         fprintf(t->out, "    %s %-6s %s  max_abs %.3g  max_rel %.3g  err/tol %.3g%s%s%s\n",
                 fail ? "FAIL" : "PASS", k_cls_name[cls], name, max_abs, max_rel, worst,
@@ -260,6 +278,10 @@ static void range_check(st *t, const char *name, badfn f, const void *ctx) {
     if (!ok) {
         t->res->range_failures++;
         t->op_fail++;
+        char nb[200];
+        snprintf(nb, sizeof nb, "range error %.100s: ref %s, dev %s, sync afterwards %s", name, rrc_status_str(sr),
+                 rrc_status_str(sd), rrc_status_str(after));
+        note(t->res->fail_notes, &t->res->n_fail_notes, nb);
     }
     if (!ok || t->o->verbose)
         fprintf(t->out, "    %s RANGE  %s: ref %s, dev %s (reported by the %s), sync afterwards %s\n      dev message: %s\n",
@@ -327,6 +349,7 @@ static double *gemm_mag(const gcase *g) {
 
 enum { L_PLAIN = 0, L_BATCH, L_BCAST_A, L_BCAST_B, L_INTERLEAVE_C, L_MISALIGNED, L_FUSED, L_ALIGNED, L_N };
 static const char *k_layout[] = {"plain", "batched", "bcastA", "bcastB", "interleavedC", "misaligned", "fusedAC", "aligned"};
+const char *rrc_st_layout_name(int l) { return l >= 0 && l < L_N ? k_layout[l] : NULL; }
 
 static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, int64_t k, int layout, rrc_dtype da,
                       rrc_dtype db, rrc_dtype dc, float beta) {
@@ -394,6 +417,7 @@ static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, i
             if (level == 2) {
                 if (t->n_kernel_cases < 40) fprintf(t->out, "    note: kernel GEMM (no cuBLASLt algorithm): %s\n", name);
                 t->n_kernel_cases++;
+                note(t->res->kernel_notes, &t->res->n_kernel_notes, name);
             }
             if (t->o->require_lt && layout == L_ALIGNED) {
                 /* natively supported triples: f32 f32 f32 (bit 0), bf16 bf16 f32 (6), bf16 bf16 bf16 (7) */
@@ -405,6 +429,9 @@ static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, i
                     t->op_fail++;
                     fprintf(t->out, "    FAIL PATH   %s: path '%s' (level %d), required %s\n", name, path, level,
                             native ? "level 0 (native cuBLASLt)" : "a cuBLASLt level (0 or 1), not the kernel fallback");
+                    char nb[200];
+                    snprintf(nb, sizeof nb, "gemm path: %.150s ran at level %d", name, level);
+                    note(t->res->fail_notes, &t->res->n_fail_notes, nb);
                 }
             }
         }
@@ -1333,6 +1360,11 @@ int rrc_st_run(const rrc_backend *dev, const rrc_backend *ref, const rrc_st_opts
     test_sum_squares(&t);
     test_cross_entropy(&t);
     test_adamw(&t);
+    memcpy(t.res->gemm_paths, t.paths, sizeof t.paths);
+    memcpy(t.res->gemm_tally, t.tally, sizeof t.tally);
+    t.res->gemm_cases = t.n_gemm_cases;
+    t.res->gemm_chunked_cases = t.n_chunked_cases;
+    t.res->gemm_kernel_cases = t.n_kernel_cases;
     fprintf(t.out, "summary: %d value checks (%d failed), %d determinism checks (%d failed), %d range-error checks (%d "
                    "failed), %d gemm path checks (%d failed)\n",
             t.res->checks, t.res->failures, t.res->det_checks, t.res->det_failures, t.res->range_checks,
