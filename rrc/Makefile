@@ -121,6 +121,13 @@ test: cpu $(TEST_BIN) $(SELFTEST_HOST)
 	RRC_TEST_TMPDIR=$(BUILD)/test_tmp $(TEST_BIN)
 	$(SELFTEST_HOST) --backend emu --deferred --quick > $(BUILD)/test_tmp/selftest_host.log || { cat $(BUILD)/test_tmp/selftest_host.log; exit 1; }
 	@tail -n 1 $(BUILD)/test_tmp/selftest_host.log
+	@# negative checks of the program's exit status: no cuBLASLt (simulated: every triple refused) and
+	@# an --only filter matching nothing must both fail
+	@if $(SELFTEST_HOST) --quick --only gemm --reject-mask 0xFF > $(BUILD)/test_tmp/selftest_reject.log; then \
+	  echo "rrc_selftest_host: PASS with every GEMM on the kernel fallback (must FAIL)"; exit 1; fi
+	@if $(SELFTEST_HOST) --only nonexistent_op > $(BUILD)/test_tmp/selftest_nomatch.log; then \
+	  echo "rrc_selftest_host: PASS with no check run (must FAIL)"; exit 1; fi
+	@echo "rrc_selftest_host negative checks: OK (kernel-only GEMM and an empty --only run both fail)"
 ifneq ($(strip $(NVCC)),)
 	@$(MAKE) --no-print-directory nvcc-check
 else

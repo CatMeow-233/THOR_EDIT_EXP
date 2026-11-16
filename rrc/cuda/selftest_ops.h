@@ -33,6 +33,15 @@ typedef struct rrc_st_opts {
     int strict;      /* GEMM, swiglu, bias_grad compared bitwise (dev uses the CPU's arithmetic: kc-emu) */
     FILE *out;       /* NULL: stdout */
     const char *only; /* run only ops whose name contains this substring (NULL: all) */
+    /* GEMM path requirement (needs gemm_path; set by rrc_selftest unless the ladder is forced to
+     * start above level 0 or --allow-fallback is given): the dense aligned case of every dtype
+     * combination must not run on the kernel fallback, and that of the natively supported triples
+     * (f32 f32 f32, bf16 bf16 f32, bf16 bf16 bf16) must run at level 0. A violation is a failure
+     * (path_failures): a broken cuBLASLt integration must not pass as the naive kernel GEMM. */
+    int require_lt;
+    /* at least one GEMM case must have run in more than one scratch chunk (needs gemm_path; the
+     * pass with a small scratch cap, which must exercise the multi-chunk path) */
+    int require_chunked;
     /* describes the path of dev's most recent gemm into buf; returns 0 if unknown */
     int (*gemm_path)(const rrc_backend *dev, char *buf, size_t n);
 } rrc_st_opts;
@@ -41,9 +50,11 @@ typedef struct rrc_st_result {
     int checks, failures;
     int det_checks, det_failures;
     int range_checks, range_failures;
+    int path_checks, path_failures; /* GEMM path requirements (require_lt) */
 } rrc_st_result;
 
-/* Returns the number of failed checks (0 = all PASS). */
+/* Returns the number of failed checks (0 = all PASS). A run in which no check ran at all (e.g. an
+ * `only` filter matching no op) counts as one failure. */
 int rrc_st_run(const rrc_backend *dev, const rrc_backend *ref, const rrc_st_opts *o, rrc_st_result *res);
 
 #ifdef __cplusplus

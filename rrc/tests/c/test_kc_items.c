@@ -28,6 +28,7 @@ static int emu_path(const rrc_backend *be, char *buf, size_t n) {
 }
 
 /* Run the harness, its log goes to a file that is printed on failure. */
+static int g_require_lt = 0; /* rrc_st_opts.require_lt for the next harness() calls */
 static void harness(const rrc_backend *dev, const char *only, const char *log) {
     FILE *f = fopen(rt_path(log), "w+");
     RT_ASSERT(f, "cannot open %s", rt_path(log));
@@ -39,6 +40,7 @@ static void harness(const rrc_backend *dev, const char *only, const char *log) {
     o.only = only;
     o.gemm_path = rrc_backend_is_emu(dev) ? emu_path : NULL;
     o.strict = rrc_backend_is_emu(dev); /* bitwise for GEMM (all paths), swiglu and bias_grad */
+    o.require_lt = g_require_lt;
     rrc_st_result r;
     int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), &o, &r);
     RT_EXPECT(fails == 0, "%s: %d failed checks (log: %s)", dev->name, fails, rt_path(log));
@@ -63,7 +65,71 @@ RT_TEST(emu_vs_cpu_all_ops) {
     eo.seed = 1234;
     const rrc_backend *emu = NULL;
     RT_OK(rrc_emu_backend_create(&eo, &emu));
+    g_require_lt = 1; /* every aligned case reaches the (simulated) library, as rrc_selftest requires */
     harness(emu, NULL, "selftest_emu.log");
+    g_require_lt = 0;
+    rrc_emu_backend_destroy(emu);
+}
+
+/* Run the harness quietly (log to a file) and return its failure count and result. */
+static int harness_quiet(const rrc_backend *dev, rrc_st_opts *o, const char *log, rrc_st_result *r) {
+    FILE *f = fopen(rt_path(log), "w");
+    if (!f) return -1;
+    o->out = f;
+    int fails = rrc_st_run(dev, rrc_backend_cpu_f32acc(), o, r);
+    fclose(f);
+    return fails;
+}
+
+/* rrc_selftest must not PASS when cuBLASLt is never used (every GEMM on the kernel fallback, as
+ * with a misconfigured heuristic) or when a natively supported triple is not run natively; nor
+ * when nothing was checked at all (an --only filter matching no op). Regressions: both passed. */
+RT_TEST(harness_fails_on_fallback_and_empty_runs) {
+    rrc_emu_options eo;
+    rrc_emu_options_default(&eo);
+    eo.lt_reject_mask = 0xFFu; /* the simulated library refuses every type triple */
+    const rrc_backend *emu = NULL;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    rrc_st_opts o;
+    memset(&o, 0, sizeof o);
+    o.seed = 7;
+    o.quick = 1;
+    o.only = "gemm";
+    o.gemm_path = emu_path;
+    o.strict = 1;
+    o.require_lt = 1;
+    rrc_st_result r;
+    int fails = harness_quiet(emu, &o, "selftest_reject_all.log", &r);
+    RT_EXPECT(fails > 0 && r.failures == 0 && r.path_failures >= 9,
+              "all GEMMs on the kernel level: %d fails, %d value failures, %d path failures (log %s)", fails, r.failures,
+              r.path_failures, rt_path("selftest_reject_all.log"));
+    o.require_lt = 0; /* opt-in: forced/simulated fallbacks without the requirement still pass */
+    fails = harness_quiet(emu, &o, "selftest_reject_all_allowed.log", &r);
+    RT_EXPECT(fails == 0 && r.path_checks == 0, "without require_lt: %d fails", fails);
+    rrc_emu_backend_destroy(emu);
+    /* bf16 x bf16 -> f32 refused natively: correct via promote-all, but required at level 0 */
+    eo.lt_reject_mask = 1u << 6;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    o.require_lt = 1;
+    fails = harness_quiet(emu, &o, "selftest_reject_bbf.log", &r);
+    RT_EXPECT(fails > 0 && r.failures == 0 && r.path_failures == 1, "native triple at promote-all: %d fails, %d path failures",
+              fails, r.path_failures);
+    /* the multi-chunk requirement: the default cap never chunks these cases, a tiny cap does */
+    o.require_lt = 0;
+    o.require_chunked = 1;
+    fails = harness_quiet(emu, &o, "selftest_chunk_default.log", &r);
+    RT_EXPECT(fails == 1 && r.path_failures == 1, "default cap: nothing chunked must fail (%d)", fails);
+    rrc_emu_backend_destroy(emu);
+    rrc_emu_options_default(&eo);
+    eo.scratch_cap_elems = 40;
+    RT_OK(rrc_emu_backend_create(&eo, &emu));
+    fails = harness_quiet(emu, &o, "selftest_chunk_capped.log", &r);
+    RT_EXPECT(fails == 0, "40-float cap chunks: %d fails", fails);
+    /* a filter matching no op */
+    memset(&o, 0, sizeof o);
+    o.only = "nonexistent_op";
+    fails = harness_quiet(emu, &o, "selftest_no_match.log", &r);
+    RT_EXPECT(fails > 0 && r.checks == 0 && r.range_checks == 0, "no check ran: %d fails", fails);
     rrc_emu_backend_destroy(emu);
 }
 
@@ -208,5 +274,6 @@ const rt_case rt_suite_kc_items[] = {
     RT_CASE(emu_range_items_write_nothing),
     RT_CASE(tree_order_fixed),
     RT_CASE(emu_xent_nan_propagates),
+    RT_CASE(harness_fails_on_fallback_and_empty_runs),
 };
 const size_t rt_suite_kc_items_n = sizeof rt_suite_kc_items / sizeof rt_suite_kc_items[0];

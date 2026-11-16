@@ -25,6 +25,7 @@ typedef struct st {
     /* gemm path tally per layout (level 0 / 1 / 2) and the cases that ran at the kernel level */
     int tally[8][3];
     int n_kernel_cases;
+    int n_gemm_cases, n_chunked_cases;
     char paths[8][160]; /* gemm paths seen per (a, b, c) dtype triple */
 } st;
 
@@ -388,9 +389,23 @@ static void gemm_case(st *t, rrc_trans ta, rrc_trans tb, int64_t m, int64_t n, i
             if (layout == L_PLAIN && !t->paths[bit][0]) snprintf(t->paths[bit], sizeof t->paths[bit], "%s", path);
             int level = !strncmp(path, "kernel", 6) ? 2 : (!strncmp(path, "promote-all", 11) ? 1 : 0);
             t->tally[layout][level]++;
+            t->n_gemm_cases++;
+            if (strstr(path, "chunks")) t->n_chunked_cases++;
             if (level == 2) {
                 if (t->n_kernel_cases < 40) fprintf(t->out, "    note: kernel GEMM (no cuBLASLt algorithm): %s\n", name);
                 t->n_kernel_cases++;
+            }
+            if (t->o->require_lt && layout == L_ALIGNED) {
+                /* natively supported triples: f32 f32 f32 (bit 0), bf16 bf16 f32 (6), bf16 bf16 bf16 (7) */
+                const int native = bit == 0 || bit == 6 || bit == 7;
+                const int ok = native ? level == 0 : level < 2;
+                t->res->path_checks++;
+                if (!ok) {
+                    t->res->path_failures++;
+                    t->op_fail++;
+                    fprintf(t->out, "    FAIL PATH   %s: path '%s' (level %d), required %s\n", name, path, level,
+                            native ? "level 0 (native cuBLASLt)" : "a cuBLASLt level (0 or 1), not the kernel fallback");
+                }
             }
         }
     } else {
@@ -437,6 +452,23 @@ static void test_gemm(st *t) {
                     t->tally[l][2]);
         if (t->n_kernel_cases)
             fprintf(t->out, "  %d gemm cases ran on the kernel fallback (correct, but not cuBLASLt)\n", t->n_kernel_cases);
+        fprintf(t->out, "  %d of %d gemm cases ran in more than one scratch chunk\n", t->n_chunked_cases, t->n_gemm_cases);
+        if (t->o->require_lt && t->n_gemm_cases > 0) {
+            int lt_cases = 0;
+            for (int l = 0; l < L_N; l++) lt_cases += t->tally[l][0] + t->tally[l][1];
+            t->res->path_checks++;
+            if (lt_cases == 0) {
+                t->res->path_failures++;
+                fprintf(t->out, "  FAIL PATH   no gemm case reached cuBLASLt (every case ran on the kernel fallback)\n");
+            }
+        }
+        if (t->o->require_chunked) {
+            t->res->path_checks++;
+            if (t->n_chunked_cases == 0) {
+                t->res->path_failures++;
+                fprintf(t->out, "  FAIL PATH   no gemm case ran in more than one scratch chunk (the capped pass tested nothing)\n");
+            }
+        }
     }
 }
 
@@ -804,7 +836,11 @@ static void test_softmax(st *t) {
         if (!want(t, op)) continue;
         op_begin(t, op);
         for (int ci = 0; ci < 2; ci++)
-            for (int c = 0; c < 8; c++) {
+            for (int c = 0; c < 11; c++) {
+                /* c 8..10: -inf scores (about 10%, one row of all -inf, -inf on the causal diagonal of
+                 * every third row, so row 0 of a causal case has only -inf allowed): f32 causal, bf16
+                 * causal, f32 non-causal */
+                const int ninf = c >= 8;
                 scase k;
                 memset(&k, 0, sizeof k);
                 k.batch = 2;
@@ -814,13 +850,13 @@ static void test_softmax(st *t) {
                 k.bs = k.rows * k.ld + 7;
                 k.bwd = bwd;
                 k.scale = 0.125f;
-                k.causal = c & 1;
-                k.docs = (c >> 1) & 1;
-                k.row_offset = (c & 4) ? k.cols - 2 : 0; /* rows with q >= cols */
+                k.causal = ninf ? c != 10 : c & 1;
+                k.docs = ninf ? 0 : (c >> 1) & 1;
+                k.row_offset = !ninf && (c & 4) ? k.cols - 2 : 0; /* rows with q >= cols */
                 k.sdt = k.pdt = k.dpdt = RRC_F32;
-                if (c == 2 || c == 3) k.sdt = k.pdt = k.dpdt = RRC_BF16;
+                if (c == 2 || c == 3 || c == 9) k.sdt = k.pdt = k.dpdt = RRC_BF16;
                 if (c == 5) k.pdt = RRC_BF16; /* f32 in, bf16 out (fwd) / bf16 p (bwd) */
-                if (c >= 6) k.alias = bwd ? (c == 6 ? 1 : 2) : 1;
+                if (c >= 6 && c < 8) k.alias = bwd ? (c == 6 ? 1 : 2) : 1;
                 if (bwd && k.alias == 2) k.dpdt = k.pdt;
                 if (bwd && k.alias == 1) k.sdt = k.dpdt; /* ds has dp's dtype */
                 if (bwd && k.alias == 2) k.sdt = k.pdt;
@@ -833,6 +869,13 @@ static void test_softmax(st *t) {
                 k.ndoc = k.row_offset + k.rows > k.cols ? k.row_offset + k.rows : k.cols;
                 k.doc = (int32_t *)malloc((size_t)k.ndoc * sizeof(int32_t));
                 if (k.s && k.dp && k.ds && k.p && k.doc) {
+                    if (ninf) {
+                        for (int64_t i = 0; i < n; i++)
+                            if (rnext(t) % 10 == 0) k.s[i] = -INFINITY;
+                        for (int64_t j = 0; j < k.cols; j++) k.s[k.ld + j] = -INFINITY; /* batch 0, row 1: all -inf */
+                        for (int64_t b = 0; b < k.batch; b++)
+                            for (int64_t r = 0; r < k.rows && r < k.cols; r += 3) k.s[b * k.bs + r * k.ld + r] = -INFINITY;
+                    }
                     for (int64_t i = 0; i < k.ndoc; i++) k.doc[i] = (int32_t)(i / 7);
                     if (k.docs && k.row_offset) k.doc[k.row_offset + 4] = 1000; /* q >= cols, unique doc: no allowed key */
                     if (bwd) { /* a valid probability layout: p = softmax of random scores */
@@ -842,7 +885,7 @@ static void test_softmax(st *t) {
                                 double z = 0.0;
                                 float *row = k.p + b * k.bs + r * k.ld;
                                 for (int64_t j = 0; j < k.cols; j++) z += row[j] = expf(k.s[b * k.bs + r * k.ld + j]);
-                                for (int64_t j = 0; j < k.cols; j++) row[j] = (float)(row[j] / z);
+                                for (int64_t j = 0; j < k.cols; j++) row[j] = z > 0.0 ? (float)(row[j] / z) : 0.0f;
                             }
                         if (k.pdt == RRC_BF16)
                             for (int64_t i = 0; i < n; i++) k.p[i] = rrc_round_bf16(k.p[i]);
@@ -852,11 +895,12 @@ static void test_softmax(st *t) {
                             for (int64_t i = 0; i < n; i++) k.p[i] = rrc_round_bf16(k.p[i]);
                     }
                     char name[200];
-                    snprintf(name, sizeof name, "%s s %s p %s dp %s batch=%lld rows=%lld cols=%lld ld=%lld%s%s%s%s", op,
+                    snprintf(name, sizeof name, "%s s %s p %s dp %s batch=%lld rows=%lld cols=%lld ld=%lld%s%s%s%s%s", op,
                              dn(k.sdt), dn(k.pdt), dn(k.dpdt), (long long)k.batch, (long long)k.rows,
                              (long long)k.cols, (long long)k.ld, k.causal ? " causal" : "", k.docs ? " docs" : "",
                              k.row_offset ? " row_offset" : "",
-                             k.alias ? (bwd ? (k.alias == 1 ? " ds=dp" : " ds=p") : " in-place") : "");
+                             k.alias ? (bwd ? (k.alias == 1 ? " ds=dp" : " ds=p") : " in-place") : "",
+                             ninf ? (bwd ? " p from -inf scores" : " -inf scores") : "");
                     outspec os = {1, {{n, bwd ? k.sdt : k.pdt}}};
                     if (!bwd && k.alias) os.s[0].dt = k.sdt;
                     check(t, name, CLS_REDUCE, (double)k.cols, NULL, 0, run_softmax, &k, &os);
@@ -1289,8 +1333,15 @@ int rrc_st_run(const rrc_backend *dev, const rrc_backend *ref, const rrc_st_opts
     test_cross_entropy(&t);
     test_adamw(&t);
     fprintf(t.out, "summary: %d value checks (%d failed), %d determinism checks (%d failed), %d range-error checks (%d "
-                   "failed)\n",
+                   "failed), %d gemm path checks (%d failed)\n",
             t.res->checks, t.res->failures, t.res->det_checks, t.res->det_failures, t.res->range_checks,
-            t.res->range_failures);
-    return t.res->failures + t.res->det_failures + t.res->range_failures;
+            t.res->range_failures, t.res->path_checks, t.res->path_failures);
+    int fails = t.res->failures + t.res->det_failures + t.res->range_failures + t.res->path_failures;
+    if (t.res->checks + t.res->range_checks == 0) {
+        /* e.g. --only with a typo: nothing was tested, which must not read as a pass */
+        fprintf(t.out, "FAIL: no check ran%s%s%s\n", t.o->only ? " (--only '" : "", t.o->only ? t.o->only : "",
+                t.o->only ? "' matches no op)" : "");
+        fails++;
+    }
+    return fails;
 }
