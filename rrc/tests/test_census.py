@@ -86,6 +86,11 @@ def test_preset_report_fields_and_flops(preset, census):
     assert g["flops_total"] == sum(want.values())
     assert sum(x["flops"] for x in g["by_combo"]) == g["flops_total"]
     assert 0.0 < g["native_bf16_fraction"] <= g["native_fraction"] <= 1.0
+    # every GEMM against a frozen base weight is on a native bf16 x bf16 plan path (after §13's fix)
+    for role in ("base_fwd", "base_dx", "lm_head_fwd", "lm_head_dx"):
+        assert roles[role]["non_native_calls"] == 0, role
+        assert roles[role]["flops_native_bf16"] == roles[role]["flops"], role
+    assert g["base_weight"]["non_native_calls"] == 0
     mem = d["memory"]
     parts = ["weights_bytes", "rope_tables_bytes", "lora_params_grads_bytes", "adam_bytes", "workspace_bytes"]
     assert sum(mem[k] for k in parts) == mem["op_table_peak_bytes"]

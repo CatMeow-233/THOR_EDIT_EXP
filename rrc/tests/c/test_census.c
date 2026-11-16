@@ -411,7 +411,7 @@ RT_TEST(census_dryrun_matches_cpu_run) {
 
 /* ---- 8B shapes: every base-weight GEMM on a native bf16 path ----------------------------------- */
 
-RT_TEST(census_8b_presets_base_weight_gemms) {
+RT_TEST(census_8b_presets_base_weight_gemms_native) {
     RT_ASSERT(rrc_census_num_presets() == 3, "three presets");
     static const double lo[] = {8.0e9, 7.4e9, 7.9e9}, hi[] = {8.4e9, 7.8e9, 8.2e9};
     for (size_t i = 0; i < rrc_census_num_presets(); i++) {
@@ -448,8 +448,10 @@ RT_TEST(census_8b_presets_base_weight_gemms) {
             if (rrc_census_role_is_base(ro)) {
                 RT_EXPECT(calls == want[ro], "%s %s: %lld GEMMs, expected %lld", p->name, rrc_census_role_name(ro),
                           (long long)calls, (long long)want[ro]);
-                (void)non_native;
-                (void)non_bf16;
+                RT_EXPECT(non_native == 0 && non_bf16 == 0,
+                          "%s %s: %lld of %lld base-weight GEMMs are not on the native bf16 path (f32 bf16 f32: %lld)",
+                          p->name, rrc_census_role_name(ro), (long long)non_bf16, (long long)calls,
+                          (long long)r->cell[ro][rrc_census_combo(RRC_F32, RRC_BF16, RRC_F32)].calls);
             } else if (ro == RRC_CR_LORA) {
                 /* LoRA stays fp32 like PEFT: never a bf16 x bf16 GEMM */
                 RT_EXPECT(calls > 0 && r->cell[ro][6].calls == 0 && r->cell[ro][7].calls == 0,
@@ -556,7 +558,7 @@ RT_TEST(census_refusals) {
 
 const rt_case rt_suite_census[] = {
     RT_CASE(census_dryrun_memory_and_transfers), RT_CASE(census_dryrun_gemm_plan_paths),
-    RT_CASE(census_dryrun_matches_cpu_run),      RT_CASE(census_8b_presets_base_weight_gemms),
+    RT_CASE(census_dryrun_matches_cpu_run),      RT_CASE(census_8b_presets_base_weight_gemms_native),
     RT_CASE(census_json_fields),                 RT_CASE(census_refusals),
 };
 const size_t rt_suite_census_n = sizeof rt_suite_census / sizeof rt_suite_census[0];

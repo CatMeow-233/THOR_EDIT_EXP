@@ -422,17 +422,21 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
    weights; one-off A/B, not a test): llama3_rope 0.00794 → 0.00750, qwen2_tied 0.00877 → 0.00820,
    qwen3_hd32_bias 0.01008 → 0.00976 (HF-bf16 itself: 0.00952, 0.00999, 0.01088). A small,
    consistent gain at this size; at long sequences the number of dK/dV accumulations grows with
-   T / chunk, which is the reason to keep them (not measured at that size). They make the device
-   GEMM see f32 A operands for the dK/dV input-gradient GEMMs (item 4). The LoRA branch follows PEFT: the bf16
+   T / chunk, which is the reason to keep them (not measured at that size). The input-gradient GEMMs
+   through the frozen k_proj / v_proj weights read a copy of dK / dV rounded once to bf16, so they
+   run bf16 x bf16 -> f32 like every other base-weight GEMM (§13 item 3; before that they promoted
+   the weight to f32 on the device). The LoRA branch follows PEFT: the bf16
    input is widened exactly to fp32 by the GEMM (`t` is fp32), and `y += s · t Bᵀ` is one GEMM with
    `alpha = s`, `beta = 1` into the base output, rounded once (PEFT: fp32 sum of the bf16 base result
    and the fp32 LoRA term, then one cast). Biases are added after the base GEMM and before LoRA.
 4. **GEMM dtype combinations issued** (A, B, C), recorded by `model.model_gemm_dtype_combinations`:
    f32 model: only (f32, f32, f32); bf16 model: (bf16, bf16, bf16) base linears, LM head and its
-   input gradient, dact/dob; (bf16, bf16, f32) scores, dP, input gradients into `dxn`; (bf16, f32,
-   f32) LoRA `t`, `dB`, `dt` from a bf16 dy; (f32, bf16, bf16) P·V and dQ; (f32, bf16, f32) dK, dV,
-   input gradients of dK/dV into `dxn`, `dA`; (f32, f32, bf16) LoRA `y += s t Bᵀ`, LoRA `dx` into a
-   bf16 gradient; (f32, f32, f32) the rest of the LoRA backward. (bf16, f32, bf16) is never used.
+   input gradient, dact/dob; (bf16, bf16, f32) scores, dP, the base-weight input gradients into
+   `dxn` (q, gate/up, and k/v from the bf16 copy of dK/dV, §13); (bf16, f32, f32) LoRA `t`, `dB`,
+   `dt` from a bf16 dy; (f32, bf16, bf16) P·V and dQ; (f32, bf16, f32) dK, dV, `dA`; (f32, f32,
+   bf16) LoRA `y += s t Bᵀ`, LoRA `dx` into a bf16 gradient; (f32, f32, f32) the rest of the LoRA
+   backward (including dB / dt of k_proj / v_proj from the f32 dK / dV). (bf16, f32, bf16) is never
+   used. Which of these the CUDA GEMM plan runs natively is counted by `rrc_census` (§13).
 5. **Attention key range**: a query chunk `[q0, q0 + R)` of a packed row reads keys
    `[k0, q0 + R)` where `k0` is the start of the document of query `q0` (keys before it are masked
    for every query of the chunk), via `row_offset = q0 − k0` and a doc-id view starting at `k0`.
