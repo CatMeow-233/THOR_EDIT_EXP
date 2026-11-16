@@ -736,7 +736,8 @@ RT_TEST(adamw_torch_semantics) {
 
 /* AdamW against torch.optim.AdamW(foreach=False) itself (python3 + torch + safetensors required;
  * skipped with a message otherwise): m and v must be bit-identical; p may differ where torch's
- * vectorized CPU sqrt is not correctly rounded. */
+ * CPU kernels round the update term differently per build / SIMD path (bounded by 8 ulp of the
+ * largest step change per step, plus 2 ulp of the value). */
 static const char *k_py_adamw =
     "import sys, torch\n"
     "from safetensors.torch import save_file\n"
@@ -787,11 +788,20 @@ RT_TEST(adamw_vs_torch) {
             RT_OK(rrc_buf_alloc(be, RRC_F32, n, &v));
             snprintf(key, sizeof key, "%d.grads", ci);
             RT_OK(rrc_st_to_f32(rrc_st_find(set, key), buf, steps * n));
+            /* largest single-step parameter change of this run: the scale of torch's rounding
+             * differences in the update term (its vectorized sqrt / division differ by CPU) */
+            double max_upd = 0;
+            float *prev = rt_download(p, n);
             for (int64_t s = 0; s < steps; s++) {
                 RT_OK(rrc_buf_upload(g, buf + s * n, n));
                 rrc_adamw_hparams h = {cfgs[ci][0], cfgs[ci][1], cfgs[ci][2], cfgs[ci][3], cfgs[ci][4], s + 1, 1.0f};
                 RT_OK(rrc_adamw_step(be, n, p, g, m, v, &h));
+                float *cur = rt_download(p, n);
+                for (int64_t i = 0; i < n; i++) max_upd = fmax(max_upd, fabs((double)cur[i] - prev[i]));
+                free(prev);
+                prev = cur;
             }
+            free(prev);
             const char *names[3] = {"p", "m", "v"};
             rrc_buf bufs[3] = {p, m, v};
             for (int k = 0; k < 3; k++) {
@@ -799,16 +809,25 @@ RT_TEST(adamw_vs_torch) {
                 snprintf(key, sizeof key, "%d.%s", ci, names[k]);
                 RT_OK(rrc_st_to_f32(rrc_st_find(set, key), want[k], n));
                 float *got = rt_download(bufs[k], n);
-                int64_t mism = 0;
-                double maxrel = 0;
+                int64_t mism = 0, over = 0;
+                double maxrel = 0, worst = 0;
                 for (int64_t i = 0; i < n; i++) {
                     if (got[i] != want[k][i]) mism++;
-                    maxrel = fmax(maxrel, fabs((double)got[i] - want[k][i]) / (fabs(want[k][i]) + 1e-30));
+                    double d = fabs((double)got[i] - want[k][i]);
+                    maxrel = fmax(maxrel, d / (fabs(want[k][i]) + 1e-30));
+                    /* p: 2 ulp of the value plus 8 ulp of the largest step change per step. torch's
+                     * CPU kernels round sqrt / division differently per SIMD path (the PyPI CUDA
+                     * wheel and the +cpu wheel on a GitHub runner differ), so p is not bit-exact;
+                     * m and v below must be. */
+                    double tol = 2.0 * ldexp(fabs((double)want[k][i]), -23) + (double)steps * 8.0 * ldexp(max_upd, -24);
+                    if (d > tol) over++;
+                    worst = fmax(worst, d / tol);
                 }
                 if (k == 0)
-                    RT_EXPECT(mism <= n / 100 && maxrel <= 2e-6,
-                              "%s cfg %d: param differs from torch in %lld of %lld elements (max rel %.3g)", be->name,
-                              ci, (long long)mism, (long long)n, maxrel);
+                    RT_EXPECT(over == 0,
+                              "%s cfg %d: param differs from torch beyond the rounding bound in %lld of %lld elements "
+                              "(%lld differ at all, max rel %.3g, worst/tol %.3g)",
+                              be->name, ci, (long long)over, (long long)n, (long long)mism, maxrel, worst);
                 else
                     RT_EXPECT(mism == 0, "%s cfg %d: %s differs from torch in %lld elements (max rel %.3g)", be->name,
                               ci, names[k], (long long)mism, maxrel);
