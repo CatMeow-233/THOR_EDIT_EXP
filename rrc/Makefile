@@ -66,6 +66,8 @@ else ifneq ($(strip $(RRC_NVCC)),)
 CUDA_ROOT := $(abspath $(dir $(RRC_NVCC))/..)
 endif
 NVCC_INC := $(if $(CUDA_ROOT),-I$(CUDA_ROOT)/include)
+# toolkit headers present: the HOST-ONLY cuda-host-test can be built (used by `test`)
+CUDA_HOST_OK := $(if $(CUDA_ROOT),$(wildcard $(CUDA_ROOT)/include/cublasLt.h))
 CUDA_LIBDIR := $(firstword $(wildcard $(CUDA_ROOT)/lib64 $(CUDA_ROOT)/lib))
 NVCCFLAGS ?= -O2
 NVCCFLAGS += -std=c++17 -ccbin $(CC) -arch=$(CUDA_ARCH) -gencode arch=$(CUDA_COMPUTE),code=$(CUDA_COMPUTE) \
@@ -182,7 +184,6 @@ $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 # force-included, linked with a fake CUDA runtime / cuBLASLt stand-in that runs kernel launches on host
 # threads. Needs the toolkit headers only (no nvcc, no CUDA libraries, no GPU). Never part of librrc_cuda.
 CXX_HOST ?= g++
-CUDA_HOST_OK := $(if $(CUDA_ROOT),$(wildcard $(CUDA_ROOT)/include/cublasLt.h))
 SHIM_DIR := $(RRC_DIR)/tests/cuda_host
 SHIM_CXXFLAGS := -std=c++17 -O2 -g -Wall -Wextra -Werror -pthread $(SAN) -DRRC_CUDA_HOST_SHIM \
                  -I$(RRC_DIR)/include -I$(RRC_DIR)/kernels_common -I$(RRC_DIR)/cuda -I$(SHIM_DIR) \
