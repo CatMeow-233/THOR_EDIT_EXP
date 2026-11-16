@@ -160,7 +160,7 @@ $(BUILD)/rrc_selftest: $(BUILD)/obj/cuda_host/selftest.o $(CUDA_LIB) $(LIB)
 
 $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
 # C tests and rrc_selftest_host under AddressSanitizer + UBSan, in a separate build directory.
 asan:
