@@ -10,5 +10,7 @@
 #include "rrc/backend.h"
 #include "rrc/lora.h"
 #include "rrc/model.h"
+#include "rrc/data.h"
+#include "rrc/train.h"
 
 #endif

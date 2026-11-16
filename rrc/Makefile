@@ -22,7 +22,7 @@ CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP $(RRC_SAN_FLAGS)
 LDLIBS   += -fopenmp -lm -lpthread $(RRC_SAN_FLAGS)
 
 LIB_SRCS  := $(wildcard $(RRC_DIR)/src/*.c)
-BIN_NAMES := rrc_inspect rrc_fwdbwd
+BIN_NAMES := rrc_inspect rrc_fwdbwd rrc_train rrc_data
 LIB_SRCS  := $(filter-out $(patsubst %,$(RRC_DIR)/src/%.c,$(BIN_NAMES)),$(LIB_SRCS))
 LIB_OBJS  := $(patsubst $(RRC_DIR)/src/%.c,$(BUILD)/obj/src/%.o,$(LIB_SRCS))
 LIB       := $(BUILD)/librrc.a
