@@ -3,9 +3,11 @@
 #   make cpu                 static library + binaries with the CPU backend
 #   make test                build and run the C unit tests (+ nvcc header check if CUDA is set)
 #   make cuda CUDA_HOME=...  compile cuda/*.cu with nvcc (CUDA_ARCH, default sm_120)
+#   make asan                C tests under AddressSanitizer + UBSan (build/asan)
 #   make clean
 #
-# Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH.
+# Optional variables: CC (default gcc), CUDA_HOME, RRC_NVCC (explicit nvcc path), CUDA_ARCH,
+# RRC_SAN_FLAGS (extra compile + link flags, used by `make asan`).
 
 RRC_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 BUILD   ?= $(RRC_DIR)/build
@@ -16,8 +18,8 @@ endif
 
 CPPFLAGS += -I$(RRC_DIR)/include -I$(RRC_DIR)/kernels_common -D_POSIX_C_SOURCE=200809L
 CFLAGS   ?= -O2
-CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP
-LDLIBS   += -fopenmp -lm -lpthread
+CFLAGS   += -std=c11 -Wall -Wextra -Werror -fopenmp -MMD -MP $(RRC_SAN_FLAGS)
+LDLIBS   += -fopenmp -lm -lpthread $(RRC_SAN_FLAGS)
 
 LIB_SRCS  := $(wildcard $(RRC_DIR)/src/*.c)
 BIN_NAMES := rrc_inspect rrc_fwdbwd
@@ -111,11 +113,11 @@ $(BUILD)/obj/cuda/%.o: $(RRC_DIR)/cuda/%.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # C tests under AddressSanitizer + UndefinedBehaviorSanitizer, built in a separate directory
-# ($(BUILD)/asan); any UBSan report aborts the run. OMP_NUM_THREADS defaults to 2 here.
+# ($(BUILD)/asan) with the normal warning/OpenMP flags plus RRC_SAN_FLAGS; any UBSan report aborts
+# the run. OMP_NUM_THREADS defaults to 2 here.
 ASAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
 asan:
-	@$(MAKE) --no-print-directory BUILD=$(BUILD)/asan CFLAGS="$(ASAN_FLAGS)" \
-	  LDLIBS="$(ASAN_FLAGS) -fopenmp -lm -lpthread" cpu $(BUILD)/asan/rrc_tests
+	@$(MAKE) --no-print-directory BUILD=$(BUILD)/asan RRC_SAN_FLAGS="$(ASAN_FLAGS)" cpu $(BUILD)/asan/rrc_tests
 	@mkdir -p $(BUILD)/asan/test_tmp
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} \
 	  RRC_TEST_TMPDIR=$(BUILD)/asan/test_tmp $(BUILD)/asan/rrc_tests

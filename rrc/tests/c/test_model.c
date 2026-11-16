@@ -568,6 +568,27 @@ RT_TEST(model_zero_labels_and_loss_only) {
     rrc_model_free(m2);
     rrc_lora_free(l);
     rrc_model_free(m);
+    /* load failures release everything (run under make asan): missing directory, a config whose
+     * tensor set does not match the checkpoint, a missing LoRA file */
+    RT_STATUS(rrc_model_load(be, rt_path("no_such_model_dir"), NULL, &m), RRC_ERR_NOT_FOUND);
+    RT_EXPECT(m == NULL, "model pointer set on failure");
+    {
+        char file[1400];
+        snprintf(file, sizeof file, "%s/config.json", dir2);
+        const char *more_layers = "{\"model_type\": \"qwen2\", \"vocab_size\": 24, \"hidden_size\": 16, "
+                                  "\"intermediate_size\": 16, \"num_hidden_layers\": 3, \"num_attention_heads\": 4, "
+                                  "\"num_key_value_heads\": 2, \"max_position_embeddings\": 64}";
+        RT_OK(rrc_write_file_atomic(file, more_layers, strlen(more_layers)));
+        RT_STATUS(rrc_model_load(be, dir2, NULL, &m), RRC_ERR_NOT_FOUND);
+        RT_EXPECT(strstr(rrc_last_error(), "model.layers.2.") != NULL, "%s", rrc_last_error());
+        RT_OK(rrc_write_file_atomic(file, k_cfg_qwen2, strlen(k_cfg_qwen2)));
+        rrc_model_opts_default(&mo);
+        RT_OK(rrc_model_load(be, dir2, &mo, &m2));
+        RT_OK(rrc_lora_create(be, rrc_model_get_config(m2), &lc, &l));
+        RT_STATUS(rrc_lora_load_safetensors(l, rt_path("no_such_lora.safetensors")), RRC_ERR_NOT_FOUND);
+        rrc_lora_free(l);
+        rrc_model_free(m2);
+    }
     /* the model loader refuses an f16 model dtype and a bad chunk size */
     rrc_model_opts_default(&mo);
     mo.dtype = RRC_I32;

@@ -619,6 +619,38 @@ def test_chunking_recompute_and_batch_derivation_invariance(tiny, fwdbwd, tmp_pa
             assert torch.equal(out[k], v), f"{name}: {k}"
 
 
+def test_sharded_bf16_checkpoint_loads_like_single_file(tiny, fwdbwd, tmp_path):
+    """A bf16 checkpoint saved by HF in several shards: loaded as bf16 it is bit-identical to the
+    fp32 single-file checkpoint rounded by the loader (RNE == torch's .to(bfloat16)); loaded as f32 it
+    is bit-identical to an fp32 single-file checkpoint of the bf16-rounded weights."""
+    from transformers import AutoModelForCausalLM
+
+    src = tiny("qwen2_tied")
+    m16 = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16)
+    sharded = tmp_path / "sharded"
+    m16.save_pretrained(sharded, max_shard_size="100KB")
+    assert (
+        len(list(sharded.glob("*.safetensors"))) > 1 and (sharded / "model.safetensors.index.json").is_file()
+    )
+    rounded = tmp_path / "rounded_f32"
+    m16.to(torch.float32).save_pretrained(rounded)
+    pm = peft_model(src, torch.float32, ALL_TARGETS)
+    adapter = write_adapter(pm, tmp_path / "adapter")
+    w = build_window(MAIN_LAYOUT, seed=12)
+    save_batch(w, tmp_path / "batch")
+    for dtype, ref_dir in [("bf16", src), ("f32", rounded)]:
+        a, ma = run_rrc(
+            fwdbwd, sharded, tmp_path / "batch", tmp_path / f"s_{dtype}", lora=adapter, dtype=dtype
+        )
+        b, mb = run_rrc(
+            fwdbwd, ref_dir, tmp_path / "batch", tmp_path / f"r_{dtype}", lora=adapter, dtype=dtype
+        )
+        assert ma["loss"] == mb["loss"], dtype
+        assert set(a) == set(b)
+        for k in a:
+            assert torch.equal(a[k], b[k]), (dtype, k)
+
+
 def test_init_b_zero_and_deterministic(tiny, fwdbwd, tmp_path):
     """Without --lora: A ~ U(-1/sqrt(in), 1/sqrt(in)) from the seeded generator, B = 0; the model
     output equals the base model exactly; dA = 0 exactly, dB != 0; same seed -> same A."""

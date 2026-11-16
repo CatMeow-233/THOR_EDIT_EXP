@@ -416,7 +416,14 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
    and three gradient accumulators: dK and dV (accumulated with `beta = 1` over `2·G` calls per query
    chunk, so a bf16 accumulator would round at every call) and `dxn`, the input gradient of a norm
    (sum of the three q/k/v — or the two gate/up — input gradients plus their LoRA terms). dQ is
-   written once per chunk and stays in the model dtype. The LoRA branch follows PEFT: the bf16
+   written once per chunk and stays in the model dtype. Measured effect of the three fp32
+   accumulators (bf16 model, the window of `test_lora_bf16_matches_peft`, T = 23, attention chunk 5;
+   mean over all LoRA tensors of the relative L2 gradient error against fp32 on the same rounded
+   weights; one-off A/B, not a test): llama3_rope 0.00794 → 0.00750, qwen2_tied 0.00877 → 0.00820,
+   qwen3_hd32_bias 0.01008 → 0.00976 (HF-bf16 itself: 0.00952, 0.00999, 0.01088). A small,
+   consistent gain at this size; at long sequences the number of dK/dV accumulations grows with
+   T / chunk, which is the reason to keep them (not measured at that size). They make the device
+   GEMM see f32 A operands for the dK/dV input-gradient GEMMs (item 4). The LoRA branch follows PEFT: the bf16
    input is widened exactly to fp32 by the GEMM (`t` is fp32), and `y += s · t Bᵀ` is one GEMM with
    `alpha = s`, `beta = 1` into the base output, rounded once (PEFT: fp32 sum of the bf16 base result
    and the fp32 LoRA term, then one cast). Biases are added after the base GEMM and before LoRA.
@@ -493,10 +500,14 @@ models for both CPU backends; nothing here has run on a GPU and no performance f
     document crossing chunk boundaries, unequal labelled counts per micro-batch (the two reductions
     are asserted to differ), an empty micro-batch inside a window and a fully empty window, GQA with
     G = 2 and Hkv = 2, Qwen3 with head_dim ≠ hidden/heads, llama3 rope, tied heads, Qwen2 biases,
-    upper-layers-only adapters vs all layers on a 3-layer model, both CPU backends. HF's own
+    upper-layers-only adapters vs all layers on a 3-layer model, both CPU backends, a bf16
+    checkpoint saved by HF in several shards (bit-identical to the single-file path). HF's own
     `model(..., labels=...).loss` pins the label shift. `tests/c/test_model.c` adds directional
     finite differences of the loss (fp32 model, double-accumulation backend), chunking / recompute /
     backend invariance, batch validation, and runs under `make asan`.
-14. **Sanitizers**: `make asan` builds the library, binaries and C tests with
-    `-fsanitize=address,undefined -fno-sanitize-recover=all` into `build/asan/` and runs the tests
-    with leak detection (the `--wrap=malloc` test link works with ASan).
+14. **Sanitizers**: `make asan` builds the library, binaries and C tests into `build/asan/` with
+    the normal flags (`-std=c11 -Wall -Wextra -Werror -fopenmp`) plus `RRC_SAN_FLAGS =
+    -fsanitize=address,undefined -fno-sanitize-recover=all` and runs the C tests with leak detection
+    and two OpenMP threads (the `--wrap=malloc` test link works with ASan). `build/asan/rrc_fwdbwd`
+    was also run by hand under ASan on two tiny models (f32 and bf16, both recompute policies, an
+    error path); that run is not part of `make asan`.
