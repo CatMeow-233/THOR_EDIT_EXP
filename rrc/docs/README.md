@@ -151,8 +151,9 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   (nvcc header check + HOST-ONLY `cuda-host-test`). No CI job has a GPU.
 * Run the test commands one at a time (serially). The CPU backend uses OpenMP with one thread per
   core by default; two OpenMP processes sharing the cores oversubscribe them and slow down by far
-  more than 2x (measured on a 4-core machine: one `rrc_selftest_host --only e2e --e2e-filter
-  qwen3/f32` 2.3 s alone, two concurrent ones 139 s; with `OMP_NUM_THREADS=2` each, 2.5 s). When
+  more than 2x (measured by the stage C review on a 4-core machine: one `rrc_selftest_host --only
+  e2e --e2e-filter qwen3/f32` 2.3 s alone, two concurrent ones 139 s; with `OMP_NUM_THREADS=2`
+  each, 2.5 s). When
   something else runs next to a CPU-backend job (another test run, `rrc_train` on the CPU backend,
   `pytest -n`), give each process its share with `OMP_NUM_THREADS`.
 
@@ -219,8 +220,9 @@ example stops the conversion (exit status 2, a one-line `prepare_sft: error: exa
 output file); `--skip-refused` instead skips the conversations the template cannot mask, counts
 them (`skipped_refused` in the summary) and warns once.
 
-Chat templates of the target families (checked offline against TRL's `assistant_only_loss`
-masks, `return_assistant_tokens_mask=True` with TRL's training templates):
+Chat templates of the target families (checked offline by the stage C review against TRL's
+`assistant_only_loss` masks, `return_assistant_tokens_mask=True` with TRL's training templates;
+not part of the test suite, which does not depend on TRL):
 
 * Qwen3: the stock template is **not** prefix-stable for multi-turn conversations: it writes an
   empty `<think>\n\n</think>\n\n` block only into assistant turns after the last user message, so

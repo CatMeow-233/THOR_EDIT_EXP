@@ -344,7 +344,7 @@ left open or a place where the implementation differs from the text above, and w
     checker accepts only F32/BF16 model weights. Untrusted-input hardening (review findings):
     duplicate JSON keys are detected by a linear scan in objects of up to 16 keys and by sorting
     (key, offset) in larger ones (a safetensors header or an index weight_map), so a 200k-entry
-    header parses in well under a second instead of minutes; the shard list of an index is
+    header parses in 0.4 s (measured here; the review measured 158 s before); the shard list of an index is
     deduplicated by sorting too. Every input file (config.json, safetensors, index, `.rrcbin`,
     `rrc_state.bin`, training config) is opened with `O_NONBLOCK` and refused unless it is a regular
     file (a FIFO no longer blocks the program); temporary files of atomic writes are created with
@@ -1385,8 +1385,9 @@ the attention softmax backward passed every llama and qwen2 bf16 check (grad err
 floor); logits 0.03–0.045; params unchanged, 0.19–0.45. The training quantities stay uncapped:
 their anchors grow legitimately with few steps (params anchor 0.16–0.52 at `--e2e-steps 2`, where
 the jitter device reaches 0.26–0.75), and the grad check is the one a backward fault shows in.
-Calibration of the caps (HOST-ONLY in the sense of "no GPU": host test devices on the CPU, full
-size, the same at 1, 2 and 4 OpenMP threads): the jitter device's largest bf16 errors are 0.026
+Calibration of the caps (host test devices on the CPU, no GPU; full size; the fault device's errors
+were the same at 1, 2 and 4 OpenMP threads, the jitter device was measured at 4 threads, and at 2
+threads with `--e2e-steps 2` in `make asan`): the jitter device's largest bf16 errors are 0.026
 (grad) and 0.0093 (logits), so the caps are about 3× and 4.8× those and about 4× the anchors; the
 fault device with `--fault-amp 0.1` (10%) fails the bf16 grad check of every family (0.147 / 0.145
 / 0.126) and `make test` requires exactly that (a control with `--e2e-size full --e2e-filter bf16
