@@ -39,9 +39,9 @@ rrc_status rrc_lr_schedule_parse(const char *name, rrc_lr_schedule *out) {
                      "lr_scheduler_type \"%s\" is not supported (constant, constant_with_warmup, linear, cosine)", name);
 }
 
-int64_t rrc_warmup_steps(int64_t warmup_steps, double warmup_ratio, int64_t total) {
-    if (warmup_steps > 0) return warmup_steps;
-    return (int64_t)ceil((double)total * warmup_ratio);
+int64_t rrc_warmup_steps(double warmup, int64_t total) {
+    if (warmup >= 1.0) return (int64_t)warmup; /* python int(): truncation */
+    return (int64_t)ceil((double)total * warmup);
 }
 
 double rrc_lr_lambda(rrc_lr_schedule s, int64_t k, int64_t warmup, int64_t total) {
@@ -363,9 +363,7 @@ rrc_status rrc_train_config_parse(const char *text, size_t len, rrc_train_config
             S(get_enum(v, k, k_sched_names, 4, &e));
             c->lr_scheduler_type = (rrc_lr_schedule)e;
         } else if (!strcmp(k, "warmup_steps")) {
-            S(get_int(v, k, 0, INT32_MAX, &c->warmup_steps));
-        } else if (!strcmp(k, "warmup_ratio")) {
-            S(get_num(v, k, &c->warmup_ratio));
+            S(get_num(v, k, &c->warmup_steps));
         } else if (!strcmp(k, "adam_beta1")) {
             S(get_num(v, k, &c->optim.beta1));
         } else if (!strcmp(k, "adam_beta2")) {
@@ -435,9 +433,8 @@ rrc_status rrc_train_config_parse(const char *text, size_t len, rrc_train_config
                                                                   "non-empty");
     RANGE(c->micro_batch_size <= INT32_MAX / c->seq_len, "config: micro_batch_size * seq_len must be < 2^31");
     RANGE(c->learning_rate >= 0.0, "config: learning_rate must be >= 0");
-    RANGE(c->warmup_ratio >= 0.0 && c->warmup_ratio <= 1.0, "config: warmup_ratio must be in [0, 1]");
-    RANGE(!(c->warmup_steps > 0 && c->warmup_ratio > 0.0),
-          "config: set warmup_steps or warmup_ratio, not both (transformers would silently use warmup_steps)");
+    RANGE(c->warmup_steps >= 0.0 && c->warmup_steps <= (double)INT32_MAX,
+          "config: warmup_steps must be in [0, 2^31) (>= 1: steps, < 1: ratio of max_steps)");
     RANGE(c->optim.beta1 >= 0.0 && c->optim.beta1 < 1.0 && c->optim.beta2 >= 0.0 && c->optim.beta2 < 1.0,
           "config: adam_beta1 / adam_beta2 must be in [0, 1)");
     RANGE(c->optim.eps >= 0.0 && c->optim.weight_decay >= 0.0 && c->optim.max_grad_norm >= 0.0,
@@ -490,7 +487,7 @@ rrc_status rrc_train_config_load(const char *path, rrc_train_config *out) {
 }
 
 int64_t rrc_train_config_warmup(const rrc_train_config *c) {
-    return rrc_warmup_steps(c->warmup_steps, c->warmup_ratio, c->max_steps);
+    return rrc_warmup_steps(c->warmup_steps, c->max_steps);
 }
 
 static void jw_path(rrc_jw *w, const char *key, const char *s) {
@@ -545,9 +542,8 @@ rrc_status rrc_train_config_to_json(const rrc_train_config *c, char **out) {
     rrc_jw_key(&w, "lr_scheduler_type");
     rrc_jw_str(&w, rrc_lr_schedule_name(c->lr_scheduler_type));
     rrc_jw_key(&w, "warmup_steps");
-    rrc_jw_int(&w, c->warmup_steps);
-    rrc_jw_key(&w, "warmup_ratio");
-    rrc_jw_double(&w, c->warmup_ratio);
+    if (c->warmup_steps == floor(c->warmup_steps)) rrc_jw_int(&w, (int64_t)c->warmup_steps);
+    else rrc_jw_double(&w, c->warmup_steps);
     rrc_jw_key(&w, "adam_beta1");
     rrc_jw_double(&w, c->optim.beta1);
     rrc_jw_key(&w, "adam_beta2");

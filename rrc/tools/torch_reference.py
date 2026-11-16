@@ -189,7 +189,20 @@ def train_reference(
         losses.append(loss_val)
         norms.append(float(norm))
         tokens.append(total)
-    final = {
-        n.replace(".default", ""): p.detach().clone() for n, p in pm.named_parameters() if p.requires_grad
+    final, m_state, v_state = {}, {}, {}
+    for n, p in pm.named_parameters():
+        if p.requires_grad:
+            key = n.replace(".default", "")
+            final[key] = p.detach().clone()
+            st = opt.state[p]
+            m_state[key] = st["exp_avg"].detach().clone()
+            v_state[key] = st["exp_avg_sq"].detach().clone()
+    return {
+        "loss": losses,
+        "lr": lrs,
+        "grad_norm": norms,
+        "tokens": tokens,
+        "params": final,
+        "m": m_state,
+        "v": v_state,
     }
-    return {"loss": losses, "lr": lrs, "grad_norm": norms, "tokens": tokens, "params": final}

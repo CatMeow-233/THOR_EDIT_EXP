@@ -16,8 +16,9 @@
  *   constant_with_warmup:    1
  *   linear:                  max(0, (N - k) / max(1, N - W))
  *   cosine:                  max(0, 0.5 * (1 + cos(pi * 0.5 * 2 * (k - W) / max(1, N - W))))
- * with N = max_steps and W = warmup_steps > 0 ? warmup_steps : ceil(N * warmup_ratio)
- * (TrainingArguments.get_warmup_steps). All in double, as Python does.
+ * with N = max_steps and W = int(warmup_steps) if warmup_steps >= 1 else ceil(N * warmup_steps)
+ * (transformers 5 TrainingArguments.get_warmup_steps: one float field, a value < 1 is a ratio of
+ * the total). All in double, as Python does.
  */
 #ifndef RRC_TRAIN_H
 #define RRC_TRAIN_H
@@ -45,8 +46,8 @@ typedef enum rrc_lr_schedule {
 
 const char *rrc_lr_schedule_name(rrc_lr_schedule s); /* "constant", ... (NULL if invalid) */
 rrc_status rrc_lr_schedule_parse(const char *name, rrc_lr_schedule *out);
-/* TrainingArguments.get_warmup_steps: warmup_steps if > 0, else ceil(total * warmup_ratio). */
-int64_t rrc_warmup_steps(int64_t warmup_steps, double warmup_ratio, int64_t total);
+/* TrainingArguments.get_warmup_steps: int(warmup) if warmup >= 1, else ceil(total * warmup). */
+int64_t rrc_warmup_steps(double warmup, int64_t total);
 /* The multiplier lambda(k) for scheduler step k = 0, 1, ... (see the header comment). */
 double rrc_lr_lambda(rrc_lr_schedule s, int64_t k, int64_t warmup, int64_t total);
 
@@ -96,8 +97,7 @@ typedef struct rrc_train_config {
     int64_t seq_len, micro_batch_size, grad_accum_steps, max_steps;
     double learning_rate;
     rrc_lr_schedule lr_scheduler_type;
-    int64_t warmup_steps;
-    double warmup_ratio;
+    double warmup_steps; /* >= 1: steps (truncated to an integer); in [0, 1): ratio of max_steps */
     rrc_optim_hparams optim;
     rrc_loss_reduction loss_reduction;
     uint64_t seed;
