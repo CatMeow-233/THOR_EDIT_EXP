@@ -919,9 +919,10 @@ reports. Unlike the CPU backend, which validates before writing, the outputs of 
 since the previous sync are unspecified after a device range error. Launch failures and CUDA
 errors are `RRC_ERR_BACKEND` (allocation failures `RRC_ERR_OOM`).
 
-`memcpy_h2d` is `cudaMemcpyAsync` followed by a stream synchronize (the contract: the host source
-may be reused on return); the pinned double-buffered staging that would let uploads overlap compute
-(§6) is not implemented. `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` synchronizes the stream, then
+`memcpy_h2d` goes through a backend-owned pinned staging ring and returns without a stream
+synchronize (the contract — the host source may be reused on return — is kept; §15.3; before
+§15 it was `cudaMemcpyAsync` + stream synchronize, which remains the path when the ring is
+disabled). `memcpy_d2d`/`memset0` are asynchronous on the stream; `free` synchronizes the stream, then
 calls `cudaFree`. The GEMM scratch and the sum_squares partial buffer grow on
 demand (stream synchronize before freeing the old buffer); `grow()` always updates the owning
 backend members, so after a failed growth they are (NULL, 0), never a freed pointer. All calls on one backend must come from
@@ -970,8 +971,8 @@ block's lane loop wraps). Tolerances (applied per element, `scale` = max |ref| o
 | GEMM | gemm (any path) | 2·k·2⁻²⁴ · (\|α\|Σ\|a\|\|b\| + \|β\|\|c\|) (+ 2⁻⁹ of that with `--tf32`) |
 
 plus one bf16 ulp (2⁻⁷ · max(\|ref\|, \|got\|)) for bf16 outputs of non-EXACT ops. It measures and
-prints no timing. Not yet in it: the tiny-model end-to-end comparison and the 20-step training check
-of §7 (they need the model/trainer of the other stage-B line).
+prints no timing. The tiny-model end-to-end comparison, the 20-step training check of §7 and the
+`--report` JSON were added with §15 (§15.1, §15.2).
 
 ### 11.7 Not done / open
 
@@ -980,7 +981,7 @@ of §7 (they need the model/trainer of the other stage-B line).
   unverified until `rrc_selftest` runs.
 * No performance work: the fallback GEMM kernel is a naive one-thread-per-element kernel, the
   row kernels use one block per row (inefficient for very short rows such as per-head q/k norm
-  with head_dim 128), no fused attention, no pinned staging for uploads, no CUDA graphs.
+  with head_dim 128), no fused attention, no CUDA graphs (pinned upload staging: §15.3).
 * Single device per process thread (`cudaSetDevice` only at creation).
 * Not executed anywhere: element kernels with more than 2²⁸ items or row kernels with more than
   2²⁰ rows at the default grid cap (the wrap paths themselves run through the grid pass and the
@@ -1047,3 +1048,203 @@ The model line (§10) and the CUDA line (§11) were merged with merge commits; n
 5. **End-to-end CPU smoke**: `rrc/tests/test_e2e_cpu.py` (tiny qwen3 + tokenizer trained in the test
    -> `prepare_sft.py` -> `rrc_train` cpu -> `metrics.jsonl`, checkpoints -> `PeftModel`). It is a
    plumbing check, not a numerical one (`test_train_vs_torch.py` is) and not a GPU validation.
+
+## 15. GPU first-run plan
+
+Goal: the user's single first run on the RTX 5090 must answer as much as possible, and its output
+must come back as files. Status of everything in this section: what runs on the GPU is
+**COMPILED-ONLY**; the same code paths were executed **TESTED (CPU)** through host backends (the
+emulation backend kc-emu, the CPU backends, two test devices) and **HOST-ONLY** through the real
+`cuda/*.cu` sources on the fake CUDA runtime of `tests/cuda_host`. No performance figure exists;
+every one is NOT_TESTED until the commands of `bench/README.md` have been run. Files:
+`cuda/selftest_e2e.{h,c}`, `cuda/selftest.c`, `cuda/cuda_backend.cu`, `cuda/rrc_cuda.h`,
+`bench/rrc_bench.c`, `bench/torch_baseline.py`, `bench/README.md` (the exact commands),
+`tests/cuda_host/*`, `tests/test_gpu_tools_smoke.py`.
+
+### 15.1 rrc_selftest end-to-end checks (§7 item 3)
+
+After the op checks (§11.6), `rrc_selftest` runs `rrc_e2e_run(dev)`: for each family (llama with
+llama3 rope scaling, untied; qwen2 with q/k/v biases, untied; qwen3 with q/k norm, attention
+biases, tied embeddings and head_dim ≠ hidden / heads; all with GQA) and dtype (f32, bf16), a tiny
+checkpoint is written **in C** (`config.json` + `model.safetensors`, random weights from a fixed
+seed, bf16 tensors stored as BF16) into a fresh work directory and read back by the normal loader;
+no Python is needed on the GPU machine. Sizes: `full` (default on the GPU: hidden 96–128, two
+layers, vocab 256–384, multiples of 16 so the bf16 GEMMs are tensor-core aligned; 2 rows × 64
+tokens, attention chunks of 24 and CE chunks of 40 so every chunk loop runs ragged), `quick` (host
+runs in `make test`) and `tiny` (the HOST-ONLY build). Checks, per family × dtype:
+
+| check | what is compared (dev vs `rrc_backend_cpu_f32acc`) |
+| --- | --- |
+| `logits`, `loss` | `rrc_model_forward_logits` and the loss sum of `rrc_model_forward_backward` on one packed micro-batch (several documents per row, prompt tokens unlabelled) with a randomized non-zero adapter (A and B) |
+| `grad`, `grad_recompute_none` | every LoRA gradient (seven projections, every layer), per tensor; the second with recompute `none` on dev |
+| `train_loss`, `train_grad_norm`, `train_params` | 20 optimizer steps through `rrc_train_run_on` (the path of `rrc_train_cuda`: data loader + prefetch thread, grad accumulation 2, clipping at 0.7 × the initial gradient norm so early steps clip, warmup 3 + cosine, weight decay 0.01, checkpoint): loss and grad norm per step from `metrics.jsonl`, final parameters from `checkpoint-20/adapter_model.safetensors` |
+| `train_loss_decreases` | mean of the last three losses < first loss (the small data set is memorized; from 10 steps) |
+| `det_forward`, `det_grad`, `det_train` | dev twice: logits, loss, gradients bit for bit; the two training runs' metrics bit for bit and byte-identical adapter and `rrc_state.bin` (AdamW m, v) |
+
+Tolerance: with `err` the normalized maximum difference (logits, grads per tensor, per-step series:
+max |d| / max |ref|; loss: relative; final parameters: max |d| / (lr · steps), i.e. in units of the
+largest displacement Adam can produce), a check passes when
+`err(dev, cpu-f32acc) ≤ max(K · err(cpu-f32acc, cpu), floor)` with K = 10: the anchor is the fp32
+reference's own error against the double-accumulation backend, so a device whose fp32 arithmetic
+is as accurate as the CPU's lands within about twice the anchor. The floors cover an anchor that is
+accidentally tiny:
+
+| quantity | floor f32 | floor bf16 |
+| --- | --- | --- |
+| logits | 6e-5 | 3e-2 |
+| loss | 6e-6 | 1e-2 |
+| grad (per tensor) | 3e-4 | 6e-2 |
+| train loss (per step) | 2e-5 | 2e-2 |
+| train grad norm (per step) | 1e-4 | 6e-2 |
+| train params (lr · steps units) | 8e-4 | 1e-1 |
+
+Calibration (TESTED on CPU, `make test`): two host test devices over `cpu-f32acc`. `jitter`
+perturbs every GEMM output element by a deterministic pseudo-random factor up to ±k·2⁻²⁴ (the
+fp32 error bound of a different summation order; deterministic so the det checks hold) and must
+PASS; at the full GPU sizes its largest f32 errors were 1.9e-5 (logits), 1.1e-6 (loss), 7.7e-5
+(grad), 1.6e-4 (params), each at most 1/3 of the floor. `fault` adds a relative error of 1e-3 to
+`attn_softmax_bwd` (a subtly wrong backward) and must FAIL (`expect_fail` in the Makefile): its f32
+grad errors are about 1.4e-3, ≈ 5× the floor (10 failing checks at the quick size); forward checks
+pass (the fault is backward-only), and in bf16 the fault is below the bf16 noise, so the f32 checks
+are the ones that catch it. On kc-emu (CPU arithmetic, tree reductions, shuffled item order) the
+whole set passes with dev_err ≈ ref_err. HOST-ONLY: the tiny qwen3 f32 + bf16 set passes through
+the real backend on the fake runtime (`make test` with `CUDA_HOME`; about 30 s). TF32 (`--tf32`)
+replaces the f32 floors by the bf16 ones / 8. The work directory (`--e2e-dir`, default `$TMPDIR`)
+is removed unless `--e2e-keep`.
+
+Run control: `--only e2e` runs only these checks; any other `--only` filter runs only matching op
+checks (so the existing `--only convert` / `--only gemm` uses are unchanged); `--no-e2e`;
+`--e2e-size`, `--e2e-steps`, `--e2e-filter family/dtype`. Every check is recorded; a failing stage
+(an error from a run) becomes a failing item carrying the error message, and the other families
+still run.
+
+### 15.2 The report (`--report FILE`)
+
+One JSON document (`schema: rrc-selftest-report-v1`): `result` (PASS / FAIL / INCOMPLETE),
+`complete`, `fatal_error`, `started_utc`, `command_line`, `build` (git revision via
+`git describe --dirty` at compile time, host compiler, nvcc version, CUDA runtime and cuBLAS
+header versions, `__CUDA_ARCH_LIST__`, host-shim flag), `device` (name, compute capability, SMs,
+memory, driver / runtime / cuBLASLt versions, and the binary and PTX versions of the kernel image
+the runtime actually loaded, from `cudaFuncGetAttributes`, which shows whether sm_120 SASS or
+JIT-compiled PTX runs), `options`, `op_passes[]` (main, capped, grid: summary counts, per-op cases /
+max abs / max rel / worst error over tolerance, GEMM path per dtype combination, cases per layout
+and ladder level, kernel-fallback examples, failing cases), and `e2e` (every item with `dev_err`,
+`ref_err`, `tol`, `pass`, `detail`; in the CUDA build also `model_gemm_tally`: the device's GEMM
+calls and computed FLOPs per dtype combination and ladder level during the end-to-end runs, with
+the kernel-fallback FLOP share printed loudly, the h2d and stream-synchronize counts, and
+`model_gemm_census`: every distinct GEMM geometry of the model with its path). The file is
+rewritten atomically after every stage with `complete: false`, and on the fatal path (e.g. the
+backend cannot be created), so a crash or hang leaves the finished stages on disk. The last stdout
+line stays exactly `rrc_selftest: PASS|FAIL` (the Makefile's checks depend on it).
+
+### 15.3 Pinned staging for memcpy_h2d (no signature change)
+
+`memcpy_h2d` was `cudaMemcpyAsync` from pageable memory + a full stream synchronize per call,
+i.e. one host-device round trip per upload (every micro-batch uploads its token, label, position
+and index arrays). Now the CUDA backend owns a pinned ring (`rrc_cuda_options.h2d_staging_bytes`,
+default 32 MiB in 4 slots, env `RRC_CUDA_H2D_STAGING_BYTES`; 0 disables). Per slot-sized chunk:
+if the slot is busy, `cudaEventSynchronize(slot.event)` (the copy that last read it has completed);
+`memcpy` of the host source into the slot; `cudaMemcpyAsync(slot → device)` on the stream;
+`cudaEventRecord(slot.event)`. The call returns without a stream synchronize: the host source has
+already been copied (contract kept: it may be reused on return), and the device copy is ordered
+with every other op by the stream. Large copies (model weights) stream through the ring in chunks,
+the host memcpy of one slot overlapping the DMA of the previous ones. With `sync_each_op` the call
+also synchronizes. A failed pinned allocation at creation disables the ring with a warning;
+`destroy` frees the ring and events after its stream synchronize. Counted on the fake runtime
+(code-derived counts, not timings): one optimizer step of `rrc_bench` with 2 micro-batches issues
+12 uploads and 6 full stream synchronizes; before the ring each upload added one synchronize.
+
+Tests (HOST-ONLY, `cuda_host.h2d_staging_ring`): the fake runtime's host → device copies are lazy
+(queued; the source is read only when the queue is flushed by a later stream operation, a stream
+or event synchronize, or a free), so a slot overwritten before its copy completed, or a copy still
+reading the caller's buffer, delivers wrong bytes. The test uploads ten buffers (1 … 1000 floats)
+through a 4 × 256-byte ring, overwriting the single host source right after each call, and checks:
+the data, that copies were still pending (not vacuous), zero stream synchronizes during the
+uploads, slot event waits = chunks − slots, zero async copies from pageable memory, stream order
+with ops in between (y = 2 x₁ + 2 x₂ re-uploading x), the disabled ring, a pinned allocation
+failure, `sync_each_op`, and no pending copy or pinned block after destroy. Mutations checked by
+hand: removing the event wait (1812 wrong elements, plus failures of the ordering and
+sync-each-op cases) and copying from the caller's buffer instead of the slot (ordering case fails)
+are both caught. The whole existing HOST-ONLY suite (harness, e2e) also runs on the lazy copies.
+
+`backend.h` gained one comment-only clarification (no signature change): on device backends, the
+outputs of the ops enqueued after an op that hit a data-dependent range error are unspecified
+until the next sync reports the error.
+
+Other additions to the CUDA line's own API (`rrc_cuda.h`): `rrc_cuda_stats` (live / peak bytes of
+`be->alloc` allocations, backend-internal bytes, h2d / staging / stream-sync counters, GEMM calls
+and computed FLOPs per dtype combination × ladder level), the GEMM census, a cudaEvent timer,
+`rrc_cuda_build_info_get` / `rrc_cuda_build_is_host_shim`, `rrc_cuda_kernel_versions`.
+
+### 15.4 rrc_bench and the PyTorch baseline
+
+`rrc_bench --model DIR` (`bench/rrc_bench.c`; built by `make cuda`) loads the model (bf16 base),
+creates LoRA (default r 16, alpha 32, all seven projections, fp32, PEFT init) and M synthetic
+micro-batches of B × T random token ids (one document per row, every position labelled), then runs
+W warmup + N measured optimizer steps (M × `rrc_model_forward_backward` + clip + AdamW, constant
+LR: the trainer's step without the loader). Step time = cudaEvent time between marks recorded on
+the backend stream before and after the step; tokens/s = B·T·M / mean step time; mean / p50 / p90
+(nearest rank) / min / max; host wall time per step separately. Memory, each labelled in the
+file: `allocator_peak_bytes` (true peak of `be->alloc` bytes over the measured steps),
+`backend_total_peak_bytes` (plus workspace / scratch / partials), `device_used_max_sampled_bytes`
+(`cudaMemGetInfo` total − free after each step: device-wide, not a peak). The GEMM tally and census
+of the first measured step show every GEMM shape, its path and computed FLOPs. `"measured_on"`
+names the device only when the build is the real CUDA build (`rrc_cuda_build_is_host_shim() == 0`)
+and the device was queried; `rrc_bench_host` (CPU backend, `make cpu`) and `rrc_bench_shim`
+(HOST-ONLY) emit the same keys with `"status": "smoke"`, null timings and `"measured_on": null`.
+`--synthetic-model FAMILY` replaces `--model` with a tiny model written in C (smoke runs only).
+
+`bench/torch_baseline.py`: same keys, same workload — bf16 base, `attn_implementation="sdpa"`,
+PEFT LoRA with the same r / alpha / targets, adapters checked to be fp32, same B, T, M, synthetic
+tokens with `labels = input_ids`, gradient checkpointing `on|off` (required argument; mapped to
+`recompute` full / none in the output), `torch.optim.AdamW` with the same hyper-parameters (fused on
+CUDA by default, stated in `optimizer.impl`), `clip_grad_norm_`, constant LR, `torch.cuda.Event`
+timing of the same span, `max_memory_allocated` / `max_memory_reserved` and the sampled device
+use. `local_files_only=True`, `HF_HUB_OFFLINE=1`, never `trust_remote_code`. Smoke tests
+(`tests/test_gpu_tools_smoke.py`, CPU): argument errors of both tools, the JSON shape and the
+"no timing claim" fields, a non-zero LoRA gradient norm with checkpointing on and off, identical key
+sets of the two tools, and the same tokens per step and trainable parameter count for the same
+configuration (the LoRA layouts agree). Known workload differences (by design): rrc synchronizes
+once per micro-batch (loss) and once per step (gradient norm for clipping), its attention is
+chunked GEMM + softmax (no fused flash kernel), and its AdamW is the `foreach=False` arithmetic.
+
+### 15.5 The run, and what each outcome tells
+
+The exact commands are in `bench/README.md` (environment record, CPU build + tests, `make cuda`,
+`rrc_selftest --report selftest.json`, four `rrc_bench` and four baseline configurations, one
+tarball back). Reading the outcome:
+
+1. Backend creation fails (`fatal_error` in the report): driver / runtime / device problem, no rrc
+   op ran.
+2. Op checks fail: the kernel or the GEMM integration on real hardware (`op_passes[].ops`,
+   `failing_cases`; a FAIL PATH means cuBLASLt refused a case the plan expects it to serve: the
+   type table, alignment or preference attributes). `--sync-each-op` localizes asynchronous
+   errors to the op.
+3. Op checks pass, end-to-end fails: the model / trainer composition on the device (e.g. an
+   aliasing or ordering assumption the CPU never exercised, or the staging ring); the failing item
+   names family, dtype and quantity, `detail` the worst tensor or step.
+4. Determinism fails: an algorithm choice or a reduction that is not run-to-run stable on the device.
+5. Everything passes: `e2e.model_gemm_tally.kernel_fallback_flop_share` and the census say whether
+   the model's GEMMs reach cuBLASLt; then the benchmark files give the first measured tokens/s,
+   step times and memory for rrc and the baseline under the same configuration.
+
+### 15.6 Status
+
+| item | status |
+| --- | --- |
+| e2e checks, report JSON, jitter / fault controls (`rrc_selftest_host`) | TESTED (CPU) |
+| e2e checks + report through the real `cuda/*.cu` (`rrc_selftest_shim`, tiny qwen3) | HOST-ONLY |
+| staging ring, counters, census, timer API (`test_cuda_host`) | HOST-ONLY |
+| `rrc_bench` CUDA main (`rrc_bench_shim`), `rrc_bench_host`, baseline `--device cpu` | HOST-ONLY / TESTED (CPU) smoke |
+| `rrc_selftest`, `rrc_bench` on a GPU; cuBLASLt behaviour; the ring on a real DMA engine | COMPILED-ONLY |
+| any tokens/s, step time, memory figure; any comparison with PyTorch | NOT_TESTED |
+
+### 15.7 Not done
+
+* Nothing ran on a GPU. Whether the tolerances fit real cuBLASLt / tensor-core arithmetic is
+  argued from the jitter calibration, not observed; a FAIL comes with every number in the report.
+* `rrc_train_cuda` is exercised by the e2e training runs, not separately on a real model; the
+  e2e models are tiny (no 7–8B checkpoint was ever loaded).
+* No overlap of uploads with compute beyond what one stream gives (the ring removes the
+  synchronize, the copies stay on the compute stream); no CUDA graphs, no fused attention.
+* The baseline's `torch.compile` option (§7 item 4) is not implemented.
