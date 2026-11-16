@@ -75,12 +75,13 @@ HF_HUB_OFFLINE=1 python -m pytest rrc/tests -q   # from the repository root
   schedule, warmup 0 / >= total / ratio, total 1), clipping against `torch.nn.utils.clip_grad_norm_`
   (the coefficient bit for bit, AdamW's first moment against the clipped torch gradient), an 8-step
   trajectory (grad accumulation 2, clipping active on some steps, warmup + cosine, weight decay, two
-  epoch boundaries) against a `torch.optim.AdamW(foreach=False)` + PEFT loop fed the batches rrc
+  epoch boundaries; both CPU backends and both loss reductions) against a `torch.optim.AdamW(foreach=False)` + PEFT loop fed the batches rrc
   trained on (`rrc/tools/torch_reference.py`; fp32 tight, bf16 anchored to HF-bf16's own error),
   bit-identical resume (every checkpoint file, metrics) with the prefetch thread on, loading the
   checkpoint with `peft.PeftModel.from_pretrained` (logits equal rrc's), `prepare_sft.py` with a
   tokenizer trained in the test, every malformed `.rrcbin`, packing determinism and the packing spec,
-  config strictness, and that every config field is documented below. The C suites `data` and
+  config strictness, refusal of an `init_adapter` whose `adapter_config.json` disagrees with `lora`,
+  and that every config field is documented below. The C suites `data` and
   `train` cover the reader / loader / optimizer / state file / an end-to-end stop + resume without
   Python.
 * `make -C rrc asan` — the C tests under AddressSanitizer + UBSan (build/asan).
@@ -162,8 +163,8 @@ Outputs in `output_dir`:
   `adapter_config.json` (PEFT `LoraConfig`, `task_type: CAUSAL_LM`), loadable with
   `peft.PeftModel.from_pretrained(base, "checkpoint-<step>")`, plus `rrc_state.bin` (AdamW m / v, step,
   data seed and cursor, tokens seen, hashes of the parameters and the data, the config fingerprint;
-  layout in `include/rrc/train.h`). Each file is written as `.tmp`, fsynced and renamed, inside
-  `.checkpoint-<step>.tmp/`, which is then renamed into place.
+  layout in `include/rrc/train.h`). The files are written (as `.tmp` + rename, and fsynced) inside
+  `.checkpoint-<step>.tmp/`, which is then renamed into place (DESIGN.md §10 item 23).
 * `batches/step-<N>.safetensors` with `dump_batches: true` (tokens / labels / position_ids / doc_ids
   `[grad_accum_steps, micro_batch_size, seq_len]`).
 

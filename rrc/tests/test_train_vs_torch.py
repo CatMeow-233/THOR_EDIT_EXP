@@ -342,7 +342,17 @@ def test_clipping_matches_torch_clip_grad_norm(max_norm, setup_fp32, train_exe, 
         assert rel_err(st["m"][k], 0.1 * g) < 1e-5, k
 
 
-def test_trajectory_fp32_matches_torch_peft(setup_fp32, train_exe, tmp_path):
+# (backend, loss_reduction) -> tolerances (loss, grad_norm, params, m / v), each about 10x the
+# measured maximum relative error (printed by the test; DESIGN.md section 10 item 25)
+TRAJ_CASES = {
+    ("cpu", "window_tokens"): (1e-6, 3e-6, 5e-6, 2e-5),
+    ("cpu-f32acc", "window_tokens"): (1e-6, 1e-5, 5e-6, 2e-5),
+    ("cpu", "microbatch_mean"): (1e-6, 3e-6, 5e-6, 2e-5),
+}
+
+
+@pytest.mark.parametrize("backend,reduction", list(TRAJ_CASES), ids=["-".join(c) for c in TRAJ_CASES])
+def test_trajectory_fp32_matches_torch_peft(backend, reduction, setup_fp32, train_exe, tmp_path):
     s = setup_fp32
     out = tmp_path / "o"
     cfg = write_cfg(
@@ -352,6 +362,8 @@ def test_trajectory_fp32_matches_torch_peft(setup_fp32, train_exe, tmp_path):
         output_dir=str(out),
         init_adapter=str(s["init"]),
         dump_batches=True,
+        backend=backend,
+        loss_reduction=reduction,
     )
     run_train(train_exe, cfg)
     met = read_metrics(out)
@@ -376,6 +388,7 @@ def test_trajectory_fp32_matches_torch_peft(setup_fp32, train_exe, tmp_path):
             max_steps=N,
             max_grad_norm=BASE_CFG["max_grad_norm"],
             weight_decay=BASE_CFG["weight_decay"],
+            loss_reduction=reduction,
         ),
     )
     # clipping active on some steps and not on others; warmup starts at lr 0
@@ -396,15 +409,15 @@ def test_trajectory_fp32_matches_torch_peft(setup_fp32, train_exe, tmp_path):
     merr = max(rel_err(st["m"][k], ref["m"][k]) for k in final)
     verr = max(rel_err(st["v"][k], ref["v"][k]) for k in final)
     print(
-        f"fp32 trajectory: max rel loss err {loss_err:.3g}, grad_norm {norm_err:.3g}, params {max(perr.values()):.3g}, "
-        f"m {merr:.3g}, v {verr:.3g}, min param movement {moved:.3g}"
+        f"fp32 trajectory {backend} {reduction}: max rel loss err {loss_err:.3g}, grad_norm {norm_err:.3g}, "
+        f"params {max(perr.values()):.3g}, m {merr:.3g}, v {verr:.3g}, min param movement {moved:.3g}, "
+        f"clipped {clipped}"
     )
-    # measured (CPU, double-accumulation backend): loss 4e-8, grad_norm 3e-7, params 3e-7, m / v 1e-6;
-    # tolerances keep a margin of ~10x
-    assert loss_err < 1e-6
-    assert norm_err < 3e-6
-    assert max(perr.values()) < 5e-6
-    assert merr < 2e-5 and verr < 2e-5
+    tol_loss, tol_norm, tol_param, tol_mv = TRAJ_CASES[(backend, reduction)]
+    assert loss_err < tol_loss
+    assert norm_err < tol_norm
+    assert max(perr.values()) < tol_param
+    assert merr < tol_mv and verr < tol_mv
     assert moved > 1e-3  # the parameters really moved (the comparison is not trivially satisfied)
     assert st["step"] == N and st["tokens_seen"] == sum(ref["tokens"])
 
@@ -598,6 +611,34 @@ def test_resume_refusals(setup_fp32, train_exe, tmp_path):
         expect_ok=False,
     )
     assert p.returncode == 2 and "does not hold the parameters" in p.stderr
+
+
+def test_init_adapter_config_must_match_lora_settings(setup_fp32, train_exe, tmp_path):
+    """A PEFT adapter directory whose adapter_config.json disagrees with the config's lora section
+    (here lora_alpha, use_rslora, targets, layers) is refused: the weights alone would load and the
+    scaling would silently differ."""
+    s = setup_fp32  # init adapter: r 4, alpha 8, all seven modules, all layers, no rslora
+    common = dict(
+        model_dir=str(s["model"]), data_path=str(s["data"]), init_adapter=str(s["init"]), max_steps=1
+    )
+    cases = [
+        (dict(r=4, alpha=16, target_modules="all-linear"), "lora_alpha differs"),
+        (dict(r=4, alpha=8, use_rslora=True, target_modules="all-linear"), "use_rslora differs"),
+        (dict(r=4, alpha=8, target_modules=["q_proj", "v_proj"]), "target_modules differs"),
+        (
+            dict(r=4, alpha=8, target_modules="all-linear", layers_to_transform=[1]),
+            "layers_to_transform differs",
+        ),
+    ]
+    for i, (lora, msg) in enumerate(cases):
+        p = run_train(
+            train_exe,
+            write_cfg(tmp_path / f"c{i}.json", **common, output_dir=str(tmp_path / f"o{i}"), lora=lora),
+            expect_ok=False,
+        )
+        assert p.returncode == 2 and msg in p.stderr, (lora, p.stderr)
+    # the matching settings train
+    run_train(train_exe, write_cfg(tmp_path / "ok.json", **common, output_dir=str(tmp_path / "ok")))
 
 
 # --------------------------------------------------------------------------------------------

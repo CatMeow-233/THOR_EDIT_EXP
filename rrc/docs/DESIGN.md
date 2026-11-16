@@ -579,9 +579,11 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
 23. **Checkpoints**: `adapter_config.json` holds a subset of the fields PEFT 0.21 writes; every one
     of them equals what PEFT's own `save_pretrained` writes for the same `LoraConfig` (tested), except
     `base_model_name_or_path`, which is `model_dir` as given. `adapter_model.safetensors` carries
-    PEFT's metadata `{"format": "pt"}`. Each file is written as `.tmp`, fsynced and renamed inside
-    `.checkpoint-<step>.tmp/`, which is fsynced and renamed to `checkpoint-<step>` (an existing one is
-    first renamed to `.old` and removed afterwards). Nothing time- or path-dependent (except the model
+    PEFT's metadata `{"format": "pt"}`. All files are written into `.checkpoint-<step>.tmp/`:
+    `adapter_config.json` and `rrc_state.bin` as `.tmp`, fsynced, renamed; `adapter_model.safetensors`
+    by the stage A writer (`.tmp` + rename, no fsync of its own) and fsynced after its rename. The
+    directory is then fsynced and renamed to `checkpoint-<step>` (an existing one is first renamed to
+    `.old` and removed afterwards), and `output_dir` is fsynced. Nothing time- or path-dependent (except the model
     path above) enters a checkpoint, so checkpoints of equal runs are byte-identical.
 24. **`rrc_state.bin`** (layout in train.h) stores m and v, not the parameters: those are read back
     from the checkpoint's `adapter_model.safetensors` (fp32, exact) and checked against the stored
@@ -597,13 +599,17 @@ models; nothing has run on a GPU; the trainer has no CUDA path yet; no performan
 25. **Measured agreement** (tiny llama, 8 steps, grad accumulation 2, seq_len 32, 2 rows, clipping
     on 4 of 8 steps, warmup 2 + cosine, wd 0.01, two epoch boundaries; CPU double-accumulation
     backend): fp32 max relative error of the loss 5.0e-8, grad norm 3.3e-7, final LoRA parameters
-    2.8e-7, Adam m 8.3e-7, v 7.8e-7 (parameters moved by ≥ 26 % relative). bf16 base: rrc's max loss
+    2.8e-7, Adam m 8.3e-7, v 7.8e-7 (parameters moved by ≥ 26 % relative; clipping active on steps 2,
+    5, 6, 7). The fp32-accumulation backend: loss 5.9e-8, grad norm 1.2e-6, parameters 2.8e-7, m / v
+    1.1e-6; `microbatch_mean`: loss 5.0e-8, grad norm 3.1e-7, parameters 2.6e-7, m / v 9.7e-7. The test
+    tolerances are about 10x these. bf16 base: rrc's max loss
     error against the fp32 truth on the same rounded weights 2.2e-4 vs HF-bf16's 2.5e-4; final
     parameters at most 0.32 of the allowed `2·e_HF + 0.005`. The PEFT-loaded checkpoint reproduces
     rrc's logits within 1.8e-7 (adapter effect on the logits 0.69). Mutation checks (by hand, not in
-    CI): using λ(s) instead of λ(s − 1) fails the trajectory test; dropping the clip epsilon or using
-    plain division passed the parameter / loss tolerances (Adam is nearly invariant to a 1e-6 relative
-    gradient scale) and is caught only by the exact coefficient check, which was added for that reason.
+    CI): using λ(s) instead of λ(s − 1) fails the trajectory test; dropping the clip epsilon, and
+    (run separately) using plain f32 division for the coefficient, each passed every loss / gradient-norm
+    / parameter / moment tolerance (Adam is nearly invariant to a 1e-6 relative gradient scale); both
+    are caught by the exact coefficient check, which was added for that reason.
 26. **`prepare_sft.py` assistant spans** are located on the rendered text (prefix renderings with
     `add_generation_prompt`), and a token is a target iff its first character lies in a span; a
     template that is not prefix-stable is refused rather than guessed. Tested with a WordLevel
