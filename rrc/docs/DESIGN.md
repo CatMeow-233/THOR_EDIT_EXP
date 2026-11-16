@@ -1096,7 +1096,12 @@ files (huggingface.co is not reachable here); `rrc_census --config` takes the re
    alike): llama3_rope 0.00750 → 0.00754, qwen2_tied 0.00820 → 0.00821, qwen3_hd32_bias 0.00976 →
    0.00977, HF-bf16 itself 0.00952 / 0.00999 / 0.01088; the worst per-tensor ratio to the test's
    tolerance `2·e_HF + 0.005` is unchanged (0.430 / 0.431 / 0.583); logits and loss are
-   bit-identical (forward untouched). The "before" values reproduce §10 item 3's exactly. Tests:
+   bit-identical (forward untouched). The "before" values reproduce §10 item 3's exactly. The A/B
+   covers tiny models at T = 23 only; the effect at 8B shapes and T = 4096 is NOT_TESTED. HOST-ONLY
+   (by hand): one bf16 step of a tiny qwen3 model through `build/rrc_train_shim` (the real
+   `cuda_backend.cu` on the fake runtime, so the new convert and the bf16 k/v GEMMs went through the
+   CUDA backend's code) gave the same loss as `cpu-f32acc` bit for bit and a gradient norm within
+   1.8e-7 relative. Tests:
    `census.census_8b_presets_base_weight_gemms_native` (exact call counts per role and every
    base-weight call on a bf16 × bf16 combination, for all three presets; it failed on the code before
    the fix with "base_dx: 72 of 216 ...") and the same assertion in `rrc/tests/test_census.py`.
@@ -1196,7 +1201,12 @@ files (huggingface.co is not reachable here); `rrc_census --config` takes the re
    `make asan`.
 7. **Not done / open** (NOT_TESTED unless stated):
    * Whether cuBLASLt accepts each "native" call on the 5090 (type table, alignment, heuristics) —
-     `rrc_selftest` on the device; the census reports what the plan would ask for.
+     `rrc_selftest` on the device; the census reports what the plan would ask for. Of the Qwen3-8B
+     preset's native-bf16 share of 0.924, 0.869 is the plain 2-D base-weight GEMMs and 0.055 the
+     batched attention scores / dP GEMMs with a broadcast K or V operand (stride 0) and per-head
+     views, where library support is least certain.
+   * `align_lt16_calls = 0` holds for the dry run's 256-byte-aligned fake allocations and the
+     workspace's 256-byte view offsets; the alignment `cudaMalloc` returns is NOT_TESTED here.
    * Attention: half of its FLOPs run promoted (f32 P / dS against bf16 Q, K, V; §10 item 3 keeps them
      f32). A bf16 P as in HF, or the fused attention kernel of §3, would move them to the native path;
      a numerics change that needs its own A/B against the PEFT tolerances.
