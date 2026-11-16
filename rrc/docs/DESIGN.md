@@ -110,7 +110,14 @@ an end-to-end tiny-model check; the user's first command on the 5090), `rrc_benc
   flash-attention kernel is a later optimisation behind the same op.
 * **RMSNorm / RoPE / SwiGLU / residual**: computed in fp32 from bf16 (or fp32) inputs, outputs
   stored in the activation dtype. RoPE cos/sin computed in fp32 (double for inv_freq setup) from
-  `rope_theta` (+ llama3 scaling) and `position_ids`.
+  `rope_theta` (+ llama3 scaling) and `position_ids`. Concretely (stage A): `rrc_rope_tables`
+  builds f32 tables `[n_pos, head_dim/2]` once per model — `inv` is the double inv_freq rounded
+  to f32, the angle is the f32 product `(float)p * inv` (as HF's `position_ids.float() *
+  inv_freq`), cos/sin of that f32 angle are evaluated in double and rounded to f32 — and
+  `rope_fwd/bwd` index the tables by `position_ids`. Both backends use the same tables, so they do
+  not differ by their `cosf/sinf`. With bf16 activations HF rounds some intermediates to bf16
+  (e.g. RMSNorm rounds `x·rstd` before multiplying by the weight; RoPE rounds cos/sin and each
+  product); rrc rounds once at the output, so bf16 runs are compared with tolerances.
 * **AdamW** (PyTorch `torch.optim.AdamW` semantics, `foreach=False`): decoupled weight decay
   `p ← p − lr·wd·p` applied before the Adam update, bias correction with step count starting at 1,
   `eps` added to `sqrt(v̂)`. Defaults: betas (0.9, 0.999), eps 1e-8, wd 0.
@@ -146,6 +153,41 @@ Ops (row-major everywhere; HF `nn.Linear` weight W is [out, in] row-major):
   `cross_entropy_fwd_bwd` (chunk of logits → per-token loss, dlogits in place, ignore_index),
   `convert` (f32↔bf16), `sum_squares` (grad norm), `scale`, `adamw_step` (fused, fp32).
 * All reductions accumulate in fp32 (CPU may use double where noted for reference ops).
+
+Frozen signatures (stage A; full contracts, aliasing rules and preconditions are documented per op
+in `include/rrc/backend.h`). Model code calls the `rrc_<op>` wrappers; the table entries take the
+same arguments with `const rrc_backend *be` first. Buffers are `rrc_buf {be, dtype, numel, ptr,
+owned}` (views via `rrc_view`):
+
+```c
+rrc_status rrc_gemm(be, const rrc_gemm_args *g);  /* {trans_a, trans_b, m, n, k, alpha, beta,
+                         a, lda, stride_a, b, ldb, stride_b, c, ldc, stride_c, batch}; rrc_gemm2d = batch 1 */
+rrc_status rrc_embedding_fwd(be, n_tokens, dim, vocab, ids, table, out);
+rrc_status rrc_add_bias(be, rows, cols, x, ldx, bias);
+rrc_status rrc_bias_grad(be, rows, cols, dy, ldy, dbias, accumulate);
+rrc_status rrc_rmsnorm_fwd(be, rows, dim, ld, x, w, eps, y);
+rrc_status rrc_rmsnorm_bwd(be, rows, dim, ld, x, w, eps, dy, dx, accumulate);
+rrc_status rrc_rope_fwd(be, n_tokens, n_heads, head_dim, ld, x, pos, cos_tab, sin_tab, n_pos, y);
+rrc_status rrc_rope_bwd(be, n_tokens, n_heads, head_dim, ld, dy, pos, cos_tab, sin_tab, n_pos, dx);
+rrc_status rrc_attn_softmax_fwd(be, batch, rows, cols, ld, batch_stride, s, scale, row_offset, causal,
+                                doc_ids, p);
+rrc_status rrc_attn_softmax_bwd(be, batch, rows, cols, ld, batch_stride, p, dp, scale, ds);
+rrc_status rrc_swiglu_fwd(be, rows, cols, gate, up, ld_in, h, ld_out);
+rrc_status rrc_swiglu_bwd(be, rows, cols, gate, up, ld_in, dh, ld_dh, dgate, dup, ld_out);
+rrc_status rrc_add(be, n, a, b, out);
+rrc_status rrc_axpy(be, n, alpha, x, y);
+rrc_status rrc_scale(be, n, alpha, x);
+rrc_status rrc_convert(be, n, src, dst);
+rrc_status rrc_sum_squares(be, n, x, out, accumulate);
+rrc_status rrc_cross_entropy_fwd_bwd(be, rows, vocab, logits, ld, labels, loss, grad_scale, row_scale,
+                                     write_grad);
+rrc_status rrc_adamw_step(be, n, param, grad, m, v, const rrc_adamw_hparams *h);
+          /* {lr, beta1, beta2, eps, weight_decay, step, grad_scale} */
+```
+
+Memory entries of the table: `alloc(be, bytes, &ptr)`, `free(be, ptr)`, `memcpy_h2d/d2h/d2d(be,
+dst, src, bytes)`, `memset0(be, ptr, bytes)`, `sync(be)`; there are no stream or handle
+arguments — each backend owns one in-order queue, `memcpy_d2h` and `sync` wait for it.
 
 Per-element math lives in `kernels_common/*.h` as `RRC_HD static inline` functions
 (`RRC_HD` = `__host__ __device__` under nvcc, empty under gcc). The CPU backend calls them in
@@ -205,3 +247,72 @@ PEFT key names (`base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weigh
 Multi-GPU, full-parameter training, QLoRA/4-bit base, LoRA dropout > 0, LoRA on embeddings or
 lm_head, sliding-window attention, MoE models, a hand-written tensor-core flash-attention kernel,
 tokenization in C (tokenization is done once, offline, in Python).
+
+## 9. Stage A decisions and deviations (recorded with the code that implements them)
+
+Building and testing: see [README.md](README.md). Each item below is a decision this document
+left open or a place where the implementation differs from the text above, and why.
+
+1. **`rrc_buf` has an `owned` field** (in addition to {backend, dtype, numel, ptr}) so that
+   `rrc_buf_free` can refuse views; an out-of-range `rrc_view` yields `numel = -1`, which every op
+   rejects ("invalid view"), so view arithmetic can be written inline.
+2. **RoPE uses precomputed f32 cos/sin tables** (`rrc_rope_tables`, see §3) passed to
+   `rope_fwd/bwd` with `n_pos`, instead of evaluating cos/sin inside the op: the CPU and CUDA
+   backends then agree exactly on the rotation inputs. Positions outside the table are
+   `RRC_ERR_RANGE`.
+3. **CPU reductions**: `rrc_backend_cpu()` accumulates in double; a second static backend
+   `rrc_backend_cpu_f32acc()` runs the same code with fp32 accumulation so the arithmetic a device
+   backend uses is also executed and tested. Both use a fixed reduction order (bit-identical for
+   any thread count, tested).
+4. **GEMM dtypes**: A, B and C are each f32 or bf16 independently (all 8 combinations, as §4
+   says). Assumption (not verified here, no GPU): cuBLASLt does not support every mixed
+   combination, so the CUDA backend may have to convert operands to a supported combination
+   internally. `stride_a/stride_b = 0` (broadcast over the batch) and C slices interleaved within
+   rows are part of the contract; overlapping C slices are refused.
+5. **Op extensions beyond the §4 list** (all optional to use): `cross_entropy_fwd_bwd` takes an
+   optional per-row f32 `row_scale` and a `write_grad` flag (loss-only evaluation, phase 2 token
+   weights); `adamw_step` takes `grad_scale` so clipping is fused into the update; `bias_grad` is
+   implemented now so the table does not change when biases become trainable.
+6. **Cross entropy** is evaluated in the log-softmax form `(max - z[y]) + log(sum exp(z - max))`
+   (the gradient as `exp((z - max) - log s)`), which avoids cancellation for large logits.
+7. **AdamW** follows the operation order of `torch/optim/adam.py::_single_tensor_adam` (Python
+   scalars rounded to f32, `bias_correction2 ** 0.5`, `addcdiv` with `-step_size`) with the
+   element rounding of ATen's vectorized CPU kernels, determined empirically against torch 2.15:
+   `lerp_` and `addcmul_` are fused multiply-adds (`fmaf`). Tested against
+   `torch.optim.AdamW(foreach=False)` itself: `exp_avg` and `exp_avg_sq` are bit-identical; the
+   parameters differ by one ulp in a small fraction of elements because torch's vectorized CPU
+   `sqrt` is not correctly rounded (`sqrtf` is), so parameters are compared with a tolerance.
+8. **bf16 NaN**: f32 → bf16 keeps sign and upper payload bits and sets the quiet bit
+   (`(bits >> 16) | 0x40`); PyTorch's CPU path returns the canonical `0x7FC0`. Every non-NaN
+   value matches torch bit-for-bit (tested against values converted by torch).
+9. **config.json strictness** (stricter than §1, which only requires refusing unimplemented
+   values): unknown top-level keys are refused unless they are on a documented ignore list
+   (metadata, token ids, generic PreTrainedConfig fields, generation parameters), because an
+   unknown key may carry semantics; `RRC_CONFIG_ALLOW_UNKNOWN_KEYS` / `rrc_inspect
+   --allow-unknown-keys` turns this into a warning. A config with both a non-empty
+   `rope_scaling` and a non-empty `rope_parameters` is refused as ambiguous (transformers silently
+   uses `rope_scaling`); keys inside the rope dict that the rope type does not use are refused
+   (transformers only warns). A top-level `original_max_position_embeddings` overrides the rope
+   dict's value, exactly as transformers does at rope init.
+10. **llama3 rope scaling is accepted for every family** (the formula does not depend on the
+    family; §1 lists it under Llama because that is where it occurs). Qwen2's
+    `attention_bias`/`mlp_bias` and Qwen3's `mlp_bias` keys are ignored because the transformers
+    models do not read them (the tensor-set check still catches any mismatch).
+11. **Safetensors strictness**: like the reference `safetensors` package, the data block must be
+    tiled exactly (overlaps, holes and uncovered bytes are errors); in addition every tensor entry
+    must have exactly the keys dtype/shape/data_offsets. F16 checkpoints are read and converted
+    exactly to f32 by `rrc_st_to_f32` (or RNE to bf16), but F16 is not an engine dtype
+    (`rrc_st_dtype_to_rrc` refuses it); I64 converts to I32 with a range check. The tensor-set
+    checker accepts only F32/BF16 model weights.
+12. **Extra files not in §2**: `src/rrc_inspect.c` (`build/rrc_inspect`, prints the loader's view
+    of a checkpoint as JSON for the pytest comparison), `tests/cuda/headers_check.cu` (the nvcc
+    compile check run by `make test` when `CUDA_HOME`/`RRC_NVCC` is set), `tests/c/rt.h` (test
+    runner). `make cuda` currently runs the header check and compiles `cuda/*.cu` when present.
+13. **No pinned / asynchronous host-to-device entry in the table** (§6 mentions pinned buffers
+    and async copies): `memcpy_h2d` is synchronous with respect to the host buffer, so a CUDA
+    backend that wants overlap must stage through its own pinned buffer inside `memcpy_h2d`.
+    The per-step uploads (token ids, labels, positions, doc ids) are small.
+14. **RoPE precision vs transformers grows with position**: transformers evaluates `inv_freq` in
+    float32, rrc in double (rounded to f32 for the tables), so the angle `p * inv_freq` differs by
+    up to about `p` times one ulp of `inv_freq`. The pytest comparison covers positions up to 255
+    (cos/sin within 3e-5); long-sequence comparisons in later stages must budget for this.
