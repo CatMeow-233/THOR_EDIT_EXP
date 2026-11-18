@@ -286,6 +286,69 @@ commit / discard, version history and restore, training view (reads a run's deci
   NOT_TESTED. Never downloads anything (`HF_HUB_OFFLINE=1` respected; a path is required).
 - Kill criteria are fixed in section 3 **before** any pilot run.
 
+### 1.15 As-built amendments (wave 1, after adversarial review)
+
+Where this section and §1.1–1.7 differ, this section and the code win.
+
+- **Split disjointness is functional, not only nominal** (`tasks.py`). Two rules are *similar*
+  when they are equal on every probe input of some input length, or agree on at least
+  `max_agreement` (default `DEFAULT_MAX_AGREEMENT = 0.25`) of probe inputs. Similar pairs share a
+  split class; a class containing a rule similar to the identity or an atomic operator goes to
+  TRAIN; depth-3 rules similar to any pair, atomic, identity or earlier depth-3 rule are
+  rejected. `check_disjoint` enforces this. Consequence: with the default `depth3_count=16`,
+  `num_operators` must be >= 9 (10-12 never failed over seeds 0-199).
+- **Truncation reaches the verifier**: `VerifierScoreFn` marks a completion truncated when it
+  uses the whole `max_new_tokens` budget, and both verifiers score it 0. Contract for callers:
+  `max_new_tokens >= longest answer + 1` (compositions: `max_len + 1`).
+- **Non-binary scores** (`stats.py`): no bootstrap and no t-bound (the t-bound was shown to be
+  anti-conservative). The same tests run on fractional discordant mass
+  (`gain = sum max(c-i,0)`, `loss = sum max(i-c,0)`): methods `sign_test_fractional` and
+  `tango_score_fractional`, calibrated by simulation in the tests.
+- **Retention sample size** (`gate.py`): default `items_per_retention_slice = 2048`; at 512 a
+  clean slice stops being passable after a handful of spending-schedule verdicts.
+  `GateConfig.retention_horizon(n=, n10=, n01=)` returns the last verdict index at which a slice
+  can still pass; the pilot must choose `n` and the decision count so the horizon covers the run
+  and record that choice. `verdict` rejects wrong splits and uid overlap before spending alpha.
+- **Alarm with correlated rollouts** (`alarm.py`): `min_rollouts` is compared with the Kish
+  effective size. ES callers construct the alarm with `rollouts_per_unit=population` or put
+  per-rollout unit ids in `report.extra["alarm_units"]`.
+- **ES default step** (`es.py`): `ESConfig.lr = 0.001` (step / perturbation ratio ~1).
+- **Interpolation endpoints** (`weights.py`): `lam` 0 and 1 are exact copies; `restore` checks
+  optimizer-state shapes; `revert_groups` validates the incumbent before writing.
+
+### 1.16 Decision semantics pinned for wave 2 (loop, trl_gate, edits)
+
+- **Alarm with both tests passing** → HOLD (not promoted), reason `"alarm_hold"`; counts toward
+  `hold_limit`. Alarm with any failing test → ROLLBACK directly (reason `"confirmed_alarm"`).
+- **SHRINK** (tried only when retention failed): for each lambda, `interpolate` to
+  `incumbent + lam (candidate - incumbent)` and re-test on fresh items. It *passes* when
+  retention passes. The shrunk weights stay as the current weights; the incumbent is promoted to
+  them only if transfer also passes and there is no alarm (record `promoted: true/false` in the
+  reason). Optimizer state is kept from the candidate (Adam moments on interpolated weights;
+  documented, not restored). **GROUP_ROLLBACK**: the same pass/promotion rule after cumulatively
+  reverting groups in damage order. If nothing passes → ROLLBACK (params, optimizer state,
+  masters restored to the incumbent).
+- **Gate disabled** (`enabled=False`, the ungated arm): the full procedure's *first* verdict is
+  still computed on the same fresh items; the decision applied is ACCEPT-with-no-rollback, and
+  the record stores `override="gate_disabled"` and `reason="would=<decision the gate would have
+  taken on the first verdict>"`, so false-accept / false-reject rates against the oracle can be
+  computed. The disabled arm uses a separate ledger so it never changes the gated arm's alpha.
+- **Alpha / horizon budgeting is in verdicts, not decisions.** One decision uses up to
+  `1 + len(shrink_lambdas) + max_group_rollbacks` verdicts. `GatedLoop` checks at start that
+  `GateConfig.retention_horizon(n=items_per_retention_slice, n10=round(0.005 n), n01=0)` covers
+  the worst-case verdict count of the planned run, and raises (or warns with
+  `allow_short_horizon=True`) otherwise. A verdict where retention is unpassable at the current
+  alpha even with zero observed drop gets reason `"horizon_exhausted"`, never a plain rollback
+  reason.
+- **Training-time scoring uses the same truncation rule as the gate**: operators and the TRL
+  screen score sampled completions through `VerifierScoreFn.truncated` + `score_completions`
+  (never raw `verify()`), so V1/V2 divergence is not manufactured by different truncation.
+- **Alarm units**: GRPO operators put the prompt index into `report.extra["alarm_units"]`; ES
+  callers build the alarm with `rollouts_per_unit=population` (or set units); the TRL screen uses
+  the prompt group (`num_generations`). An end-to-end test must show a clean stream through
+  `GatedLoop` does not alarm.
+- **edits.py** evaluates with its own ledger and never spends a training run's alpha.
+
 ## 2. Engineering rules for this package
 
 - Reuse existing pieces: `ChannelSelection`, `extract_channels`, `rollback_channels`,
