@@ -272,7 +272,8 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   `init_from_model(note="")` records the root version): versions are immutable records (id, parent id, edits, gate verdict or
   `override` reason, model fingerprint, created) persisted as JSON; the channel state of each
   version is stored with safetensors (never pickle). `stage(edit)`, `discard(staged)`,
-  `evaluate(staged, gate_config, probe)` (the store's own persisted ledger),
+  `evaluate(staged, gate_config, probe)` (the store's own persisted ledger, and gate items from
+  the store's own stream: purpose `edit/<gate_nonce>/gate/0`, nonce drawn when the store is created),
   `commit(staged, *, override: str | None = None, note="")` (refused if the gate did not pass and no override
   reason is given), `restore(version_id)`, `history()`, plus `add_delta`, `delta_between`, `diff`; scope verification
   (`verify_modification_scope`) is run and stored for every commit.
@@ -351,7 +352,9 @@ Where this section and §1.1–1.7 differ, this section and the code win.
   still computed on the same fresh items; the decision applied is ACCEPT-with-no-rollback, and
   the record stores `override="gate_disabled"` and `reason="would=<decision the gate would have
   taken on the first verdict>"`, so false-accept / false-reject rates against the oracle can be
-  computed. The disabled arm uses a separate ledger so it never changes the gated arm's alpha.
+  computed. The disabled arm uses a separate ledger so it never changes the gated arm's alpha
+  (it spends one alpha per decision, the gated arm one per verdict, so after the gated arm's first
+  re-test the two arms' first verdicts share items but not alpha).
 - **Alpha / horizon budgeting is in verdicts, not decisions.** One decision uses up to
   `1 + len(shrink_lambdas) + max_group_rollbacks` verdicts. `GatedLoop` checks at start that
   `GateConfig.retention_horizon(n=items_per_retention_slice, n10=round(0.005 n), n01=0)` covers
@@ -366,7 +369,8 @@ Where this section and §1.1–1.7 differ, this section and the code win.
   callers build the alarm with `rollouts_per_unit=population` (or set units); the TRL screen uses
   the prompt group (`num_generations`). An end-to-end test must show a clean stream through
   `GatedLoop` does not alarm.
-- **edits.py** evaluates with its own ledger and never spends a training run's alpha.
+- **edits.py** evaluates with its own ledger and never spends a training run's alpha, on gate
+  items from a per-store stream (purpose `edit/<gate_nonce>/gate/0`, see 4.3).
 
 ## 2. Engineering rules for this package
 
@@ -420,6 +424,7 @@ code, its docstrings and sections 1.15/1.16 win. Section 3 (the kill criteria) i
 | `edits.py` | declarative channel edits and the immutable, gate-checked version graph | `EditOp`, `EditRecord`, `VersionStore`, `Version`, `StagedEdit` | `test_capability_edits.py` |
 | `pilot.py` | the P0 pilot pipeline and the section-3 criteria evaluation | `PilotConfig`, `smoke_config`, `run_pilot`, `evaluate_criteria` | `test_capability_pilot.py` |
 | `research_rl/ui/` | local channel search + edit tool (stdlib HTTP server, static front end) | `python -m research_rl.ui` | `test_ui.py` |
+| `research_rl/models/safe_checkpoint.py` | safetensors-only allowlist check of a local model directory, shared by UI `--model-dir` and the P1 script | `check_safetensors_dir`, `UnsafeCheckpointError` | `test_ui.py`, `test_capability_p1_script.py` |
 | `examples/capability_pilot_tiny.py` | CLI of the P0 pilot | `--smoke`, `--output-dir`, `--arms`, `--jobs` | `test_capability_pilot.py` |
 | `scripts/gpu/capability_p1.py` | P1 on a local 7-8B checkpoint, one GPU (**NOT_TESTED**; only `--dry-run` on CPU is tested) | | `test_capability_p1_script.py` |
 
@@ -429,7 +434,9 @@ types), so `from research_rl.capability import GatedLoop, ESOperator` works. The
 `generate_every`) are resolved lazily on first attribute access: `import research_rl.capability`
 does not import `trl_gate`, `research_rl.trainers` or TRL. The intra-package imports form a DAG
 (checked by `tests/research_rl/test_capability_exports.py`, which also imports every module as the
-first module in a fresh interpreter). The full API reference is in [API.md](API.md).
+first module in a fresh interpreter). The full API reference is in [API.md](API.md), with a
+section for every `research_rl.capability` and `research_rl.ui` module; the same test checks that
+each section lists the module's public names with their current signatures.
 
 ### 4.2 Quickstart
 
@@ -566,8 +573,9 @@ On the random model the transfer test cannot pass, so both decisions are `hold`
 `DecisionRecord` per line, with `reward_v1` beside the verdicts (here `reward_v1` is the ES
 fitness, a mean log-probability, not a V1 pass rate).
 
-**A `VersionStore` edit cycle** (continues the blocks above; a fresh model, and a probe with its
-own sampler seed so that edit evaluations never reuse a run's gate items):
+**A `VersionStore` edit cycle** (continues the blocks above; a fresh model, and a probe on a
+sampler of its own. Each store draws its gate items under its own random nonce, so its evaluations
+never replay a run's gate items, or another store's, even with the same sampler seed):
 
 <!-- quickstart:edits -->
 ```python
@@ -623,6 +631,12 @@ python examples/capability_pilot_tiny.py --smoke --output-dir runs/capability_pi
 
 The full P0 run is `python examples/capability_pilot_tiny.py --output-dir runs/pilot_p0 --jobs 4`
 (48 arms; the CLI prints a measured ETA first). `scripts/gpu/capability_p1.py` is NOT_TESTED.
+The section-3 statistics pair the arms of one seed on items: oracle items per decision index,
+tracker items per step, and every arm's `final` point (T_rule, R, A, ...) at one tracker step
+shared by every arm of the config (`final_step` = `oracle_exclusion_steps(config)`), whatever the
+arm's decision count. Every seed of a run shares one split, one start checkpoint, one start map and
+one informed channel selection, so the paired intervals cover RL-stage randomness only (see 4.3,
+"Pilot verdicts").
 
 ### 4.3 Limits and the scope of the statistical guarantees
 
@@ -658,7 +672,17 @@ against the oracle instead of assuming them away.
   the bound is nominal: it inherits the asymptotic approximation of Tango's test, which is not
   calibrated by simulation at the small spending-schedule alphas.
 - The disabled-gate arm (`enabled=False`) and `VersionStore.evaluate` use their own ledgers, so
-  they never spend a gated run's alpha; `edits` evaluations are budgeted separately.
+  they never spend a gated run's alpha; `edits` evaluations are budgeted separately. Because the
+  disabled arm never spends alpha on re-tests, after the gated arm's first re-test the two arms'
+  first verdicts of the same decision run on the same items but at different alphas.
+- Each `VersionStore` draws its gate items from a stream of its own (sampler purpose
+  `edit/<gate_nonce>/gate/0`, index = the store's evaluation counter; the 128-bit nonce is drawn
+  at random when the store is created and kept in `store.json`), so evaluation k of a store never
+  replays the items of evaluation k of another store or of a training run's decision k, also on
+  the same `--sampler-seed`. The streams are independent draws from the same gate pool, so single
+  items can still repeat by chance. A legacy store whose `store.json` has no `gate_nonce` keeps
+  the old key `gate/0` and shares its items with every other legacy store and run on the same
+  sampler seed.
 
 **Horizon.** Under spending, alpha shrinks like `1/k^2`, so a retention slice of fixed size
 becomes unpassable after a finite number of verdicts even with zero observed drop
@@ -702,8 +726,8 @@ retention, and committing it needs a recorded override reason. Candidate-only wi
 p-value and extend the ceiling (`retention_horizon(n01=...)`), but a random tiny demo model has
 none. Remedies: a larger
 `--items-retention` (2048 items raise the ceiling to 24 495 evaluations), a larger
-`--retention-margin`, or a new `--store` directory, which starts a new ledger (the false-accept
-guarantee is then per store, not across stores). The first evaluation pins the ledger's alpha and
+`--retention-margin`, or a new `--store` directory, which starts a new ledger and a new gate-item
+stream (the false-accept guarantee is then per store, not across stores). The first evaluation pins the ledger's alpha and
 schedule, so `--alpha` / `--alpha-schedule` cannot be changed for an existing store.
 
 **Alarm scope.** `DisagreementAlarm` is a heuristic early-warning signal, not a calibrated test.
@@ -726,7 +750,13 @@ independent items. Every such alarm forces an
 items). It runs no statistical test and makes no optimality claim: the winner is not shown to be
 the best subset, finalist repeats average item noise only (not training noise), and the controls
 match the per-candidate burst budget, not the total compute spent on selection
-(`search.STATEMENT` is the default of every `SearchReport.statement`).
+(`search.STATEMENT` is the default of every `SearchReport.statement`). Items depend on the
+sampler, the purpose and `index`, not on `seed`. The UI's search number `k` of a process (0, 1,
+...) passes `index=k` (reported as `search_index` and `report.config.index`), so successive
+searches rank candidates on independently drawn track-pool items (not guaranteed disjoint)
+instead of one fixed set; the counter is not
+persisted, so after a UI restart the first search reuses the items of an earlier process's first
+search on the same sampler.
 
 **ES versus backprop.** ES is the forward-only operator because "no backpropagation" is a design
 constraint of this build, not because it is expected to be stronger. Nothing here claims ES
@@ -734,12 +764,69 @@ matches or beats gradient training; the pilot's Operator criterion (section 3) o
 ES reaches half of GRPO's T_rule gain within ten times its forward-pass-equivalent budget, and the
 `ESConfig` defaults were validated only on CPU toy problems.
 
+**Pilot verdicts: scope and reachability** (`pilot.CRITERIA_DEFINITIONS`, written into every
+`results.json`; the P1 script uses the same `evaluate_criteria`).
+
+- *Scope of the intervals.* `run_pilot` builds the splits, runs SFT, measures the start map and
+  selects the informed channels once, from `config.seed`; every arm of every seed reloads that one
+  `start_model.safetensors` and uses that one selection. The arm seed varies only the RL stage: the
+  sampler root (every item drawn through the arm's sampler: gate, tracker, oracle and training items,
+  i.e. GRPO prompts and ES fitness items), the operator seed and the `es_random` draw. The
+  paired-over-seeds intervals therefore cover RL-stage randomness only, conditional on this split,
+  start and selection; they say nothing about SFT or selection variance. A Subset verdict concerns
+  this one informed selection (only the density-matched random control is redrawn per seed), not
+  the selection procedure. `summary.md` states this under "Setup".
+- *Gate.* SUCCESS requires both section-3 KILL conditions to be evaluable and not to hold. The
+  reject-rate KILL ("rejects more than half of the oracle-improved blocks") is evaluable only with
+  at least `min_improved_blocks` (default 5) oracle-improved blocks, pooled over every arm's first
+  verdicts (`gate_exercise(...)["false_reject_evaluable"]`). With fewer the verdict is INCONCLUSIVE
+  ("reject-rate KILL not evaluable"), whatever the T_rule and hack intervals show; the clean-cost
+  KILL still applies. So a gate that rejects every block cannot pass the Gate question; on what the
+  default configuration measured (four seed-0 arms, no oracle-improved block) the Gate verdict could
+  not be SUCCESS.
+- *Operator.* The KILL ("below half of GRPO's gain") is applied only if the ES arm spent the whole
+  `operator_budget_factor` x GRPO FPE budget in every paired seed; otherwise the result is SUCCESS or
+  INCONCLUSIVE, the statistic `kill_reachable` is False, the reason says "Operator KILL not
+  reachable" and the run adds a warning (`results["warnings"]`, `summary.md`). At the `PilotConfig`
+  defaults GRPO spends 512 FPE per update (24 576 in 48 updates, budget 245 760) and ES 256 per
+  update (12 288 in 48 updates, 5 % of the budget), so the default P0 run cannot reach the Operator
+  KILL. `es_updates=960` spends the budget (`choose_retention_items` then needs 3072 retention items
+  per slice); it multiplies the ES arms' updates by 20 (configuration not run; time extrapolated, not measured) and is not
+  the default. These figures are recomputed by `test_capability_pilot.py`.
+
+**What a decision restores, and exceptions.** A decision writes only the gated parameters and
+the optimizer state (moments, masters, rule state) of the operator / trainer. It does not write
+TRL's `ref_model`, so `CapabilityGateCallback` with an enabled gate refuses `sync_ref_model=True`
+(`ValueError` in `on_train_begin`): TRL's sync mixes the policy into the KL reference at its sync
+steps, and a ROLLBACK / SHRINK / GROUP_ROLLBACK could not take rejected weights back out of it.
+The disabled gate never changes the weights and allows it. If the remedy stage's trial writes or
+re-tests raise (a re-test OOM, `KeyboardInterrupt`, a scorer error), `GateController.run` writes
+the raw candidate's parameters and masters back before re-raising (the stage never touches the
+moments), so the model is not left at interpolated or partly reverted weights; the first verdict
+writes nothing, and a failure while the chosen outcome is applied (`on_decision`, the promotion's
+capture) keeps that outcome's weights. The verdicts already computed have spent their alpha and
+no record is written. `GatedLoop` then reports `decision_pending`, saves the owed block in
+`state_dict()` (which `load_state_dict` accepts), counts the owed decision's verdicts in
+`required_verdicts` / the horizon check, and takes that decision at its next `run()` with the
+same `decision_index` (the same attempt-0 items, at the ledger's next alphas). `CapabilityGateCallback` keeps its running block and
+decision index, so a further `train()` judges the candidate at its next block decision.
+
 **Security.** Nothing in this package executes untrusted code (edits are declarative records;
 the code-execution reward of `research_rl.rewards` stays disabled by default and is not used).
 The UI binds 127.0.0.1 by default and needs the session token on every API request; the AUDIT
 split is not reachable through it. Model weights (UI `--model-dir`, the pilot's start checkpoint,
 the P1 script) and version-store channel states and deltas are read with safetensors only; pickle
-weight files are refused. Resume state, including incumbent snapshots, is not safetensors:
+weight files are refused. For UI `--model-dir` and the P1 script this is one shared allowlist
+(`research_rl.models.safe_checkpoint.check_safetensors_dir`) over exactly the files
+`from_pretrained(use_safetensors=True)` opens: `model.safetensors`, or
+`model.safetensors.index.json` whose `weight_map` lists only bare `*.safetensors` file names present
+in the directory (an index naming a suffixless or out-of-directory pickle shard would otherwise be
+`torch.load`ed); a `transformers_weights` override in `config.json` and a PEFT adapter directory are
+refused. The UI additionally refuses any pickle-format file anywhere in the directory. The UI server
+handles at most 64 connections at once (more are closed on accept) and drops a connection whose
+request line and headers have not arrived within 30 s in total, so a client without the token
+cannot pile up threads or hold one by trickling bytes; a client that keeps reconnecting can still
+occupy the slots (the server is a single-user local tool, not hardened for hostile networks). Resume state, including incumbent snapshots, is not safetensors:
 `CapabilityGateCallback` state travels in ResearchRL's checkpoint file
 `research_rl_components.pt` (written with `torch.save`, read only with
 `torch.load(weights_only=True)`, the restricted unpickler), and `GatedLoop.state_dict()` is a

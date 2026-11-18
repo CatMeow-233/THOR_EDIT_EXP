@@ -343,6 +343,65 @@ def test_spec_section_3_and_api_reference_present() -> None:
     assert "| `capability/` |" in readme and "CAPABILITY.md" in readme
 
 
+UI_MODULES = ("api", "jobs", "loading", "runs", "server", "workspace")
+
+
+class _NamedDefault:
+    """Renders a long default that is a module constant by its name (as API.md does)."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+def _api_signature(mod: Any, fn: Any) -> str:
+    sig = inspect.signature(fn)
+    consts = {id(v): k for k, v in vars(mod).items() if k.isupper() and len(repr(v)) > 80}
+    params = [
+        p.replace(default=_NamedDefault(consts[id(p.default)])) if id(p.default) in consts else p
+        for p in sig.parameters.values()
+    ]
+    return str(sig.replace(parameters=params))
+
+
+def _api_sections() -> dict[str, str]:
+    text = API_MD.read_text(encoding="utf-8")
+    pattern = r"^## `(research_rl[\w.]*)`\n(.*?)(?=^## `|^<!-- capability-api:end|\Z)"
+    return {m.group(1): m.group(2) for m in re.finditer(pattern, text, re.S | re.M)}
+
+
+@pytest.mark.parametrize(
+    "modname",
+    [
+        "research_rl.ui",
+        *(f"research_rl.ui.{m}" for m in UI_MODULES),
+        *(f"research_rl.capability.{m}" for m in ALL_MODULES),
+    ],
+)
+def test_api_reference_matches_public_names_and_signatures(modname: str) -> None:
+    """API.md has a section per public module listing its ``__all__`` with the live signatures."""
+    section = _api_sections().get(modname)
+    assert section is not None, f"API.md has no section for {modname}"
+    mod = importlib.import_module(modname)
+    public = getattr(mod, "__all__", None) or [  # ``types`` has no ``__all__``: its own public names
+        n for n, v in vars(mod).items() if not n.startswith("_") and getattr(v, "__module__", None) == modname
+    ]
+    for name in public:
+        assert f"`{name}" in section, f"{modname}.{name} missing from API.md"
+        obj = getattr(mod, name)
+        if inspect.isfunction(obj):
+            assert f"`{name}{_api_signature(mod, obj)}`" in section, f"{modname}.{name}: stale signature"
+        elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+            for attr, raw in vars(obj).items():
+                fn = raw.__func__ if isinstance(raw, (staticmethod, classmethod)) else raw
+                if attr.startswith("_") or not inspect.isfunction(fn):
+                    continue
+                expected = f"`{attr}{_api_signature(mod, fn)}`"
+                assert expected in section, f"{modname}.{name}.{attr}: stale signature"
+
+
 @pytest.fixture
 def quiet_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """``tempfile.mkdtemp`` (used by the quickstart) creates its directories under ``tmp_path``."""

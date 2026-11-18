@@ -947,3 +947,112 @@ def test_disabled_gate_with_real_probe_leaves_training_bit_identical(tokenizer, 
         gated.run.hooked_optimizer.inner.state_dict(), plain.run.hooked_optimizer.inner.state_dict()
     )
     assert gated.gate.gate.ledger.count == 0  # the disabled arm spends a private ledger
+
+
+# ---- reference-model sync and exceptions mid-decision
+@pytest.fixture
+def ref_model_from_tiny(monkeypatch, tokenizer):
+    """beta > 0 makes TRL build ``ref_model`` from the model's name; build the same tiny start
+    model instead (nothing is downloaded)."""
+    import trl.trainer.grpo_trainer as grpo_trainer
+
+    monkeypatch.setattr(
+        grpo_trainer, "create_model_from_path", lambda *a, **k: build_tiny_llama(len(tokenizer), seed=0)
+    )
+
+
+@pytest.mark.integration
+def test_sync_ref_model_refused_with_enabled_gate(tokenizer, tmp_path, ref_model_from_tiny):
+    """Regression: TRL's ref-model sync mixed weights of rejected blocks into the KL anchor."""
+    args = grpo_args(max_steps=2, beta=0.1, sync_ref_model=True, ref_model_sync_steps=1)
+    r = build(
+        tmp_path,
+        tokenizer,
+        run_name="refsync",
+        args=args,
+        probe=ScriptedProbe(["fail"]),
+        config=gate_config(block_updates=2),
+        optim=OptimSpec(hooked=False),
+    )
+    ref0 = snapshot(r.trainer.ref_model)
+    with pytest.raises(ValueError, match="sync_ref_model"):
+        r.trainer.train()
+    assert same(snapshot(r.trainer.ref_model), ref0) and r.gate.records == []
+    # the disabled gate never changes the weights, so it allows the sync
+    off = build(
+        tmp_path / "off",
+        tokenizer,
+        run_name="refsync_off",
+        args=args,
+        probe=ScriptedProbe(["fail"]),
+        config=gate_config(block_updates=2, enabled=False),
+        optim=OptimSpec(hooked=False),
+    )
+    off.trainer.train()
+    assert [rec.decision for rec in off.gate.records] == [GateDecision.ACCEPT]
+
+
+@pytest.mark.integration
+def test_kl_reference_untouched_by_rollback_without_sync(tokenizer, tmp_path, ref_model_from_tiny):
+    r = build(
+        tmp_path,
+        tokenizer,
+        run_name="kl_rollback",
+        args=grpo_args(max_steps=2, beta=0.1),
+        probe=ScriptedProbe(["fail"]),
+        config=gate_config(block_updates=2),
+        optim=OptimSpec(hooked=False),
+    )
+    ref0 = snapshot(r.trainer.ref_model)
+    start = snapshot(r.trainer.model)
+    r.trainer.train()
+    assert [rec.decision for rec in r.gate.records] == [GateDecision.ROLLBACK]
+    assert same(snapshot(r.trainer.ref_model), ref0)
+    assert same(
+        {k: v for k, v in snapshot(r.trainer.model).items() if k in r.gate.incumbent.params},
+        {k: start[k] for k in r.gate.incumbent.params},
+    )
+
+
+class FaultyProbe(ScriptedProbe):
+    """Raises at every attempt >= ``at_attempt`` while ``armed``."""
+
+    def __init__(self, plan: Sequence[str], at_attempt: int) -> None:
+        super().__init__(plan)
+        self.at_attempt = at_attempt
+        self.armed = True
+
+    def evidence(self, model, incumbent, decision_index, *, attempt=0, alarm=False) -> GateEvidence:
+        if self.armed and attempt >= self.at_attempt:
+            raise RuntimeError("simulated OOM in re-test")
+        return super().evidence(model, incumbent, decision_index, attempt=attempt, alarm=alarm)
+
+
+@pytest.mark.integration
+def test_exception_mid_shrink_leaves_candidate_and_gate_continues(tokenizer, tmp_path):
+    """Regression: a re-test that raised left the policy at the interpolated weights."""
+    probe = FaultyProbe(["fail"], at_attempt=1)
+    r = build(
+        tmp_path,
+        tokenizer,
+        run_name="fault",
+        args=grpo_args(max_steps=2),
+        probe=probe,
+        config=gate_config(block_updates=2, shrink_lambdas=(0.5,)),
+        optim=OptimSpec(hooked=False),
+    )
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        r.trainer.train()
+    gate = r.gate
+    inc = gate.incumbent.params
+    assert same(
+        {k: v for k, v in snapshot(r.trainer.model).items() if k in inc}, {k: r.pre.params[2][k] for k in inc}
+    )
+    inner = base_optimizer(r.trainer.optimizer)
+    assert optim_state_equal(copy.deepcopy(inner.state_dict()), r.pre.optim[2])
+    assert gate.records == [] and gate.decision_index == 0 and gate.gate.ledger.count == 1
+    assert len(gate._block_v1) == 2  # the block's rewards are kept for the next decision
+    probe.armed = False
+    r.trainer.train()  # a further train() continues the same gate and takes decision 0
+    assert [(rec.decision_index, rec.decision) for rec in gate.records] == [(0, GateDecision.ROLLBACK)]
+    assert same({k: v for k, v in snapshot(r.trainer.model).items() if k in inc}, inc)

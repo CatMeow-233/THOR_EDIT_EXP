@@ -83,6 +83,16 @@ when the operator has no optimizer). After every procedure the operator is told 
 promotion captures the new incumbent with :func:`~research_rl.capability.weights.capture` (same
 parameter names, the operator's optimizer, the same channel-state layers as the old incumbent).
 
+Exceptions during the procedure: the first verdict writes nothing. If anything raises during the
+remedy stage's trial writes and re-tests (a re-test OOM, ``KeyboardInterrupt``, a scorer error),
+the raw candidate's parameters and masters are written back with ``weights.restore(...,
+restore_optimizer=False)`` (the stage never touches the moments, so the optimizer state is the
+candidate's too) before the exception propagates: the model is left at the pre-decision
+candidate, never at interpolated or partly reverted weights. A failure while the chosen outcome
+is applied (``_passed`` / ``_rollback``: the promotion's capture, ``operator.on_decision``) keeps
+that outcome's weights. The verdicts already computed have spent their alpha; no record is returned and the hold streak is unchanged. ``GatedLoop`` keeps
+the decision pending (:attr:`GatedLoop.decision_pending`) and takes it at its next ``run``.
+
 Gate disabled (the ungated control arm, ``GateConfig.enabled=False``)
 ---------------------------------------------------------------------
 Only the first verdict is computed (same fresh items as the gated arm would use) and classified as
@@ -104,6 +114,7 @@ test_capability_loop.py``); nothing here has run on a GPU (NOT_TESTED).
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -381,6 +392,8 @@ class GateController:
         incumbent that holds optimizer state whenever ``operator.optimizer`` is not None (a
         ROLLBACK must restore it), and, when the gate is enabled and the group stage is enabled,
         that every channel group can be reverted to this incumbent (:meth:`check_group_scope`).
+        An exception raised later leaves the model at the candidate (see the module docstring,
+        "Exceptions during the procedure").
         """
         if not isinstance(incumbent, StateSnapshot):
             raise TypeError(f"incumbent must be a StateSnapshot, got {type(incumbent).__name__}")
@@ -459,38 +472,68 @@ class GateController:
         # ---- retention failed: SHRINK, then GROUP_ROLLBACK, then ROLLBACK
         candidate = capture(model, incumbent.names(), optimizer=optimizer)
         attempt = 0
-        for lam in cfg.shrink_lambdas:
-            interpolate(model, incumbent, candidate, lam, optimizer=optimizer)
-            attempt += 1
-            verdict = evaluate(attempt)
-            if verdict.retention_ok:
-                return self._passed(
-                    model, operator, incumbent, record, verdict, GateDecision.SHRINK, shrink_lambda=lam
-                )
-            if retention_unpassable(verdict):
-                return self._rollback(model, operator, incumbent, record, REASON_HORIZON_EXHAUSTED)
-        if self.group_stage_enabled:
-            restore(model, candidate, optimizer=optimizer, restore_optimizer=False)
-            order = self._damage_order(model, incumbent, decision_index, first)
-            reverted: list[str] = []
-            for group in order[: cfg.max_group_rollbacks]:
-                revert_groups(model, incumbent, [group], optimizer=optimizer)
-                reverted.append(group.name)
+        finish: Callable[[], tuple[DecisionRecord, StateSnapshot]] | None = None
+        # The trial writes and re-tests are exception-safe: if anything raises before the outcome
+        # is chosen (a re-test OOM, KeyboardInterrupt, a scorer error), the raw candidate's
+        # parameters and masters are written back (the remedy stage never touches the moments)
+        # and the exception propagates; the outcome itself (_passed / _rollback, which also tell
+        # the operator) is applied outside this block.
+        try:
+            for lam in cfg.shrink_lambdas:
+                interpolate(model, incumbent, candidate, lam, optimizer=optimizer)
                 attempt += 1
                 verdict = evaluate(attempt)
                 if verdict.retention_ok:
-                    return self._passed(
+                    finish = functools.partial(
+                        self._passed,
                         model,
                         operator,
                         incumbent,
                         record,
                         verdict,
-                        GateDecision.GROUP_ROLLBACK,
-                        groups=reverted,
+                        GateDecision.SHRINK,
+                        shrink_lambda=lam,
                     )
+                    break
                 if retention_unpassable(verdict):
-                    return self._rollback(model, operator, incumbent, record, REASON_HORIZON_EXHAUSTED)
-        return self._rollback(model, operator, incumbent, record, REASON_RETENTION_FAILED)
+                    finish = functools.partial(
+                        self._rollback, model, operator, incumbent, record, REASON_HORIZON_EXHAUSTED
+                    )
+                    break
+            if finish is None and self.group_stage_enabled:
+                restore(model, candidate, optimizer=optimizer, restore_optimizer=False)
+                order = self._damage_order(model, incumbent, decision_index, first)
+                reverted: list[str] = []
+                for group in order[: cfg.max_group_rollbacks]:
+                    revert_groups(model, incumbent, [group], optimizer=optimizer)
+                    reverted.append(group.name)
+                    attempt += 1
+                    verdict = evaluate(attempt)
+                    if verdict.retention_ok:
+                        finish = functools.partial(
+                            self._passed,
+                            model,
+                            operator,
+                            incumbent,
+                            record,
+                            verdict,
+                            GateDecision.GROUP_ROLLBACK,
+                            groups=list(reverted),
+                        )
+                        break
+                    if retention_unpassable(verdict):
+                        finish = functools.partial(
+                            self._rollback, model, operator, incumbent, record, REASON_HORIZON_EXHAUSTED
+                        )
+                        break
+        except BaseException:
+            restore(model, candidate, optimizer=optimizer, restore_optimizer=False)
+            raise
+        if finish is None:
+            finish = functools.partial(
+                self._rollback, model, operator, incumbent, record, REASON_RETENTION_FAILED
+            )
+        return finish()
 
     def check_group_scope(self, model: nn.Module, incumbent: StateSnapshot) -> None:
         """Raise :class:`~research_rl.capability.weights.SnapshotError` (a ``ValueError``) unless
@@ -772,6 +815,17 @@ class GatedLoop:
     def updates_since_decision(self) -> int:
         return len(self._block_v1)
 
+    @property
+    def decision_pending(self) -> bool:
+        """True when the running block is owed a decision that has not been recorded: it holds
+        ``block_updates`` updates, or its latched alarm fired with ``alarm_triggers_decision``.
+        This happens only when a decision raised (see :meth:`run`); the next :meth:`run` takes
+        that decision before its first update."""
+        n = len(self._block_v1)
+        return n >= self.config.block_updates or (
+            n > 0 and self._block_alarm and self.config.alarm_triggers_decision
+        )
+
     # ---------------------------------------------------------------- horizon
     def _horizon_config(self) -> GateConfig:
         """``config`` with ``alpha`` / ``alpha_schedule`` of the ledger the verdicts spend from
@@ -800,13 +854,18 @@ class GatedLoop:
         return best
 
     def required_verdicts(self, num_updates: int) -> int:
-        """:func:`worst_case_verdicts` of ``num_updates`` more updates from the current position."""
-        return worst_case_verdicts(
+        """:func:`worst_case_verdicts` of ``num_updates`` more updates from the current position
+        (with a :attr:`decision_pending`: that decision's ``max_verdicts_per_decision`` plus the
+        worst case of ``num_updates`` updates from an empty block)."""
+        num_updates = _check_index("num_updates", num_updates)
+        per_decision = self.controller.max_verdicts_per_decision
+        pending = self.decision_pending
+        return (per_decision if pending else 0) + worst_case_verdicts(
             num_updates,
             block_updates=self.config.block_updates,
-            verdicts_per_decision=self.controller.max_verdicts_per_decision,
+            verdicts_per_decision=per_decision,
             alarm_triggers_decision=self.config.alarm_triggers_decision,
-            since=self.updates_since_decision,
+            since=0 if pending else self.updates_since_decision,
         )
 
     def check_horizon(self, num_updates: int) -> None:
@@ -836,11 +895,22 @@ class GatedLoop:
     # ---------------------------------------------------------------- running
     def run(self, num_updates: int) -> list[DecisionRecord]:
         """Run ``num_updates`` more operator updates (with their decisions); returns the decision
-        records of this call (also appended to :attr:`records`). The horizon check runs first."""
+        records of this call (also appended to :attr:`records`). The horizon check runs first.
+
+        Exceptions: if a decision raises (a probe / scorer error, OOM, ``KeyboardInterrupt``), the
+        controller has written the raw candidate back (see :meth:`GateController.run`), no record
+        is written, ``decision_index`` is not advanced and the running block (rewards, latched
+        alarm) is kept, so :attr:`decision_pending` is True; the verdicts already computed have
+        spent their alpha. :meth:`state_dict` / :meth:`load_state_dict` keep that state, and the
+        next :meth:`run` (also ``run(0)``) first takes the pending decision, on the same weights,
+        with the same ``decision_index`` (so the same attempt-0 items; the ledger moves on) and
+        ``update_index`` = the block's last update."""
         num_updates = _check_index("num_updates", num_updates)
         self.check_horizon(num_updates)
         out: list[DecisionRecord] = []
         cfg = self.config
+        if self.decision_pending:
+            out.append(self._decide(self.update_index - 1))
         for _ in range(num_updates):
             t = self.update_index
             report = self.operator.step(self.model, t)
@@ -919,6 +989,9 @@ class GatedLoop:
         ``sampler`` (the probe sampler's identity; it has no position: items are keyed by
         ``(purpose, index)``), ``alarm`` and ``operator`` state dicts. Parameters outside
         ``operator.parameter_names()`` are not saved: rebuild the model identically before loading.
+        After a decision raised (:attr:`decision_pending`), the owed block (up to
+        ``block_updates`` updates) is saved as it is; the restored loop takes that decision at its
+        next :meth:`run`.
         """
         current = capture(self.model, self.operator.parameter_names(), optimizer=self.operator.optimizer)
         return {
@@ -969,7 +1042,7 @@ class GatedLoop:
         block = state["block"]
         v1 = [float(v) for v in block["reward_v1"]]
         v2 = [None if v is None else float(v) for v in block["reward_v2"]]
-        if len(v1) != len(v2) or len(v1) >= self.config.block_updates:
+        if len(v1) != len(v2) or len(v1) > self.config.block_updates:
             raise ValueError(f"invalid running block of {len(v1)} updates")
         if not isinstance(block["alarm"], bool):
             raise ValueError(f"invalid block alarm flag {block['alarm']!r}")

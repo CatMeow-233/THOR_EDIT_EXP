@@ -20,9 +20,15 @@ Item streams (all keyed ``(purpose, index)`` on the workspace's sampler):
 * edit evaluation: the gate items of :meth:`VersionStore.evaluate` (gate pool, key
   ``("gate/0", evaluation counter)``); the training reward beside it on ``train/pairs`` items
   ``("ui/reward", evaluation counter)``;
-* subset search: :class:`~research_rl.capability.search.SubsetSearch` (track pool by default);
-  the ES fitness of update ``u`` on ``train/pairs`` items ``("ui/search/fitness/<k>", u)`` where
-  ``k`` counts the searches of this process.
+* subset search number ``k`` of this process (``k`` = 0, 1, ... counts the searches of this
+  process; reported as ``search_index`` and ``report.config.index``):
+  :class:`~research_rl.capability.search.SubsetSearch` with ``index=k`` (track pool), so its
+  round and final item sets ``(f"search/{r}/{c}", k)`` / ``(f"search/final/{j}", k)`` are drawn
+  independently for every search (not guaranteed disjoint) and a user comparing several
+  searches' winners does not select on one fixed item set; the ES fitness of update ``u`` on ``train/pairs`` items
+  ``("ui/search/fitness/<k>", u)``. Like the statistics counters, ``k`` is not persisted: after
+  a restart of the UI the first search again uses ``index=0`` (the same items as the first
+  search of an earlier process on the same sampler).
 
 Every number this module returns was computed by the model loaded in this process on this
 machine. With ``--tiny-demo`` that is a randomly initialised tiny model: the numbers exercise the
@@ -1143,6 +1149,7 @@ class Workspace:
             seed=params.seed,
             items_per_transfer_slice=params.items_per_transfer_slice,
             items_per_retention_slice=params.items_per_retention_slice,
+            index=k,
         )
         before = fingerprint(self.model)
         report = search.run(self.model)
@@ -1151,6 +1158,7 @@ class Workspace:
             raise RuntimeError("the search did not restore the start weights")
         result = {
             "params": params.to_dict(),
+            "search_index": k,
             "report": report.to_dict(),
             "fingerprint": after,
             "honesty": HONESTY_NOTE,

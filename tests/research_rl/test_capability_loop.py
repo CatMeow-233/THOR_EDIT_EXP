@@ -534,6 +534,27 @@ def test_gate_disabled_records_would_and_separate_ledger(sampler: ItemSampler, t
     assert gate.ledger.count == 0 and ctl.verdict_gate.ledger.count == 3
 
 
+def test_gate_disabled_first_verdicts_share_items_not_alpha(sampler: ItemSampler, tok: Any) -> None:
+    # GateConfig.enabled contract: the ungated arm spends a private ledger one alpha per decision,
+    # the gated arm one per verdict, so after a re-test the first verdicts of the same decision are
+    # on the same items but (under "spending") at different alphas
+    first: dict[bool, Any] = {}
+    for enabled, plan in ((True, ["fail", "pass", "pass"]), (False, ["fail", "pass"])):
+        s = Setup(tok)
+        ctl, score, gate = controller_for(
+            sampler, plan, base_config(enabled=enabled, alpha_schedule="spending")
+        )
+        r0, inc = ctl.run(s.model, s.op, s.incumbent, 0, 1, False, None)
+        assert len(r0.verdicts) == (2 if enabled else 1)  # the gated arm re-tested after shrinking
+        before = len(score.uids)
+        r1, _ = ctl.run(s.model, s.op, inc, 1, 2, False, None)
+        first[enabled] = (r1.verdicts[0].transfer.alpha, score.uids[before])
+        assert gate.ledger.count == (3 if enabled else 0)
+    ledger = AlphaLedger(0.05, "spending")
+    assert first[True][0] == ledger.alpha_at(3) and first[False][0] == ledger.alpha_at(2)
+    assert first[True][1] == first[False][1]  # identical items
+
+
 def test_gate_disabled_alarm_would_reasons(sampler: ItemSampler, tok: Any) -> None:
     s = Setup(tok)
     ctl, _, _ = controller_for(sampler, ["fail", "pass"], base_config(enabled=False))
@@ -1159,3 +1180,174 @@ def test_horizon_check_uses_the_verdict_ledger(sampler: ItemSampler, tok: Any) -
             with pytest.raises(ValueError, match=r"alpha=0\.001"):
                 loop.run(2)
             assert op.steps == 0
+
+
+# ============================================================================== exceptions mid-decision
+class ProbeFault(RuntimeError):
+    """Stands in for an OOM / scorer error raised by a re-test."""
+
+
+class ProbeInterrupt(KeyboardInterrupt):
+    """A ``BaseException`` that is not an ``Exception`` (Ctrl-C during a re-test)."""
+
+
+def arm_fault(
+    probe: CapabilityProbe, at_attempt: int, fault: type[BaseException] = ProbeFault
+) -> dict[str, bool]:
+    """Make ``probe.evidence`` raise at every attempt >= ``at_attempt`` while ``armed["on"]``."""
+    armed = {"on": True}
+    original = probe.evidence
+
+    def evidence(
+        model: nn.Module,
+        incumbent: StateSnapshot,
+        decision_index: int,
+        *,
+        attempt: int = 0,
+        alarm: bool = False,
+    ):
+        if armed["on"] and attempt >= at_attempt:
+            raise fault(f"simulated fault at attempt {attempt}")
+        return original(model, incumbent, decision_index, attempt=attempt, alarm=alarm)
+
+    probe.evidence = evidence  # type: ignore[method-assign]
+    return armed
+
+
+@pytest.mark.parametrize(
+    ("hooked", "fault"), [(False, ProbeFault), (True, ProbeFault), (False, ProbeInterrupt)]
+)
+def test_exception_during_shrink_retest_leaves_candidate(
+    sampler: ItemSampler, tok: Any, hooked: bool, fault: type[BaseException]
+) -> None:
+    """Regression: a re-test that raised left the model at the interpolated weights."""
+    s = Setup(tok, dtype=torch.bfloat16 if hooked else torch.float32, hooked=hooked)
+    ctl, _, gate = controller_for(
+        sampler, ["fail"] * 3, base_config(shrink_lambdas=(0.5,), max_group_rollbacks=0)
+    )
+    arm_fault(ctl.probe, 1, fault)
+    with pytest.raises(fault):
+        ctl.run(s.model, s.op, s.incumbent, 0, 1, False, None)
+    s.assert_is_candidate()  # parameters and optimizer state bit-identical to the candidate
+    if hooked:
+        assert isinstance(s.opt, HookedOptimizer) and s.candidate.masters
+        assert_tree_equal(masters_of(s.model, s.opt), s.candidate.masters)
+    assert gate.ledger.count == 1  # the first verdict was spent
+    assert ctl.holds == 0 and s.op.decisions == []
+
+
+def test_exception_during_group_retest_leaves_candidate(sampler: ItemSampler, tok: Any) -> None:
+    s = Setup(tok)
+    groups = group_channels(random_scores(s.model, 3), bands=2)
+    config = base_config(rollback_unit=RollbackUnit.CHANNELS, shrink_lambdas=(0.5,))
+    ctl, _, gate = controller_for(
+        sampler, ["fail"] * 5, config, tok=tok, rollback_unit=RollbackUnit.CHANNELS, groups=groups
+    )
+    arm_fault(ctl.probe, 3)  # attempt 1 = shrink, 2 = first group, 3 = second group (cumulative)
+    with pytest.raises(ProbeFault):
+        ctl.run(s.model, s.op, s.incumbent, 0, 1, False, None)
+    s.assert_is_candidate()
+    assert gate.ledger.count == 3 and s.op.decisions == []
+
+
+def test_exception_in_on_decision_after_rollback_is_not_undone(sampler: ItemSampler, tok: Any) -> None:
+    """The candidate is written back only for failures of the trial stage, never after the
+    outcome was applied (an operator that fails in on_decision keeps the ROLLBACK's weights)."""
+    s = Setup(tok)
+    ctl, _, _ = controller_for(sampler, ["fail"] * 3, base_config())
+
+    def broken(decision: GateDecision) -> None:
+        raise ProbeFault("on_decision failed")
+
+    s.op.on_decision = broken  # type: ignore[method-assign]
+    with pytest.raises(ProbeFault):
+        ctl.run(s.model, s.op, s.incumbent, 0, 1, False, None)
+    s.assert_is_incumbent()
+
+
+@pytest.mark.parametrize("at_attempt", [0, 1])
+def test_loop_exception_keeps_decision_pending_and_resumes_exactly(
+    sampler: ItemSampler, tok: Any, tmp_path: Path, at_attempt: int
+) -> None:
+    """A decision that raised: the model stays at the candidate, the block stays owed, the state
+    saves and loads, and the next run() takes the decision; the result equals an uninterrupted run."""
+    config = base_config(block_updates=2, shrink_lambdas=(0.5,), max_group_rollbacks=0)
+    plan = ["fail", "fail", "hold", "hold"]
+    ref, _ = lm_loop(sampler, tok, plan, config)
+    ref_records = ref.run(4)
+    assert [r.decision for r in ref_records] == [GateDecision.ROLLBACK, GateDecision.HOLD]
+
+    loop, op = lm_loop(sampler, tok, plan, config, log_path=tmp_path / "cut.jsonl")
+    arm_fault(loop.controller.probe, at_attempt)
+    with pytest.raises(ProbeFault):
+        loop.run(2)
+    candidate = capture(loop.model, op.parameter_names(), optimizer=op.optimizer)
+    assert loop.decision_pending and loop.updates_since_decision == 2
+    assert loop.decision_index == 0 and loop.records == [] and op.decisions == []
+    assert loop.controller.verdict_gate.ledger.count == at_attempt
+    per = loop.controller.max_verdicts_per_decision
+    assert loop.required_verdicts(0) == per
+    assert loop.required_verdicts(2) == per + worst_case_verdicts(
+        2, block_updates=2, verdicts_per_decision=per, alarm_triggers_decision=True
+    )
+    assert not (tmp_path / "cut.jsonl").exists()
+    path = tmp_path / "state.pt"
+    torch.save(loop.state_dict(), path)
+    state = torch.load(path, weights_only=True)
+    assert state["current"]["fingerprint"] == candidate.fingerprint != loop.incumbent.fingerprint
+
+    resumed, _ = lm_loop(sampler, tok, plan, config, log_path=tmp_path / "cut.jsonl")
+    resumed.load_state_dict(state)
+    assert resumed.decision_pending
+    assert_params(resumed.model, candidate.params)
+    records = resumed.run(2)
+    assert [(r.decision_index, r.update_index, r.decision, r.reason) for r in records] == [
+        (r.decision_index, r.update_index, r.decision, r.reason) for r in ref_records
+    ]
+    assert not resumed.decision_pending and resumed.update_index == 4
+    assert_params(resumed.model, params_of(ref.model))
+    assert resumed.operator.optimizer is not None and ref.operator.optimizer is not None
+    assert_tree_equal(resumed.operator.optimizer.state_dict(), ref.operator.optimizer.state_dict())
+    rows = [json.loads(ln) for ln in (tmp_path / "cut.jsonl").read_text().splitlines()]
+    assert [r["decision_index"] for r in rows] == [0, 1]
+
+
+def test_loop_retry_in_process_takes_pending_decision_first(sampler: ItemSampler, tok: Any) -> None:
+    config = base_config(block_updates=2, shrink_lambdas=(0.5,), max_group_rollbacks=0)
+    loop, op = lm_loop(sampler, tok, ["fail", "fail", "fail"], config)
+    armed = arm_fault(loop.controller.probe, 1)
+    with pytest.raises(ProbeFault):
+        loop.run(2)
+    armed["on"] = False
+    records = loop.run(0)  # no new update: only the owed decision
+    assert [(r.decision_index, r.update_index, r.decision) for r in records] == [
+        (0, 1, GateDecision.ROLLBACK)
+    ]
+    assert op.steps == 2 and not loop.decision_pending and loop.decision_index == 1
+    assert_params(loop.model, loop.incumbent.params)
+
+
+def test_loop_alarm_decision_that_raised_stays_pending(sampler: ItemSampler, tok: Any) -> None:
+    """An alarm decision owed by a short block is pending too (its latched alarm is not lost)."""
+    config = base_config(block_updates=4)
+    alarm = DisagreementAlarm(min_rollouts=8, baseline_updates=1)
+    loop, _ = lm_loop(sampler, tok, ["fail"], config, feed=_leak_feed(1), alarm=alarm)
+    armed = arm_fault(loop.controller.probe, 0)
+    with pytest.raises(ProbeFault):
+        loop.run(2)
+    assert loop.updates_since_decision == 2 < config.block_updates and loop.decision_pending
+    state = loop.state_dict()
+    assert state["block"]["alarm"] is True
+    armed["on"] = False
+    records = loop.run(0)
+    assert len(records) == 1 and records[0].alarm and records[0].update_index == 1
+    assert records[0].reason == REASON_CONFIRMED_ALARM
+
+
+def test_load_state_refuses_overfull_block(sampler: ItemSampler, tok: Any) -> None:
+    config = base_config(block_updates=2)
+    loop, _ = lm_loop(sampler, tok, ["hold"], config)
+    state = loop.state_dict()
+    state["block"] = {"reward_v1": [0.0] * 3, "reward_v2": [0.0] * 3, "alarm": False}
+    with pytest.raises(ValueError, match="running block"):
+        loop.load_state_dict(state)

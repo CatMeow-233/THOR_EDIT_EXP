@@ -262,6 +262,105 @@ def test_oversize_body_is_413(tmp_path: Path) -> None:
         app.close()
 
 
+# ============================================================================== connections
+def _closed_by_server(sock: socket.socket, timeout: float) -> bool:
+    """``True`` once the server closes ``sock`` (EOF or reset) within ``timeout`` seconds."""
+    sock.settimeout(timeout)
+    try:
+        return sock.recv(1024) == b""
+    except (ConnectionResetError, BrokenPipeError):
+        return True
+    except TimeoutError:
+        return False
+
+
+def test_connection_cap_closes_extra_connections(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, options=ServerOptions(port=0, token=TOKEN, max_connections=3))
+    held: list[socket.socket] = []
+    try:
+        c = Client(app)
+        for _ in range(10):  # more sequential requests than the cap: every slot is given back
+            assert c.raw("GET", "/", token=None)[0] == 200
+        for _ in range(3):
+            s = socket.create_connection((c.host, c.port), timeout=10)
+            s.sendall(b"GET / HTTP/1.1\r\n")  # an unfinished request holds its slot
+            held.append(s)
+        deadline = time.time() + 10
+        while app.server._slots._value != 0 and time.time() < deadline:  # type: ignore[attr-defined]
+            time.sleep(0.01)
+        extra = socket.create_connection((c.host, c.port), timeout=10)
+        try:
+            assert _closed_by_server(extra, 10.0)  # closed on accept, nothing read or answered
+        finally:
+            extra.close()
+        assert app.server.connections_refused == 1
+        for s in held:
+            s.close()
+        held.clear()
+        deadline = time.time() + 10
+        while time.time() < deadline:  # the held slots come back once their handlers see EOF
+            if app.server._slots._value == 3:  # type: ignore[attr-defined]
+                break
+            time.sleep(0.01)
+        assert c.raw("GET", "/", token=None)[0] == 200
+    finally:
+        for s in held:
+            s.close()
+        app.close()
+
+
+def test_header_trickle_is_dropped_and_never_dispatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dispatched: list[str] = []
+    real = server_mod.UIRequestHandler._dispatch_checked
+
+    def record(self: server_mod.UIRequestHandler, method: str) -> None:
+        dispatched.append(self.path)
+        real(self, method)
+
+    monkeypatch.setattr(server_mod.UIRequestHandler, "_dispatch_checked", record)
+    app = _make_app(
+        tmp_path, options=ServerOptions(port=0, token=TOKEN, max_connections=2, header_timeout=1.0)
+    )
+    try:
+        c = Client(app)
+        s = socket.create_connection((c.host, c.port), timeout=10)
+        try:
+            head = f"POST /api/discard HTTP/1.1\r\nHost: {c.authority}\r\nX-Session-Token: {TOKEN}\r\n"
+            s.sendall(head.encode())
+            start = time.monotonic()
+            closed = False
+            while (
+                time.monotonic() - start < 8.0
+            ):  # one byte every 0.2 s, far inside the 30 s per-read timeout
+                try:
+                    s.sendall(b"X")
+                except (BrokenPipeError, ConnectionResetError):
+                    closed = True
+                    break
+                if _closed_by_server(s, 0.2):
+                    closed = True
+                    break
+            elapsed = time.monotonic() - start
+        finally:
+            s.close()
+        assert closed and elapsed < 4.0, elapsed  # dropped near header_timeout, not after 30 s per read
+        assert app.server.header_timeouts == 1
+        assert dispatched == []  # the truncated request was never handled
+        assert c.raw("GET", "/", token=None)[0] == 200  # the slot was given back
+        assert dispatched == ["/"]
+    finally:
+        app.close()
+
+
+def test_server_rejects_bad_connection_options(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_connections"):
+        _make_app(tmp_path, options=ServerOptions(port=0, token=TOKEN, max_connections=0))
+    with pytest.raises(ValueError, match="header_timeout"):
+        _make_app(tmp_path, options=ServerOptions(port=0, token=TOKEN, header_timeout=float("nan")))
+
+
 def test_body_validation(client: Client) -> None:
     ct = {"Content-Type": "application/json"}
     # no Content-Length
@@ -485,6 +584,40 @@ def test_search_job(client: Client, app: UIApp) -> None:
     _, data = client.json("POST", "/api/search", {**body, "groups": ["L0/b7"]})
     job = client.wait(data["job"])
     assert job["status"] == "failed" and job["error"]["status"] == 404
+
+
+def test_searches_draw_fresh_items(client: Client, app: UIApp) -> None:
+    # Regression: every UI search used SubsetSearch's default index=0, so all searches of one
+    # process ranked candidates on the same round / final item sets (only the ES fitness stream
+    # was keyed per search). Search k now uses index=k: same purposes, different items.
+    client.result("POST", "/api/stats", {"split": "train", "n": 16})
+    body = {
+        "score": "wanda",
+        "split": "train",
+        "bands": 2,
+        "layers": [0],
+        "items_per_transfer_slice": 2,
+        "items_per_retention_slice": 4,
+        "fitness_items": 2,
+        "population": 2,
+        "controls": ["random"],
+    }
+    first = client.result("POST", "/api/search", body)
+    second = client.result("POST", "/api/search", {**body, "seed": 7})
+    assert second["search_index"] == first["search_index"] + 1
+    for res in (first, second):
+        assert res["report"]["config"]["index"] == res["search_index"]
+        assert {e["index"] for e in res["report"]["evaluations"]} == {res["search_index"]}
+
+    def digests(res: dict[str, object]) -> dict[str, str]:
+        report = res["report"]
+        assert isinstance(report, dict)
+        return {e["purpose"]: e["uid_digest"] for e in report["evaluations"]}
+
+    d1, d2 = digests(first), digests(second)
+    common = set(d1) & set(d2)
+    assert common  # the same round / final purposes ...
+    assert all(d1[p] != d2[p] for p in common)  # ... on different items
 
 
 def test_stage_evaluate_commit_requires_pass_or_override(client: Client, app: UIApp) -> None:
@@ -777,6 +910,100 @@ def test_non_safetensors_model_dir_is_refused(tmp_path: Path, monkeypatch: pytes
     # the CLI refuses a non-safetensors dir before serving anything
     with pytest.raises(SystemExit):
         server_mod.main(["--model-dir", str(bin_only), "--store", str(tmp_path / "s"), "--port", "0"])
+
+
+def _index_checkpoint(root: Path, shard_name: str) -> Path:
+    """Tiny checkpoint whose ``model.safetensors.index.json`` maps every key to ``shard_name``, a
+    ``torch.save`` pickle (written at ``root / 'm' / shard_name``, which may lie outside the dir),
+    with a decoy ``decoy.safetensors`` next to it; ``model.safetensors`` is removed."""
+    from safetensors.torch import load_file, save_file
+
+    model_dir = save_tiny_model(root / "m")
+    state = load_file(str(model_dir / "model.safetensors"))
+    (model_dir / "model.safetensors").unlink()
+    target = model_dir / shard_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, target)
+    save_file({"dummy": torch.zeros(1)}, str(model_dir / "decoy.safetensors"))
+    index = {"metadata": {}, "weight_map": {k: shard_name for k in state}}
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    return model_dir
+
+
+@pytest.mark.parametrize(
+    ("shard_name", "message"),
+    [
+        ("shard-00001", "non-safetensors shards"),  # no suffix: the suffix blocklist cannot see it
+        ("../outside/weights", "not bare file names"),  # outside the directory: rglob never sees it
+    ],
+)
+def test_index_naming_a_pickle_shard_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard_name: str, message: str
+) -> None:
+    from transformers import AutoModelForCausalLM
+
+    model_dir = _index_checkpoint(tmp_path, shard_name)
+    calls: list[str] = []
+    real_load = torch.load
+    real_pretrained = AutoModelForCausalLM.from_pretrained
+
+    def spy_load(*args: Any, **kwargs: Any) -> Any:
+        calls.append(f"torch.load {args[0] if args else kwargs.get('f')}")
+        return real_load(*args, **kwargs)
+
+    def spy_pretrained(*args: Any, **kwargs: Any) -> Any:
+        calls.append("from_pretrained")
+        return real_pretrained(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", spy_load)
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", spy_pretrained)
+    with pytest.raises(ModelLoadError, match=message):
+        check_model_dir(model_dir)
+    with pytest.raises(ModelLoadError, match=message):
+        load_model_dir(model_dir)
+    assert calls == []  # refused before transformers is called: no pickle is ever read
+
+
+def test_weight_override_and_adapter_dirs_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(torch, "load", lambda *a, **k: calls.append("torch.load"))
+    model_dir = save_tiny_model(tmp_path / "m")
+    config_text = (model_dir / "config.json").read_text(encoding="utf-8")
+    config = json.loads(config_text)
+    config["transformers_weights"] = "weights-file"
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ModelLoadError, match="transformers_weights"):
+        load_model_dir(model_dir)
+    (model_dir / "config.json").write_text(config_text, encoding="utf-8")
+    (model_dir / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "x"}), encoding="utf-8"
+    )
+    with pytest.raises(ModelLoadError, match="PEFT adapter"):
+        load_model_dir(model_dir)
+    (model_dir / "adapter_config.json").unlink()
+    (model_dir / "config.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ModelLoadError, match="not a JSON object"):
+        check_model_dir(model_dir)
+    (model_dir / "config.json").write_text(config_text, encoding="utf-8")
+    (model_dir / "model.safetensors").rename(model_dir / "consolidated.safetensors")
+    with pytest.raises(ModelLoadError, match="non-standard safetensors"):
+        check_model_dir(model_dir)
+    assert calls == []
+
+
+def test_safetensors_index_checkpoint_loads(tmp_path: Path) -> None:
+    from safetensors.torch import load_file, save_file
+
+    model_dir = save_tiny_model(tmp_path / "m")
+    state = load_file(str(model_dir / "model.safetensors"))
+    (model_dir / "model.safetensors").unlink()
+    save_file(state, str(model_dir / "model-00001-of-00001.safetensors"))
+    index = {"metadata": {}, "weight_map": {k: "model-00001-of-00001.safetensors" for k in state}}
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    assert check_model_dir(model_dir) == [model_dir / "model-00001-of-00001.safetensors"]
+    assert load_model_dir(model_dir).tiny_demo is False
 
 
 def test_corrupt_weights_and_mismatched_store_are_clean_refusals(

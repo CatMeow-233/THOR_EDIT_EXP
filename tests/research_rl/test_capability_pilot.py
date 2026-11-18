@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import random
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,8 +29,11 @@ from research_rl.capability.pilot import (
     VERDICT_SUCCESS,
     ArmSpec,
     PilotConfig,
+    _criteria_warnings,
+    _measure_final,
     _report_counts,
     _sampler_root,
+    _slices,
     arm_specs,
     baseline_standard_error,
     build_splits,
@@ -114,6 +119,13 @@ def test_smoke_writes_every_output(smoke: tuple[PilotConfig, Path, dict[str, Any
     assert not results["gate_exercise"]["exercised"]
     assert any(w.startswith("gate not exercised") for w in results["warnings"])
     assert "## Gate exercise" in summary
+    # the scope of the paired intervals: one start checkpoint and one informed selection for every seed
+    assert "RL-stage randomness only" in results["criteria"]["definitions"]["pairing"]
+    assert "the paired intervals cover RL-stage randomness only" in summary
+    assert "about this selection" in results["criteria"]["definitions"]["subset"]
+    # GRPO (gate_on) and ES (gate_off) have no paired seed: Operator KILL reachability is undetermined
+    assert results["criteria"]["operator"]["statistic"].get("kill_reachable") is None
+    assert not any("Operator KILL" in w for w in results["warnings"])
     # the decision log has one JSON line per decision record
     for spec in arm_specs(config):
         lines = (out / "decisions" / f"{spec.file_stem}.jsonl").read_text(encoding="utf-8").splitlines()
@@ -210,6 +222,7 @@ def test_trailing_updates_and_alarm_decisions(tmp_path: Path) -> None:
     assert arm["curve"][-1]["updates"] == 5
     assert arm["curve"][-1]["fpe"] == arm["counts"]["fpe"]
     assert arm["final"]["T_rule"] == arm["curve"][-1]["T_rule"]
+    assert arm["final_step"] == arm["curve"][-1]["step"] == oracle_exclusion_steps(config)
     # an alarm that fires on every update: every update ends in an alarm decision
     alarm = {"min_rollouts": 4, "baseline_gap": -0.5, "drift": 0.0, "threshold": 0.1}
     config = smoke_config(updates=3, arms=("grpo+gate_on",), alarm=alarm, sft_steps=300, progress=False)
@@ -225,6 +238,65 @@ def test_trailing_updates_and_alarm_decisions(tmp_path: Path) -> None:
         "hold_limit",
     }
     assert arm["trailing_updates"] == 0 and arm["curve"][-1]["fpe"] == arm["counts"]["fpe"]
+    # no trailing update: the final weights are measured once more at the shared step, off the curve
+    assert arm["final_step"] == oracle_exclusion_steps(config) == 3
+    assert [p["step"] for p in arm["curve"]] == [0, 1, 2, 3]
+
+
+class _StepTracker:
+    """Records ``measure(model, step, reward)`` calls; returns a minimal point."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, float | None]] = []
+
+    def measure(self, model: Any, step: int, reward_v1: float | None) -> Any:
+        self.calls.append((step, reward_v1))
+        point = {"step": step, "reward_v1": reward_v1}
+        return type("P", (), {"to_dict": lambda self: dict(point)})()
+
+
+def test_measure_final_uses_the_shared_step() -> None:
+    reports = [SimpleNamespace(reward_v1=r) for r in (0.2, 0.4, 0.6)]
+    records = [SimpleNamespace(reward_v1=0.3)]
+    tracker = _StepTracker()
+    trailing, final = _measure_final(tracker, None, reports, records, trailing=2, final_step=9)  # type: ignore[arg-type]
+    assert trailing is not None and trailing == final and final["step"] == 9
+    assert tracker.calls == [(9, pytest.approx(0.5))]
+    tracker = _StepTracker()
+    trailing, final = _measure_final(tracker, None, reports, records, trailing=0, final_step=9)  # type: ignore[arg-type]
+    assert trailing is None and final["step"] == 9 and tracker.calls == [(9, 0.3)]
+
+
+@pytest.mark.integration
+def test_same_seed_arms_final_points_share_tracker_items(tmp_path: Path) -> None:
+    # regression: alarm-shifted blocks give the arms different decision counts (gate_on ends with a
+    # trailing update, gate_off with a decision); their final points must still be measured at the
+    # same tracker step, i.e. on identical tracker items
+    gate = {
+        "block_updates": 4,
+        "items_per_transfer_slice": 8,
+        "items_per_retention_slice": 16,
+        "retention_margin": 0.5,
+        "hold_limit": 1,
+    }
+    config = smoke_config(
+        arms=("grpo+gate_on", "grpo+gate_off"),
+        updates=19,
+        progress=False,
+        gate=gate,
+        alarm={"min_rollouts": 4, "threshold": 0.05, "drift": 0.0},
+    )
+    results = run_pilot(config, tmp_path)
+    arms = results["arms"]
+    assert len(arms) == 2
+    assert {a["final_step"] for a in arms} == {oracle_exclusion_steps(config)} == {19}
+    # the old rule (len(blocks) + 1 with trailing updates, len(blocks) without) depends on the
+    # arm's decision count; the shared step does not (true for any run with < 18 decisions)
+    for a in arms:
+        old = len(a["blocks"]) + 1 if a["trailing_updates"] else len(a["blocks"])
+        assert old < a["final_step"], (len(a["blocks"]), a["trailing_updates"])
+    for a in arms:
+        assert a["final"]["R"].keys() == arms[0]["final"]["R"].keys()
 
 
 @pytest.mark.integration
@@ -447,7 +519,15 @@ def _gate_arms(seeds: Sequence[int], leak_on: Sequence[float], leak_off: Sequenc
 
 def test_gate_criterion_branches() -> None:
     seeds = (0, 1, 2)
-    good = _gate_arms(seeds, [0.30, 0.32, 0.29], [0.10, 0.11, 0.12], [0.20, 0.21, 0.19], [0.20, 0.20, 0.20])
+    # 6 oracle-improved blocks (>= min_improved_blocks = 4), all accepted: both KILLs evaluable
+    good = _gate_arms(
+        seeds,
+        [0.30, 0.32, 0.29],
+        [0.10, 0.11, 0.12],
+        [0.20, 0.21, 0.19],
+        [0.20, 0.20, 0.20],
+        blocks=[(True, True), (True, True)],
+    )
     crit = evaluate_criteria(_results(good))["gate"]
     assert crit["verdict"] == VERDICT_SUCCESS, crit
     assert crit["statistic"]["d_hack"]["lo"] > 0 and crit["statistic"]["d_T_rule_leak"]["lo"] > 0
@@ -491,6 +571,43 @@ def _subset_arms(d_r: Sequence[float], d_t: Sequence[float], d_a: Sequence[float
         arms.append(_arm("es_informed", "gate_off", "clean", s, r_mean=0.8 + r, t_rule=0.1 + t, a=0.3 + a))
         arms.append(_arm("es_random", "gate_off", "clean", s, r_mean=0.8, t_rule=0.1, a=0.3))
     return arms
+
+
+def test_gate_success_needs_an_evaluable_reject_rate_kill() -> None:
+    """Section 3's Gate KILL has two conditions; SUCCESS needs both evaluated and not holding. With
+    fewer than min_improved_blocks oracle-improved blocks the reject-rate KILL cannot be checked, so
+    the verdict is INCONCLUSIVE even when the intervals look perfect (regression: it was SUCCESS,
+    also for a gate that rejected every oracle-improved block and accepted nothing)."""
+    seeds = (0, 1, 2)
+    strong = ([0.30, 0.32, 0.29], [0.10, 0.11, 0.12], [0.20, 0.21, 0.19], [0.20, 0.20, 0.20])
+    # no blocks at all
+    crit = evaluate_criteria(_results(_gate_arms(seeds, *strong)))["gate"]
+    assert crit["verdict"] == VERDICT_INCONCLUSIVE, crit
+    assert "reject-rate KILL not evaluable" in crit["reason"]
+    assert "would meet the success condition" in crit["reason"]
+    # 3 oracle-improved blocks (one per seed), all rejected, nothing accepted: rate 1.0, still not a
+    # SUCCESS (and not a KILL: 3 < min_improved_blocks = 4)
+    rejecting = _gate_arms(seeds, *strong, blocks=[(False, True), (False, False)])
+    crit = evaluate_criteria(_results(rejecting))["gate"]
+    assert crit["verdict"] == VERDICT_INCONCLUSIVE, crit
+    assert crit["statistic"]["oracle"]["improved_blocks"] == 3
+    assert crit["statistic"]["oracle"]["false_reject_rate"] == 1.0
+    assert not crit["statistic"]["exercise"]["false_reject_evaluable"]
+    assert "reject-rate KILL not evaluable" in crit["reason"] and "gate not exercised" in crit["reason"]
+    # the clean-cost KILL is still applied when the reject-rate KILL is not evaluable
+    costly = _gate_arms(seeds, [0.12, 0.12, 0.13], [0.11, 0.11, 0.12], [0.00, 0.01, 0.00], [0.20, 0.21, 0.20])
+    assert evaluate_criteria(_results(costly))["gate"]["verdict"] == VERDICT_KILL
+    # exactly min_improved_blocks = 4 improved blocks (pooled: 2 + 1 + 1), rejected at 50% (not > 50%)
+    arms = _gate_arms(seeds, *strong)
+    by_seed = {a["seed"]: a for a in arms if a["gate"] == "gate_on" and a["variant"] == "leak"}
+    for seed, blocks in {0: [(True, True), (False, True)], 1: [(True, True)], 2: [(False, True)]}.items():
+        by_seed[seed]["blocks"] = [
+            {"accepted_first": acc, "oracle": {"improved": imp}} for acc, imp in blocks
+        ]
+    crit = evaluate_criteria(_results(arms))["gate"]
+    assert crit["statistic"]["oracle"]["improved_blocks"] == 4
+    assert crit["statistic"]["oracle"]["false_reject_rate"] == 0.5
+    assert crit["verdict"] == VERDICT_SUCCESS, crit
 
 
 def test_subset_criterion_branches() -> None:
@@ -543,10 +660,56 @@ def test_operator_criterion_branches() -> None:
     short = _operator_arms(gains, [[(0, 0.0), (200, 0.01)]] * 3)
     crit = evaluate_criteria(_results(short))["operator"]
     assert crit["verdict"] == VERDICT_INCONCLUSIVE and "budget" in crit["reason"]
+    # ES reaches the share at 200 of 1000 budget FPE: SUCCESS stays reachable, the KILL was not, and
+    # the reason, the statistic and the run warning say so
+    early = _operator_arms(gains, [[(0, 0.0), (200, 0.2)]] * 3)
+    crit = evaluate_criteria(_results(early))["operator"]
+    assert crit["verdict"] == VERDICT_SUCCESS, crit
+    assert crit["statistic"]["kill_reachable"] is False
+    assert crit["statistic"]["per_seed"][0]["es_budget_share"] == pytest.approx(0.2)
+    assert "Operator KILL not reachable" in crit["reason"] and "20.0%" in crit["reason"]
+    (warning,) = _criteria_warnings(evaluate_criteria(_results(early)))
+    assert warning.startswith("Operator KILL not reachable") and "3 of 3" in warning
+    crit = evaluate_criteria(_results(below))["operator"]
+    assert crit["statistic"]["kill_reachable"] is True and "not reachable" not in crit["reason"]
+    assert _criteria_warnings(evaluate_criteria(_results(below))) == []
+    # no paired seed: reachability is not determinable (None), never claimed
+    assert evaluate_criteria(_results([]))["operator"]["statistic"].get("kill_reachable") is None
     # GRPO gained nothing
     flat = _operator_arms([0.0, -0.01, 0.0], [[(0, 0.0), (1000, 0.0)]] * 3)
     assert evaluate_criteria(_results(flat))["operator"]["verdict"] == VERDICT_INCONCLUSIVE
     assert evaluate_criteria(_results(reach[:2]))["operator"]["verdict"] == VERDICT_INCONCLUSIVE
+
+
+def test_default_config_cannot_reach_the_operator_kill() -> None:
+    """The figures of the PilotConfig docstring / CAPABILITY.md 4.3 (Operator KILL at the defaults),
+    recomputed with the counting rules the smoke run asserts (GRPO 4 FPE per rollout, ES 1)."""
+    config = PilotConfig()
+    grpo = 4 * config.grpo_prompts_per_update * config.grpo_group_size * config.updates_for("grpo")
+    per_es_update = config.es_population * config.es_items_per_update
+    es = per_es_update * config.updates_for(config.operator_es_arm)
+    budget = config.operator_budget_factor * grpo
+    assert (grpo, budget, es) == (24576, 245760, 12288)
+    assert es / budget == pytest.approx(0.05)
+    assert math.ceil(budget / per_es_update) == 960
+    longer = PilotConfig(es_updates=960)
+    _, retention = _slices(longer, build_splits(longer))
+    assert choose_retention_items(longer, retention)["items_per_retention_slice"] == 3072
+
+
+def test_unreachable_operator_kill_is_reported_by_the_run(tmp_path: Path) -> None:
+    """End to end: a three-seed smoke run whose ES arm cannot spend 10x GRPO's FPE records
+    kill_reachable False in the statistic, the Operator reason, results["warnings"] and summary.md."""
+    config = smoke_config(
+        seeds=(0, 1, 2), arms=("grpo+gate_off", "es_informed+gate_off"), variants=("clean",), progress=False
+    )
+    results = run_pilot(config, tmp_path)
+    crit = results["criteria"]["operator"]
+    assert crit["verdict"] != VERDICT_KILL
+    assert crit["statistic"]["kill_reachable"] is False
+    assert "Operator KILL not reachable" in crit["reason"]
+    assert any(w.startswith("Operator KILL not reachable") for w in results["warnings"])
+    assert "> WARNING: Operator KILL not reachable" in (tmp_path / "summary.md").read_text(encoding="utf-8")
 
 
 def test_low_start_criterion_branches() -> None:

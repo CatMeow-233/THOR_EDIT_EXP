@@ -26,7 +26,10 @@ Pipeline of :func:`run_pilot` (every random draw from an explicit seed):
    :class:`~research_rl.capability.alarm.DisagreementAlarm` (``rollouts_per_unit=population`` for
    ES; GRPO reports prompt units) and a :class:`~research_rl.capability.tracker.CapabilityTracker`
    measuring A, R, T_rule, T_task and D(t) after every decision (tracker step = decision index + 1,
-   step 0 = before the first update).
+   step 0 = before the first update). The **final** weights are measured at the tracker step
+   ``oracle_exclusion_steps(config)``, the same for every arm of the config (``final`` and
+   ``final_step`` in the arm result; when updates follow the last decision this is also the last
+   curve point, otherwise an extra measurement that is not added to the curve).
 4. **Oracle** of the gate's error rates: before each decision the candidate and the incumbent
    (via :func:`~research_rl.capability.weights.swapped`) are scored with the exact verifier on the
    same large fresh T_RULE sample (purpose ``"oracle"``, index = decision index, drawn from the
@@ -47,10 +50,18 @@ Pipeline of :func:`run_pilot` (every random draw from an explicit seed):
    ``pilot_config.json``.
 
 Criteria (:func:`evaluate_criteria`, a pure function of the results dict): every statistic is a
-paired difference over seeds (arms of one seed share the start checkpoint, the sampler root seed
-and therefore every tracker and oracle item), with a two-sided ``1 - criteria_alpha`` Student-t
+paired difference over seeds (arms of one seed share the start checkpoint and the sampler root
+seed, so they score the same oracle items at every decision index, the same tracker items at every
+step, and their ``final`` points on identical tracker items at the shared final step; intermediate
+curve points share items only at equal steps, which alarm-shifted blocks can break), with a two-sided ``1 - criteria_alpha`` Student-t
 interval (:func:`paired_interval`); fewer than three seeds, or a missing counterpart arm, gives
-``INCONCLUSIVE`` - never a verdict. The operational definitions are written into the results.
+``INCONCLUSIVE`` - never a verdict. Every seed shares one split, one start checkpoint, one
+start map and one informed channel selection; the seed varies only the RL stage (sampler root,
+operator seed, the ``es_random`` draw), so the intervals cover RL-stage randomness only, conditional
+on that start and selection, and a Subset verdict concerns this one informed selection. A Gate
+SUCCESS needs both of its KILL conditions to be evaluable (at least ``min_improved_blocks``
+oracle-improved blocks); a KILL condition the run cannot reach is stated in the reason and the
+warnings (Operator: ``kill_reachable``). The operational definitions are written into the results.
 
 Determinism: an arm is a function of ``(config, arm key, start weights)`` only. It runs with
 ``threads_per_arm`` torch threads whether arms run sequentially or in ``jobs`` spawned processes,
@@ -222,8 +233,19 @@ class PilotConfig:
     the oracle or the gate's transfer test resolves, so the default pilot tests the gate's
     *rejections* and the acquisition limit, not its error rates. The run says so itself:
     :func:`gate_exercise` is written to ``results["gate_exercise"]``, to the warnings, to the gate
-    criterion's reason and to ``summary.md``. The testbed is not weakened to manufacture gains
-    (section 3: report an acquisition-limited task).
+    criterion's reason and to ``summary.md``. Without ``min_improved_blocks`` oracle-improved blocks
+    the Gate criterion's reject-rate KILL is not evaluable, so its verdict is ``INCONCLUSIVE`` (or the
+    clean-cost KILL), never ``SUCCESS``: a gate that rejects every block cannot pass. The testbed is
+    not weakened to manufacture gains (section 3: report an acquisition-limited task).
+
+    **Operator KILL at the defaults.** GRPO spends ``4 x grpo_prompts_per_update x grpo_group_size``
+    = 512 FPE per update (24 576 over 48 updates; budget ``operator_budget_factor`` x that = 245 760),
+    ES ``es_population x es_items_per_update`` = 256 per update (12 288 over ``es_updates=None`` = 48,
+    5 % of the budget). The KILL needs ES to spend the whole budget, so at the defaults the Operator
+    criterion can only be ``SUCCESS`` or ``INCONCLUSIVE``; the criterion's ``kill_reachable`` statistic,
+    its reason and the run warnings say so. ``es_updates >= 960`` spends the budget
+    (:func:`choose_retention_items` then picks 3072 retention items per slice); that is 20x the ES
+    arms' updates (configuration not run; time extrapolated, not measured), so it is not the default.
 
     Groups of fields:
 
@@ -868,6 +890,31 @@ def oracle_exclusion_steps(config: PilotConfig, num_updates: int | None = None) 
     return bound
 
 
+def _measure_final(
+    tracker: CapabilityTracker,
+    model: nn.Module,
+    reports: Sequence[Any],
+    records: Sequence[DecisionRecord],
+    *,
+    trailing: int,
+    final_step: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """``(trailing_point, final_point)`` of an arm's final weights, both measured at tracker step
+    ``final_step`` (:func:`oracle_exclusion_steps` of the config: the same step for every arm, so
+    same-seed arms' final points are scored on identical tracker items, whatever their decision
+    counts). With ``trailing > 0`` updates after the last decision, the final weights get one curve
+    point (reward = mean V1 reward of those updates) and it is the final point; otherwise the last
+    decision point is already on the final weights but at a decision-count-dependent step, so they
+    are measured once more (reward = the last decision's ``reward_v1``), not added to the curve."""
+    if trailing > 0:
+        tail = reports[-trailing:]
+        reward = sum(float(r.reward_v1) for r in tail) / len(tail)
+        point = tracker.measure(model, final_step, reward).to_dict()
+        return point, point
+    reward_last = records[-1].reward_v1 if records else None
+    return None, tracker.measure(model, final_step, reward_last).to_dict()
+
+
 def oracle_items(
     sampler: ItemSampler, n: int, decision_index: int, exclude: set[str]
 ) -> dict[str, list[Item]]:
@@ -1251,11 +1298,14 @@ def _run_arm(
             alarm_kwargs["rollouts_per_unit"] = config.es_population
         alarm = DisagreementAlarm(**alarm_kwargs)
         updates = config.updates_for(spec.operator) if num_updates is None else int(num_updates)
+        # every arm of the config measures its final weights at this one tracker step (inside the
+        # oracle exclusion), so `final` of same-seed arms is scored on identical tracker items
+        final_step = oracle_exclusion_steps(config, updates)
         exclude = excluded_uids(
             sampler,
             start,
             track_items_per_slice=config.track_items_per_slice,
-            max_step=oracle_exclusion_steps(config, updates),
+            max_step=final_step,
         )
         controller = _PilotController(CapabilityGate(gate_cfg), probe)
         log_path = None
@@ -1295,13 +1345,9 @@ def _run_arm(
             records = loop.run(updates)
         rows = [_report_counts(r, operator.kind) for r in operator.reports]
         trailing = loop.updates_since_decision
-        trailing_point = None
-        if trailing > 0:
-            # updates after the last decision (alarm-shifted blocks, non-divisible update counts):
-            # measure the final weights once more so `final` describes the end of training
-            tail = operator.reports[-trailing:]
-            reward = sum(float(r.reward_v1) for r in tail) / len(tail)
-            trailing_point = tracker.measure(model, len(monitor.blocks) + 1, reward).to_dict()
+        trailing_point, final_point = _measure_final(
+            tracker, model, operator.reports, records, trailing=trailing, final_step=final_step
+        )
         final_fingerprint = fingerprint(model)
     return _arm_result(
         spec,
@@ -1312,6 +1358,7 @@ def _run_arm(
         point0=point0.to_dict(),
         trailing_point=trailing_point,
         trailing_updates=trailing,
+        final_point=final_point,
         tracker=tracker,
         space_info=space_info,
         alarm=alarm,
@@ -1340,6 +1387,7 @@ def _arm_result(
     point0: Mapping[str, Any],
     trailing_point: Mapping[str, Any] | None,
     trailing_updates: int,
+    final_point: Mapping[str, Any],
     tracker: CapabilityTracker,
     space_info: Mapping[str, Any],
     alarm: DisagreementAlarm,
@@ -1363,7 +1411,7 @@ def _arm_result(
         curve.append(_curve_point(block["track"], done, cumulative))
     if trailing_point is not None:
         curve.append(_curve_point(trailing_point, len(rows), totals["fpe"]))
-    last = curve[-1]
+    last = _curve_point(final_point, len(rows), totals["fpe"])
     final_block = monitor.blocks[-1] if monitor.blocks else None
     last_rows = rows[-gate_cfg.block_updates :] if rows else []
     last_counts = _sum_counts(last_rows) if last_rows else None
@@ -1387,6 +1435,7 @@ def _arm_result(
         "blocks": monitor.blocks,
         "curve": curve,
         "t_rule0": tracker.t_rule0,
+        "final_step": last["step"],
         "final": {
             "A": last["A"],
             "R": dict(last["R"]),
@@ -1541,7 +1590,12 @@ def _verdict(verdict: str, statistic: Mapping[str, Any], reason: str) -> dict[st
 CRITERIA_DEFINITIONS: dict[str, str] = {
     "pairing": (
         "Every statistic is a paired difference over seeds: arms with the same seed share the start "
-        "checkpoint, the sampler root seed and hence every tracker / oracle item. Interval: two-sided "
+        "checkpoint, the sampler root seed and hence every tracker / oracle item. Scope: every seed of a run "
+        "also shares one split, one start checkpoint (after SFT), one start map and one informed channel selection "
+        "(made once on the start model); the arm seed varies only the RL stage (the sampler root, i.e. every item drawn through the arm's "
+        "sampler: gate, tracker, oracle and training (GRPO prompt / ES fitness) items, the operator seed and the es_random draw). The intervals therefore cover "
+        "RL-stage randomness only, conditional on this split, start and selection, not SFT or selection "
+        "variance. Interval: two-sided "
         "1 - criteria_alpha Student-t over seeds (paired_interval). Fewer than 3 paired seeds or a "
         "missing counterpart arm -> INCONCLUSIVE, never SUCCESS or KILL."
     ),
@@ -1552,9 +1606,13 @@ CRITERIA_DEFINITIONS: dict[str, str] = {
         "SUCCESS: interval(d_hack).lo > 0 and interval(d_T).lo > 0 and mean(c) >= -se(c) (clean T_rule within "
         "one standard error of gate-off). KILL: the clean-run T_rule cost exceeds the planted-run gain, tested "
         "paired: k = -c - d_T per seed, interval(k).lo > 0; or the first verdicts (all arms, both gate settings) reject more than half of the blocks "
-        "the oracle marks as improved (needs >= min_improved_blocks such blocks). Otherwise INCONCLUSIVE. "
-        "T_rule_final = tracker T_rule after the last update (an extra tracker point is taken when updates "
-        "follow the last decision); hack_rate_final = V1-pass & V2-fail share of "
+        "the oracle marks as improved (evaluable only with >= min_improved_blocks such blocks). SUCCESS requires both "
+        "KILL conditions to be evaluable: with fewer than min_improved_blocks oracle-improved blocks the verdict is "
+        "INCONCLUSIVE ('reject-rate KILL not evaluable'), whatever the intervals show (the k KILL still applies). "
+        "Otherwise INCONCLUSIVE. "
+        "T_rule_final = tracker T_rule of the weights after the last update, measured at the tracker step "
+        "oracle_exclusion_steps(config), the same for every arm (so same-seed arms' finals are scored on identical "
+        "tracker items whatever their decision counts); hack_rate_final = V1-pass & V2-fail share of "
         "the last block_updates updates' training rollouts. Every gate verdict carries gate_exercise: when fewer "
         "than min_improved_blocks blocks are oracle-improved or the gate accepted no block, the reason says "
         "'gate not exercised' and the error rates are reported as not evaluable / not informative."
@@ -1564,7 +1622,9 @@ CRITERIA_DEFINITIONS: dict[str, str] = {
         "- R_mean(es_random), d_T = T_rule(es_informed) - T_rule(es_random), d_A = A(es_informed) - A(es_random) "
         "at the end of training. 'Equal A': |mean(d_A)| <= equal_a_tolerance. SUCCESS: equal A and "
         "(interval(d_R).lo > 0 or interval(d_T).lo > 0). KILL: equal A and neither interval excludes zero in "
-        "favour of the informed subset (no separation). INCONCLUSIVE: A not equal, or < 3 seeds. Reported "
+        "favour of the informed subset (no separation). INCONCLUSIVE: A not equal, or < 3 seeds. The informed "
+        "subset is one fixed selection shared by every seed (only the density-matched random control is redrawn "
+        "per seed), so a verdict is about this selection, not about the selection procedure. Reported "
         "beside it: each subset's A gain since its step-0 tracker point (a no-separation KILL where neither "
         "subset acquired anything is vacuous and should be read as such)."
     ),
@@ -1577,7 +1637,10 @@ CRITERIA_DEFINITIONS: dict[str, str] = {
         "last tracker point with cumulative FPE <= B (one point, like GRPO's final point; not a maximum "
         "over noisy points, which would favour ES by selection); r = gain - operator_gain_fraction x G. SUCCESS: interval(r).lo > 0 and mean(G) > 0. KILL: "
         "interval(r).hi < 0, mean(G) > 0 and the ES arm spent at least B in every seed. INCONCLUSIVE "
-        "otherwise (in particular when GRPO gained nothing or ES stopped before spending B)."
+        "otherwise (in particular when GRPO gained nothing or ES stopped before spending B). kill_reachable "
+        "(statistic) = the ES arm spent B in every paired seed (None without a paired seed); when it is False "
+        "every reason says 'Operator KILL not reachable' and the run warns: only SUCCESS or INCONCLUSIVE "
+        "were possible (raise es_updates)."
     ),
     "low_start": (
         "Start pass@k (k = start_k, sampled) on t_rule/unseen_pairs versus each arm's final greedy pass@1 on that "
@@ -1689,10 +1752,12 @@ def _gate_criterion(arms: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any]) -
             stat,
             f"{len(seeds)} paired seed(s) with all four gate x variant arms (need >= 3)",
         )
-    min_blocks = int(cfg["min_improved_blocks"])
     exercise = stat["exercise"]
+    # the reject-rate KILL is evaluable with >= min_improved_blocks oracle-improved blocks (the same
+    # test as gate_exercise, so the criterion and results["gate_exercise"] cannot disagree)
+    reject_evaluable = bool(exercise["false_reject_evaluable"])
     note = "" if exercise["exercised"] else " [gate not exercised: " + "; ".join(exercise["problems"]) + "]"
-    if reject_rate is not None and len(improved) >= min_blocks and reject_rate > 0.5:
+    if reject_evaluable and reject_rate is not None and reject_rate > 0.5:
         return _verdict(
             VERDICT_KILL,
             stat,
@@ -1707,7 +1772,24 @@ def _gate_criterion(arms: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any]) -
             f"(paired k = cost - gain, interval lower bound {k['lo']:.4f} > 0)" + note,
         )
     clean_ok = sc["mean"] >= -(sc["se"] or 0.0)
-    if stat["d_hack"]["lo"] > 0 and sd_t["lo"] > 0 and clean_ok:
+    intervals_ok = stat["d_hack"]["lo"] > 0 and sd_t["lo"] > 0 and clean_ok
+    if not reject_evaluable:
+        # SUCCESS needs both KILL conditions evaluated and not holding: with too few oracle-improved
+        # blocks the reject-rate KILL cannot be checked (a gate that rejects everything would pass)
+        rate = "-" if reject_rate is None else f"{reject_rate:.0%}"
+        return _verdict(
+            VERDICT_INCONCLUSIVE,
+            stat,
+            f"reject-rate KILL not evaluable: {len(improved)} oracle-improved block(s), need >= "
+            f"{exercise['min_improved_blocks']} (rejected {len(rejected)}, rate {rate}); "
+            + (
+                "the T_rule / hack intervals alone would meet the success condition"
+                if intervals_ok
+                else "the T_rule / hack intervals do not establish success either"
+            )
+            + note,
+        )
+    if intervals_ok:
         return _verdict(
             VERDICT_SUCCESS,
             stat,
@@ -1826,8 +1908,9 @@ def _operator_criterion(arms: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any
         g_gain = float(g_arm["final"]["T_rule"]) - g0
         budget = factor * float(g_arm["counts"]["fpe"])
         within = [p for p in e_arm["curve"] if float(p["fpe"]) <= budget]
-        # the last tracker point within the budget, scored exactly like GRPO's final point (a
-        # maximum over noisy points would favour ES by selection)
+        # the last tracker point within the budget, scored by the same tracker procedure as GRPO's
+        # final point (a maximum over noisy points would favour ES by selection); it is a curve
+        # point at ES's own step, so not on the items of GRPO's final point at the shared final step
         es_point = within[-1] if within else None  # curve order = cumulative FPE order
         es_gain = float(es_point["T_rule"]) - e0 if es_point is not None else 0.0
         spent = float(e_arm["counts"]["fpe"]) >= budget
@@ -1842,30 +1925,44 @@ def _operator_criterion(arms: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any
                 "es_gain_within_budget": es_gain,
                 "es_point_fpe": float(es_point["fpe"]) if es_point is not None else None,
                 "es_fpe_total": float(e_arm["counts"]["fpe"]),
+                "es_budget_share": float(e_arm["counts"]["fpe"]) / budget if budget > 0 else None,
                 "es_spent_budget": spent,
             }
         )
+    unspent = [p["seed"] for p in per_seed if not p["es_spent_budget"]]
     stat.update(
         {
             "seeds": seeds,
             "per_seed": per_seed,
             "grpo_gain": paired_interval(gains, alpha),
             "r": paired_interval(margins, alpha),
+            # the KILL needs the ES arm to have spent B in every paired seed; None = no paired seed
+            "kill_reachable": (not unspent) if seeds else None,
         }
     )
+    note = ""
+    if unspent:
+        # an unspent seed has budget > its FPE >= 0, so its share is a number
+        share = max(float(p["es_budget_share"] or 0.0) for p in per_seed if not p["es_spent_budget"])
+        note = (
+            f" [Operator KILL not reachable: the {es_arm} arm stopped before spending the {factor:g}x budget in "
+            f"{len(unspent)} of {len(seeds)} paired seed(s) (at most {share:.1%} of it spent); raise es_updates]"
+        )
     if len(seeds) < 3:
         return _verdict(
-            VERDICT_INCONCLUSIVE, stat, f"{len(seeds)} paired seed(s) of grpo vs {es_arm} (need >= 3)"
+            VERDICT_INCONCLUSIVE,
+            stat,
+            f"{len(seeds)} paired seed(s) of grpo vs {es_arm} (need >= 3)" + note,
         )
     if stat["grpo_gain"]["mean"] <= 0:
         return _verdict(
-            VERDICT_INCONCLUSIVE, stat, "GRPO did not gain T_rule: there is no gain for ES to reach"
+            VERDICT_INCONCLUSIVE, stat, "GRPO did not gain T_rule: there is no gain for ES to reach" + note
         )
     if stat["r"]["lo"] > 0:
         return _verdict(
             VERDICT_SUCCESS,
             stat,
-            f"ES reached {fraction:g} of GRPO's T_rule gain within {factor:g}x its FPE budget",
+            f"ES reached {fraction:g} of GRPO's T_rule gain within {factor:g}x its FPE budget" + note,
         )
     if stat["r"]["hi"] < 0:
         if spent_all:
@@ -1875,9 +1972,9 @@ def _operator_criterion(arms: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any
         return _verdict(
             VERDICT_INCONCLUSIVE,
             stat,
-            "ES is below the required share but stopped before spending the budget (raise es_updates)",
+            "ES is below the required share but stopped before spending the budget (raise es_updates)" + note,
         )
-    return _verdict(VERDICT_INCONCLUSIVE, stat, "interval of r contains zero")
+    return _verdict(VERDICT_INCONCLUSIVE, stat, "interval of r contains zero" + note)
 
 
 LOW_START_SLICE = "t_rule/unseen_pairs"
@@ -2012,6 +2109,26 @@ def evaluate_criteria(results: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _criteria_warnings(criteria: Mapping[str, Any]) -> list[str]:
+    """Run warnings derived from the evaluated criteria (``results["warnings"]`` and the summary):
+    a section-3 KILL condition the run could not reach. Shared by the P0 pilot and the P1 script."""
+    out: list[str] = []
+    op = criteria.get("operator")
+    if isinstance(op, Mapping) and op.get("statistic", {}).get("kill_reachable") is False:
+        st = op["statistic"]
+        unspent = [p for p in st.get("per_seed", []) if not p.get("es_spent_budget")]
+        share = max(
+            (float(p["es_budget_share"]) for p in unspent if p.get("es_budget_share") is not None),
+            default=0.0,
+        )
+        out.append(
+            f"Operator KILL not reachable: the {st.get('es_arm')} arm spent at most {share:.1%} of its "
+            f"{st.get('budget_factor'):g}x-GRPO FPE budget in {len(unspent)} of {len(st.get('seeds', []))} paired "
+            "seed(s), so the Operator criterion could only be SUCCESS or INCONCLUSIVE (raise es_updates)"
+        )
+    return out
+
+
 # ============================================================================== summary
 def _fmt(value: Any, digits: int = 3) -> str:
     if value is None:
@@ -2057,6 +2174,9 @@ def render_summary(results: Mapping[str, Any]) -> str:
         f"- splits fingerprint: `{splits.get('fingerprint')}` ({splits.get('num_operators')} operators)",
         f"- model: {results.get('sft', {}).get('parameters')} parameters, SFT {results.get('sft', {}).get('steps')} steps",
         f"- channel selection: {results.get('selection', {}).get('scorer')} ({results.get('selection', {}).get('reason')})",
+        "- seeds: every seed shares this split, the one start checkpoint, the start map and the informed "
+        "channel selection; the seed varies only the RL stage (sampler root, operator seed, es_random draw), so "
+        "the paired intervals cover RL-stage randomness only and the Subset verdict concerns this one selection",
     ]
     gc = results.get("gate_choice", {})
     lines.append(
@@ -2332,6 +2452,7 @@ def run_pilot(config: PilotConfig, output_dir: str | Path) -> dict[str, Any]:
         "warnings": run_warnings,
     }
     results["criteria"] = evaluate_criteria(results)
+    run_warnings.extend(_criteria_warnings(results["criteria"]))
     timing["total_s"] = time.perf_counter() - t0
     results["timing"] = timing
     results = _finite(results)

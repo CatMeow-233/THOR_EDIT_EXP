@@ -278,4 +278,4 @@ ruff format --check && ruff check && mypy
 GitHub Actions (`.github/workflows/research_rl_ci.yml`) runs format/lint/type checks, the unit
 tests, the integration tests and the example smoke runs on CPU with `HF_HUB_OFFLINE=1`.
 
-See [API.md](API.md) for the API reference (generated from the docstrings) and [DEPLOY_GPU.md](DEPLOY_GPU.md) for running on the two RTX 5090 hosts.
+See [API.md](API.md) for the API reference (built from the docstrings) and [DEPLOY_GPU.md](DEPLOY_GPU.md) for running on the two RTX 5090 hosts.

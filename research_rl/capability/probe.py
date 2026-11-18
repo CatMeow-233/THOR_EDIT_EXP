@@ -15,7 +15,8 @@
 
 Item streams. Every draw goes through :meth:`~research_rl.capability.tasks.ItemSampler.draw`
 with an explicit ``(purpose, index)`` key: gate evidence uses ``purpose=f"gate/{attempt}"`` and
-``index=decision_index`` (:func:`gate_purpose`), the start map ``purpose="start"``, ``index=0``,
+``index=decision_index`` (:func:`gate_purpose`; a version store passes a per-store ``namespace``,
+``purpose=f"{namespace}/gate/{attempt}"``), the start map ``purpose="start"``, ``index=0``,
 and the tracker ``purpose="track"``, ``index=step``. Different keys are independent random
 streams.
 
@@ -37,8 +38,9 @@ so **tracker and gate items never coincide**, by construction. Limits, stated ex
   previous decision, as without pools): excluding earlier gate items would exhaust the
   length-3 domain within a few decisions at 2048 items per retention slice and change the item
   distribution, so it is not done (a limit of the wave-1 sampler's domains, not fixed here);
-* draws with ``pool=None`` (the default of :func:`draw_slice` / :func:`score_slice`, e.g. for a
-  subset search) are unpartitioned and may coincide with gate and tracker items.
+* draws with ``pool=None`` (the default of :func:`draw_slice` / :func:`score_slice`; e.g. a
+  :class:`~research_rl.capability.search.SubsetSearch` built with ``pool=None`` - its default is
+  ``TRACK_POOL``) are unpartitioned and may coincide with gate and tracker items.
 
 AUDIT. The draw-and-score path of this module refuses every AUDIT slice with
 :class:`~research_rl.capability.tasks.AuditAccessError`, also when the sampler itself was built
@@ -77,6 +79,7 @@ handling of :func:`sample_completions`) is NOT_TESTED.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -129,11 +132,26 @@ gate-vs-gate repetition across decisions at its unpartitioned level)."""
 _TRANSFER_SPLITS = (Split.T_RULE, Split.T_TASK)
 
 
-def gate_purpose(attempt: int) -> str:
+_NAMESPACE_RE = re.compile(r"[A-Za-z0-9_.:-]+(/[A-Za-z0-9_.:-]+)*")  # always used with fullmatch
+
+
+def gate_purpose(attempt: int, namespace: str | None = None) -> str:
     """Sampler purpose of gate evaluation ``attempt`` (0 = the raw candidate, then one per shrink
-    factor / group revert of the same decision): ``f"gate/{attempt}"``."""
+    factor / group revert of the same decision): ``f"gate/{attempt}"``, or
+    ``f"{namespace}/gate/{attempt}"`` with a ``namespace`` (an independent item stream per namespace;
+    :class:`~research_rl.capability.edits.VersionStore` uses one per store)."""
     _check_index("attempt", attempt)
-    return f"gate/{attempt}"
+    if namespace is None:
+        return f"gate/{attempt}"
+    return f"{_check_gate_namespace(namespace)}/gate/{attempt}"
+
+
+def _check_gate_namespace(namespace: Any) -> str:
+    """``namespace`` if it is a valid gate namespace (non-empty ``/``-separated segments of
+    ``[A-Za-z0-9_.:-]``), else ``ValueError``."""
+    if not isinstance(namespace, str) or not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(f"gate namespace must match {_NAMESPACE_RE.pattern}, got {namespace!r}")
+    return namespace
 
 
 def _check_index(name: str, value: Any) -> int:
@@ -464,12 +482,14 @@ class CapabilityProbe:
             return self.items_per_transfer_slice
         return self.items_per_retention_slice
 
-    def gate_items(self, decision_index: int, attempt: int = 0) -> dict[str, list[Item]]:
+    def gate_items(
+        self, decision_index: int, attempt: int = 0, *, namespace: str | None = None
+    ) -> dict[str, list[Item]]:
         """The items of evaluation ``(decision_index, attempt)``, per slice (transfer slices first,
         then retention, in construction order): :func:`draw_slice` with
-        ``purpose=gate_purpose(attempt)``, ``index=decision_index`` and ``pool=GATE_POOL`` (so they
+        ``purpose=gate_purpose(attempt, namespace)``, ``index=decision_index`` and ``pool=GATE_POOL`` (so they
         never coincide with tracker or start-map items). Deterministic; a pure function of the key."""
-        purpose = gate_purpose(attempt)
+        purpose = gate_purpose(attempt, namespace)
         index = _check_index("decision_index", decision_index)
         return {
             name: draw_slice(
@@ -496,11 +516,13 @@ class CapabilityProbe:
         *,
         attempt: int = 0,
         alarm: bool = False,
+        namespace: str | None = None,
     ) -> GateEvidence:
         """Paired evidence of the candidate (current weights) against ``incumbent``.
 
-        Items: :meth:`gate_items` for ``(decision_index, attempt)`` - fresh for each decision and
-        each attempt of a decision. All items are scored on the current weights in one
+        Items: :meth:`gate_items` for ``(decision_index, attempt, namespace)`` - fresh for each
+        decision and each attempt of a decision (``namespace=None``: the training-run stream
+        ``gate/<attempt>``; a :class:`~research_rl.capability.edits.VersionStore` passes its own). All items are scored on the current weights in one
         ``score_fn`` call, then once more, in the same order, inside
         ``weights.swapped(model, incumbent)``. Each slice becomes one :class:`PairedScores` with
         its own split (``Split.T_RULE`` / ``Split.T_TASK`` / ``Split.RETENTION``). On return (or on
@@ -511,7 +533,7 @@ class CapabilityProbe:
         """
         if not isinstance(incumbent, StateSnapshot):
             raise TypeError(f"incumbent must be a StateSnapshot, got {type(incumbent).__name__}")
-        per_slice = self.gate_items(decision_index, attempt)
+        per_slice = self.gate_items(decision_index, attempt, namespace=namespace)
         items = [it for group in per_slice.values() for it in group]
         with _keep_mode(model):
             candidate = score_items(self.score_fn, model, items)

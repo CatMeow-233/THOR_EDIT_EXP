@@ -29,6 +29,13 @@ Security model (``CAPABILITY.md`` 1.13):
   ``Content-Security-Policy: default-src 'self'; ... frame-ancestors 'none'``,
   ``X-Content-Type-Options: nosniff``, ``X-Frame-Options: DENY``, ``Referrer-Policy: no-referrer``
   and ``Cache-Control: no-store``. Errors are JSON.
+* **Connections.** At most ``max_connections`` (default 64) requests are handled at once; a
+  connection over the cap is closed on accept, before a thread is started or anything is read. The
+  request line and headers must arrive within ``header_timeout`` seconds in total (default 30;
+  every socket operation also has a 30 s timeout): a client that trickles header bytes is
+  disconnected and its partial request is never dispatched. This bounds the threads and the time
+  a client without the token can hold; a client that keeps reconnecting can still occupy the slots
+  (the server is meant for one local user, not for hostile networks).
 
 Model access goes through :class:`~research_rl.ui.jobs.ModelWorker` (see :mod:`research_rl.ui.api`).
 """
@@ -36,6 +43,7 @@ Model access goes through :class:`~research_rl.ui.jobs.ModelWorker` (see :mod:`r
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hmac
 import ipaddress
 import json
@@ -48,6 +56,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -62,7 +71,9 @@ from research_rl.ui.loading import LoadedModel, ModelLoadError, build_tiny_demo,
 from research_rl.ui.workspace import Workspace, WorkspaceConfig, call_on_worker
 
 __all__ = [
+    "DEFAULT_HEADER_TIMEOUT",
     "DEFAULT_MAX_BODY",
+    "DEFAULT_MAX_CONNECTIONS",
     "MAX_JSON_DEPTH",
     "STATIC_DIR",
     "TOKEN_ENV",
@@ -83,6 +94,10 @@ logger = logging.getLogger("research_rl.ui")
 
 TOKEN_ENV = "RESEARCH_RL_UI_TOKEN"
 DEFAULT_MAX_BODY = 1024 * 1024
+DEFAULT_MAX_CONNECTIONS = 64
+"""Requests handled at once; further connections are closed on accept."""
+DEFAULT_HEADER_TIMEOUT = 30.0
+"""Seconds a client has, in total, to send the request line and headers."""
 MAX_JSON_DEPTH = 32
 """Deepest nesting of arrays / objects accepted in a request body (edit records need about 4)."""
 _MAX_LENGTH_DIGITS = 15
@@ -202,10 +217,17 @@ class ServerOptions:
     allow_remote: bool = False
     max_body: int = DEFAULT_MAX_BODY
     static_dir: Path = STATIC_DIR
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    header_timeout: float = DEFAULT_HEADER_TIMEOUT
 
 
 class UIServer(ThreadingHTTPServer):
-    """Threading HTTP server holding the API, the token and the allowed Host / Origin values."""
+    """Threading HTTP server holding the API, the token and the allowed Host / Origin values.
+
+    Concurrency is capped at ``options.max_connections`` (a connection over the cap is closed on
+    accept) and the request line + headers of each connection must arrive within
+    ``options.header_timeout`` seconds in total; one watchdog thread shuts down connections past
+    that deadline (a per-read socket timeout alone does not stop a client that trickles bytes)."""
 
     daemon_threads = True
     allow_reuse_address = True
@@ -216,6 +238,10 @@ class UIServer(ThreadingHTTPServer):
             raise ValueError("the session token must be 16-256 characters from [A-Za-z0-9_-]")
         if options.max_body < 1:
             raise ValueError("max_body must be >= 1")
+        if options.max_connections < 1:
+            raise ValueError("max_connections must be >= 1")
+        if not (math.isfinite(options.header_timeout) and options.header_timeout > 0):
+            raise ValueError("header_timeout must be a finite number of seconds > 0")
         self.options = options
         self.api = api
         self.loopback = loopback
@@ -233,6 +259,74 @@ class UIServer(ThreadingHTTPServer):
             allowed.add(f"localhost:{self.bound_port}")
         self.allowed_hosts = frozenset(allowed)
         self.allowed_origins = frozenset(f"http://{h}" for h in allowed)
+        self.connections_refused = 0
+        """Connections closed on accept because ``max_connections`` requests were in progress."""
+        self.header_timeouts = 0
+        """Connections dropped because their request line + headers missed ``header_timeout``."""
+        self._slots = threading.BoundedSemaphore(options.max_connections)
+        self._header_deadlines: dict[socket.socket, float] = {}
+        self._deadline_lock = threading.Lock()
+        self._watchdog_stop = threading.Event()
+        self._watchdog = threading.Thread(
+            target=self._watch_headers, name="research-rl-ui-watchdog", daemon=True
+        )
+        self._watchdog.start()
+
+    # ---------------------------------------------------------------- connection cap
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Start a handler thread, or close the connection when ``max_connections`` are in progress
+        (runs on the accepting thread: nothing is read or written here)."""
+        if not self._slots.acquire(blocking=False):
+            self.connections_refused += 1
+            log = logger.warning if self.connections_refused == 1 else logger.debug  # no log flood
+            log("connection limit (%d) reached: closing new connections", self.options.max_connections)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        """Handle one connection on its thread and free its slot afterwards."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    # ---------------------------------------------------------------- header deadline
+    def begin_header_phase(self, conn: socket.socket) -> None:
+        """Start the ``header_timeout`` clock of a new connection."""
+        with self._deadline_lock:
+            self._header_deadlines[conn] = time.monotonic() + self.options.header_timeout
+
+    def end_header_phase(self, conn: socket.socket) -> bool:
+        """Stop the clock; ``False`` if the deadline had already fired (the connection is dead)."""
+        with self._deadline_lock:
+            return self._header_deadlines.pop(conn, None) is not None
+
+    def _watch_headers(self) -> None:
+        interval = min(1.0, self.options.header_timeout / 4)
+        while not self._watchdog_stop.wait(interval):
+            now = time.monotonic()
+            with self._deadline_lock:
+                expired = [c for c, deadline in self._header_deadlines.items() if deadline <= now]
+                for conn in expired:
+                    del self._header_deadlines[conn]
+            for conn in expired:
+                self.header_timeouts += 1
+                logger.info(
+                    "dropping a connection that did not send its headers within %ss",
+                    self.options.header_timeout,
+                )
+                with contextlib.suppress(OSError):
+                    conn.shutdown(socket.SHUT_RDWR)  # the blocked read in the handler thread returns EOF
+
+    def server_close(self) -> None:
+        """Close the listening socket and stop the header watchdog."""
+        self._watchdog_stop.set()
+        super().server_close()
 
     @property
     def url(self) -> str:
@@ -280,7 +374,32 @@ class UIRequestHandler(BaseHTTPRequestHandler):
     server_version = "research-rl-ui"
     sys_version = ""
     protocol_version = "HTTP/1.0"
-    timeout = 30.0  # seconds per socket operation (slow clients are dropped)
+    timeout = 30.0  # seconds per socket operation; the total header deadline is UIServer's watchdog
+
+    # ---------------------------------------------------------------- header deadline
+    def setup(self) -> None:
+        """Start the connection's header deadline (see :class:`UIServer`)."""
+        super().setup()
+        self.server.begin_header_phase(self.connection)
+
+    def parse_request(self) -> bool:
+        """Parse the request; refuse it if the header deadline fired while it was being read (the
+        watchdog shut the socket down, so the headers read so far may be truncated)."""
+        try:
+            ok = super().parse_request()
+        finally:
+            in_time = self.server.end_header_phase(self.connection)
+        if not in_time:
+            self.close_connection = True
+            return False
+        return ok
+
+    def finish(self) -> None:
+        """Flush and close; always clears the header deadline."""
+        try:
+            super().finish()
+        finally:
+            self.server.end_header_phase(self.connection)
 
     # ---------------------------------------------------------------- logging (never the token)
     def log_message(self, format: str, *args: Any) -> None:
@@ -315,7 +434,8 @@ class UIRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             phrase = "error"
         self.close_connection = True
-        self._error(code, message or phrase, close=True)
+        with contextlib.suppress(OSError):  # the client (or the header watchdog) already closed the socket
+            self._error(code, message or phrase, close=True)
 
     # ---------------------------------------------------------------- methods
     def do_GET(self) -> None:

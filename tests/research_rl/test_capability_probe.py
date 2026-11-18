@@ -325,6 +325,15 @@ def test_fresh_items_per_decision_and_attempt(sampler: ItemSampler) -> None:
         gate_purpose(-1)
     with pytest.raises(ValueError):
         probe.gate_items(-1)
+    # a namespace (one per version store) gives an independent stream of the same shape
+    assert gate_purpose(0, "edit/0f") == "edit/0f/gate/0"
+    for bad in ("", "a b", "/x", "x/", "a//b", 3):
+        with pytest.raises(ValueError, match="namespace"):
+            gate_purpose(0, bad)  # type: ignore[arg-type]
+    named = probe.gate_items(1, 0, namespace="edit/0f")
+    assert named == probe.gate_items(1, 0, namespace="edit/0f")
+    assert named != probe.gate_items(1, 0) and named != probe.gate_items(1, 0, namespace="edit/1f")
+    assert [len(g) for g in named.values()] == [len(g) for g in probe.gate_items(1, 0).values()]
 
 
 def test_evidence_restores_weights_on_score_failure(sampler: ItemSampler, model: nn.Module) -> None:

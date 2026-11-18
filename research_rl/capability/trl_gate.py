@@ -75,6 +75,21 @@ bit-identically to the incumbent, with two deliberate exceptions kept at their p
   incumbent's ``lr`` would train the next step at a stale learning rate. LR-scheduler and RNG state
   are not rolled back either (as documented in :mod:`research_rl.capability.weights`).
 
+Nothing outside the trainable parameters and the optimizer is written, in particular not TRL's
+``ref_model``. TRL's reference-model sync (``sync_ref_model=True``) mixes the policy into
+``ref_model`` at its sync steps and a decision could not undo that, so an enabled gate refuses
+it in ``on_train_begin`` (``ValueError``); the disabled gate (``enabled=False``) never changes the
+weights and allows it.
+
+Exceptions: if the gate procedure raises (a probe / scorer error, OOM, ``KeyboardInterrupt``),
+the controller has written the raw candidate's parameters and masters back (see
+:mod:`research_rl.capability.loop`, "Exceptions during the procedure"), the callback puts
+the step counters and ``param_groups`` back, and the exception propagates out of ``train()``. No
+record is written, ``decision_index`` is not advanced and the running block (rewards, latched
+alarm) is kept; the verdicts already computed have spent their alpha. A further ``train()``
+continues the gate (see "Repeated train()"), so the block's rewards and alarm reach its next
+decision.
+
 State and resume
 ----------------
 :meth:`CapabilityGateCallback.bind` registers the callback in ``trainer.research_components``
@@ -101,7 +116,7 @@ restarts ``state.global_step`` at 0 in every ``train()``, so block decisions fal
 too (``decision_index`` keeps counting). A fresh gate needs a new callback.
 
 Limits: single process only (``ValueError`` for ``world_size > 1``: every rank would run its own
-gate on its own alarm). The retention-horizon check of ``GatedLoop`` is not run here (a run whose
+gate on its own alarm); no ``sync_ref_model`` with an enabled gate (see above). The retention-horizon check of ``GatedLoop`` is not run here (a run whose
 retention slices are too small gets ``horizon_exhausted`` rollbacks, labelled by the controller).
 Verified on CPU with tiny models only (``tests/research_rl/test_capability_trl_gate.py``); GPU,
 vLLM, PEFT and DeepSpeed / FSDP runs are NOT_TESTED.
@@ -351,8 +366,8 @@ class CapabilityGateCallback(TrainerCallback):
         :meth:`load_state_dict`); else, on a further ``train()`` of the same callback, continue the
         gate as it is (see the module docstring, "Repeated train()"); else capture the incumbent.
 
-        ``RuntimeError`` without :meth:`bind`; ``ValueError`` for ``world_size > 1``, a
-        ``block_updates`` whose micro-batch count is not a multiple of the generation period, a
+        ``RuntimeError`` without :meth:`bind`; ``ValueError`` for ``world_size > 1``,
+        ``sync_ref_model=True`` with an enabled gate, a ``block_updates`` whose micro-batch count is not a multiple of the generation period, a
         model without trainable parameters, a missing optimizer, a continued gate whose incumbent
         does not cover exactly the trainable parameters, or a resumed state that does not fit (see
         :meth:`load_state_dict`)."""
@@ -362,6 +377,13 @@ class CapabilityGateCallback(TrainerCallback):
         if _world_size(args) > 1:
             raise ValueError(
                 "CapabilityGateCallback supports single-process training only (NOT_TESTED otherwise)"
+            )
+        if self.config.enabled and getattr(args, "sync_ref_model", False):
+            raise ValueError(
+                "sync_ref_model=True is not supported with an enabled CapabilityGateCallback: TRL "
+                "mixes the policy into the reference model (the KL anchor) at its sync steps, and "
+                "a ROLLBACK / SHRINK / GROUP_ROLLBACK does not undo that, so weights the gate "
+                "rejected would stay in ref_model"
             )
         period = generate_every(args, trainer)
         micro = self.block_updates * int(args.gradient_accumulation_steps)

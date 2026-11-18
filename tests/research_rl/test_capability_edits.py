@@ -480,6 +480,103 @@ def test_evaluate_uses_parent_as_incumbent_and_own_ledger(
     reopened.discard(staged2)
 
 
+class ItemLog(SwitchScore):
+    """:class:`SwitchScore` that also records the uids of every scored batch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.uids: list[tuple[str, ...]] = []
+
+    def __call__(self, m: nn.Module, items: Sequence[Item]) -> list[float]:
+        self.uids.append(tuple(it.uid for it in items))
+        return super().__call__(m, items)
+
+
+def _evaluated_uids(
+    store: VersionStore, probe: CapabilityProbe, score: ItemLog, n: int
+) -> list[tuple[str, ...]]:
+    out = []
+    for k in range(n):
+        score.uids.clear()
+        staged = store.stage(_edit("scale", {0: [k]}, factor=0.5))
+        store.evaluate(staged, _config("spending"), probe)
+        assert score.uids[0] == score.uids[1]  # candidate and incumbent on the same items
+        out.append(score.uids[0])
+        store.discard(staged)
+    return out
+
+
+def test_each_store_draws_its_own_gate_items(tmp_path: Path, vocab: int, sampler: ItemSampler) -> None:
+    # regression: a new store (the remedy CAPABILITY.md 4.3 names) must not replay the gate items
+    # of another store - or of a training run's decisions - at the same evaluation index
+    score = ItemLog()
+    probe = _probe(sampler, score)
+    a = VersionStore(tmp_path / "a", build_tiny_llama(vocab, seed=0))
+    b = VersionStore(tmp_path / "b", build_tiny_llama(vocab, seed=0))
+    assert a.gate_namespace is not None and b.gate_namespace is not None
+    assert a.gate_namespace != b.gate_namespace and a.gate_namespace.startswith("edit/")
+    a.init_from_model()
+    b.init_from_model()
+    uids_a = _evaluated_uids(a, probe, score, 3)
+    uids_b = _evaluated_uids(b, probe, score, 3)
+    run_items = [tuple(it.uid for g in probe.gate_items(k, 0).values() for it in g) for k in range(3)]
+    for k in range(3):
+        assert uids_a[k] != uids_b[k]
+        assert uids_a[k] != run_items[k] and uids_b[k] != run_items[k]
+        assert uids_a[k] == tuple(
+            it.uid for g in probe.gate_items(k, 0, namespace=a.gate_namespace).values() for it in g
+        )
+    assert len(set(uids_a)) == 3  # fresh per evaluation within a store
+    # the namespace is persisted: a reopened store continues its own stream
+    reopened = VersionStore(tmp_path / "a", a.model)
+    assert reopened.gate_namespace == a.gate_namespace
+    meta = json.loads((tmp_path / "a" / "store.json").read_text())
+    assert reopened.gate_namespace == f"edit/{meta['gate_nonce']}"
+    score.uids.clear()
+    staged = reopened.stage(_edit("ablate", {0: [0]}))
+    reopened.evaluate(staged, _config("spending"), probe)
+    assert score.uids[0] == tuple(
+        it.uid for g in probe.gate_items(3, 0, namespace=a.gate_namespace).values() for it in g
+    )
+    version = reopened.commit(staged)
+    assert version.evaluation is not None and version.evaluation["gate_namespace"] == a.gate_namespace
+
+
+def test_store_gate_nonce_validation_and_legacy_store(
+    tmp_path: Path, model: nn.Module, sampler: ItemSampler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, model)
+    store.init_from_model()
+    path = tmp_path / "store" / "store.json"
+    meta = json.loads(path.read_text())
+    assert set(meta) == {"format", "channel_layers", "signature", "created", "gate_nonce"}
+    for bad in ("", "XYZ", meta["gate_nonce"].upper(), None, 7):
+        path.write_text(json.dumps({**meta, "gate_nonce": bad}))
+        with pytest.raises(StoreError, match="gate_nonce"):
+            VersionStore(tmp_path / "store", model)
+    # a legacy store (store.json without a nonce) still opens and keeps the training-run key gate/0
+    legacy = {k: v for k, v in meta.items() if k != "gate_nonce"}
+    path.write_text(json.dumps(legacy))
+    old = VersionStore(tmp_path / "store", model)
+    assert old.gate_namespace is None
+    score = ItemLog()
+    probe = _probe(sampler, score)
+    staged = old.stage(_edit("ablate", {0: [0]}))
+    old.evaluate(staged, _config("spending"), probe)
+    assert score.uids[0] == tuple(it.uid for g in probe.gate_items(0, 0).values() for it in g)
+    version = old.commit(staged)
+    assert version.evaluation is not None and version.evaluation["gate_namespace"] is None
+    # a version evaluated on another namespace is inconsistent with the store
+    path.write_text(json.dumps({**legacy, "gate_nonce": "0" * 32}))
+    with pytest.raises(StoreError, match="gate namespace"):
+        VersionStore(tmp_path / "store", model)
+    # an invalid nonce from the factory is refused before anything is written
+    monkeypatch.setattr(edits_mod, "_new_gate_nonce", lambda: "not-hex")
+    with pytest.raises(StoreError, match="gate nonce"):
+        VersionStore(tmp_path / "fresh", model)
+    assert not (tmp_path / "fresh").exists()
+
+
 def test_commit_refused_without_passing_verdict_or_override(
     tmp_path: Path, model: nn.Module, sampler: ItemSampler
 ) -> None:

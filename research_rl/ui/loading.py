@@ -3,11 +3,18 @@
 :func:`load_model_dir` loads a Hugging Face model directory **from local files only** and **from
 safetensors only**:
 
-* the directory must exist, contain ``config.json`` and at least one ``*.safetensors`` file;
+* the directory must exist and contain ``config.json``;
 * any file that could hold a pickle (``*.bin``, ``*.pt``, ``*.pth``, ``*.pkl``, ``*.pickle``,
   ``*.ckpt``, ``*.joblib``, ``*.npy``/``*.npz`` with objects, ...) anywhere in the directory makes
   the load **refused** before ``from_pretrained`` is called (refusing is safer than hoping the
   loader ignores it);
+* the files ``from_pretrained`` will open are then checked as an allowlist by
+  :func:`research_rl.models.safe_checkpoint.check_safetensors_dir` (the same check as
+  ``scripts/gpu/capability_p1.py``): ``model.safetensors``, or ``model.safetensors.index.json``
+  whose ``weight_map`` lists only bare ``*.safetensors`` file names present in the directory (an
+  index can name a suffixless pickle shard or one outside the directory, which the suffix check
+  cannot see and ``transformers`` would ``torch.load``); a ``transformers_weights`` override in
+  ``config.json`` and a PEFT adapter directory (``adapter_config.json``) are refused;
 * ``from_pretrained`` is called with ``local_files_only=True``, ``use_safetensors=True`` and
   ``trust_remote_code=False`` (no network, no pickle, no code from the checkpoint).
 
@@ -24,6 +31,7 @@ from typing import Any
 
 from torch import nn
 
+from research_rl.models.safe_checkpoint import UnsafeCheckpointError, check_safetensors_dir
 from research_rl.models.tiny import build_char_tokenizer, build_tiny_llama
 
 __all__ = [
@@ -56,11 +64,13 @@ class LoadedModel:
 
 
 def check_model_dir(path: str | Path) -> list[Path]:
-    """Validate a model directory and return its ``*.safetensors`` files (sorted).
+    """Validate a model directory and return the ``*.safetensors`` files the loader will open.
 
-    Raises :class:`ModelLoadError` if the path is not a directory, has no ``config.json``, has no
-    ``*.safetensors`` file, or contains any file with a suffix in :data:`UNSAFE_SUFFIXES`
-    (recursively; symlinks are followed only for this name check).
+    Raises :class:`ModelLoadError` if the path is not a directory, has no ``config.json``, contains
+    any file with a suffix in :data:`UNSAFE_SUFFIXES` (recursively; symlinks are followed only for
+    this name check), or fails :func:`~research_rl.models.safe_checkpoint.check_safetensors_dir`
+    (no ``model.safetensors`` / valid safetensors-only ``model.safetensors.index.json``, a
+    ``transformers_weights`` override, a PEFT adapter directory).
     """
     root = Path(path)
     if not root.is_dir():
@@ -73,10 +83,11 @@ def check_model_dir(path: str | Path) -> list[Path]:
             f"model dir {root} contains non-safetensors weight / pickle files {unsafe[:5]}; "
             "only *.safetensors weights are loaded (convert the checkpoint and remove these files)"
         )
-    weights = sorted(root.glob("*.safetensors"))
-    if not weights:
-        raise ModelLoadError(f"model dir {root} has no *.safetensors weight file")
-    return weights
+    try:
+        checked = check_safetensors_dir(root, label=f"model dir {root}")
+    except UnsafeCheckpointError as exc:
+        raise ModelLoadError(str(exc)) from exc
+    return [root / name for name in checked.safetensors]
 
 
 def load_model_dir(path: str | Path) -> LoadedModel:

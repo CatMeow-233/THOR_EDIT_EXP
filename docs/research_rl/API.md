@@ -1,6 +1,9 @@
 # ResearchRL API reference
 
-Generated from the module and object docstrings of `research_rl` (public names only).
+Built from the module and object docstrings of `research_rl` (public names only). There is no
+generator script: `tests/research_rl/test_capability_exports.py` checks that every
+`research_rl.capability` and `research_rl.ui` module has a section listing its public names with
+their current signatures.
 See [README.md](README.md) for concepts and [DEPLOY_GPU.md](DEPLOY_GPU.md) for GPU runs.
 
 <!-- capability-api:begin -->
@@ -74,6 +77,7 @@ Declarative FFN-channel edits and an immutable, gate-checked version graph (``CA
   - `discard(self, staged: 'StagedEdit') -> 'None'` — Undo a staged edit: the affected parameters are restored bitwise to the parent's.
   - `evaluate(self, staged: 'StagedEdit', gate_config: 'GateConfig', probe: 'CapabilityProbe') -> 'GateVerdict'` — Gate verdict of the staged weights (candidate) against the parent's (incumbent).
   - `evaluation_count` — Evaluations run by this store so far (the next evaluation's ``decision_index``).
+  - `gate_namespace` — Sampler namespace of this store's gate items, ``"edit/<gate_nonce>"`` (the nonce is drawn at random when the store is created and kept in ``store.json``), so two stores never share an item stream; ``None`` for a legacy store created without a nonce (its items use the training-run purpose ``gate/0``).
   - `get(self, version_id: 'str') -> 'Version'` — A copy of version ``version_id`` (:class:`EditError` for a malformed id, ``KeyError`` if unknown). Mutating the copy's dicts never changes the store.
   - `head` — Id of the version the live model was last put at by this store (``None`` before init).
   - `history(self, version_id: 'str | None' = None) -> 'list[Version]'` — Copies of the lineage root -> ``version_id`` (default: the head; ``[]`` for an empty store).
@@ -141,9 +145,10 @@ The gated training loop (``docs/research_rl/CAPABILITY.md`` 1.9 with the pinned 
   - `verdict_gate` — The gate that computes (and spends alpha for) every verdict: ``gate`` itself when enabled, a private copy with its own ledger when disabled.
 - **class `GatedLoop`** — Operator updates, alarm, gate decisions, decision log and resume state.
   - `check_horizon(self, num_updates: 'int') -> 'None'` — Start-of-run check: ``verdict_gate.ledger.count + required_verdicts(num_updates)`` must not exceed :meth:`horizon`. Otherwise ``ValueError`` (``UserWarning`` with ``allow_short_horizon=True``). Run by :meth:`run` before the first update.
+  - `decision_pending` — True when the running block is owed a decision that has not been recorded: it holds ``block_updates`` updates, or its latched alarm fired with ``alarm_triggers_decision``. This happens only when a decision raised (see :meth:`run`); the next :meth:`run` takes that decision before its first update.
   - `horizon(self) -> 'int | None'` — Last verdict index (1-based, ledger count) at which every retention slice of the probe can still pass with ``n10 = round(0.005 n)`` incumbent-only wins and no candidate-only win (``GateConfig.retention_horizon`` per slice, ``n = probe.items_per_retention_slice``, the size the probe actually tests, falling back to ``config.items_per_retention_slice``); ``None`` = no practical limit.
   - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Continue from a :meth:`state_dict` (build every object exactly as the saved run did).
-  - `required_verdicts(self, num_updates: 'int') -> 'int'` — :func:`worst_case_verdicts` of ``num_updates`` more updates from the current position.
+  - `required_verdicts(self, num_updates: 'int') -> 'int'` — :func:`worst_case_verdicts` of ``num_updates`` more updates from the current position (with a :attr:`decision_pending`: that decision's ``max_verdicts_per_decision`` plus the worst case of ``num_updates`` updates from an empty block).
   - `run(self, num_updates: 'int') -> 'list[DecisionRecord]'` — Run ``num_updates`` more operator updates (with their decisions); returns the decision records of this call (also appended to :attr:`records`). The horizon check runs first.
   - `state_dict(self) -> 'dict[str, Any]'` — Everything needed to continue the run exactly; loadable with ``torch.save`` / ``torch.load(weights_only=True)`` (tensors, numbers, strings, lists, dicts).
   - `updates_since_decision`
@@ -211,9 +216,9 @@ P0 capability pilot on CPU (``docs/research_rl/CAPABILITY.md`` 1.14 and the kill
 Gate evidence and start-of-run capability maps (``docs/research_rl/CAPABILITY.md`` 1.8).
 
 - **class `CapabilityProbe`** — Builds :class:`GateEvidence` for one gate evaluation.
-  - `evidence(self, model: 'nn.Module', incumbent: 'StateSnapshot', decision_index: 'int', *, attempt: 'int' = 0, alarm: 'bool' = False) -> 'GateEvidence'` — Paired evidence of the candidate (current weights) against ``incumbent``.
+  - `evidence(self, model: 'nn.Module', incumbent: 'StateSnapshot', decision_index: 'int', *, attempt: 'int' = 0, alarm: 'bool' = False, namespace: 'str | None' = None) -> 'GateEvidence'` — Paired evidence of the candidate (current weights) against ``incumbent``.
   - `from_config(cls, sampler: 'ItemSampler', score_fn: 'ScoreFn', config: 'GateConfig', *, transfer_slices: 'Sequence[str] | None' = None, retention_slices: 'Sequence[str] | None' = None) -> 'CapabilityProbe'` — Probe with ``config.items_per_transfer_slice`` / ``config.items_per_retention_slice``.
-  - `gate_items(self, decision_index: 'int', attempt: 'int' = 0) -> 'dict[str, list[Item]]'` — The items of evaluation ``(decision_index, attempt)``, per slice (transfer slices first, then retention, in construction order): :func:`draw_slice` with ``purpose=gate_purpose(attempt)``, ``index=decision_index`` and ``pool=GATE_POOL`` (so they never coincide with tracker or start-map items).
+  - `gate_items(self, decision_index: 'int', attempt: 'int' = 0, *, namespace: 'str | None' = None) -> 'dict[str, list[Item]]'` — The items of evaluation ``(decision_index, attempt)``, per slice (transfer slices first, then retention, in construction order): :func:`draw_slice` with ``purpose=gate_purpose(attempt, namespace)``, ``index=decision_index`` and ``pool=GATE_POOL`` (so they never coincide with tracker or start-map items). Deterministic; a pure function of the key.
   - `items_per(self, slice_name: 'str') -> 'int'` — Items per evaluation of one of this probe's slices (``KeyError`` for other slices).
   - `score_slice(self, model: 'nn.Module', slice: 'str', n: 'int', *, purpose: 'str', index: 'int', pool: 'str | None' = None) -> 'SliceScores'` — :func:`score_slice` with this probe's sampler and score function. ``slice`` may be any non-AUDIT slice of the sampler (TRAIN included), not only this probe's slices.
   - `to_dict(self) -> 'dict[str, Any]'` — JSON-able configuration (slices, item counts, sampler identity).
@@ -239,7 +244,7 @@ Gate evidence and start-of-run capability maps (``docs/research_rl/CAPABILITY.md
   - `to_dict(self) -> 'dict[str, Any]'` — JSON-able (``json.dumps`` works); :meth:`from_dict` inverts it.
 - `check_truncation_budget(sampler: 'ItemSampler', score_fn: 'Any') -> 'None'` — Raise ``ValueError`` if ``score_fn`` exposes an integer ``max_new_tokens`` smaller than ``sampler.splits.operators.max_len + 1`` (the longest possible answer plus the EOS token); no-op for score functions without ``max_new_tokens``.
 - `draw_slice(sampler: 'ItemSampler', slice_name: 'str', n: 'int', *, purpose: 'str', index: 'int', pool: 'str | None' = None) -> 'list[Item]'` — ``n`` >= 1 distinct items of a non-AUDIT slice for the key ``(purpose, index)``.
-- `gate_purpose(attempt: 'int') -> 'str'` — Sampler purpose of gate evaluation ``attempt`` (0 = the raw candidate, then one per shrink factor / group revert of the same decision): ``f"gate/{attempt}"``.
+- `gate_purpose(attempt: 'int', namespace: 'str | None' = None) -> 'str'` — Sampler purpose of gate evaluation ``attempt`` (0 = the raw candidate, then one per shrink factor / group revert of the same decision): ``f"gate/{attempt}"``, or ``f"{namespace}/gate/{attempt}"`` with a ``namespace`` (an independent item stream per namespace; :class:`~research_rl.capability.edits.VersionStore` uses one per store).
 - `item_pool(sampler: 'ItemSampler', uid: 'str') -> 'str'` — The pool of item ``uid`` for ``sampler``: :data:`TRACK_POOL` iff ``_derive_seed("item_pool", sampler.root_seed, uid) % TRACK_POOL_DENOMINATOR == 0``, else :data:`GATE_POOL`. A fixed function of ``(root_seed, uid)``; every uid is in exactly one pool.
 - `sample_completions(model: 'nn.Module', tokenizer: 'Any', prompt: 'str', *, num_samples: 'int', max_new_tokens: 'int', temperature: 'float' = 1.0, seed: 'int', batch_size: 'int' = 16) -> 'list[str]'` — ``num_samples`` sampled continuations of one ``prompt`` (decoded, EOS and after removed).
 - `sample_completions_with_truncation(model: 'nn.Module', tokenizer: 'Any', prompt: 'str', *, num_samples: 'int', max_new_tokens: 'int', temperature: 'float' = 1.0, seed: 'int', batch_size: 'int' = 16) -> 'tuple[list[str], list[bool]]'` — :func:`sample_completions` plus one exact truncation flag per sample.
@@ -718,6 +723,18 @@ Element-wise parameter masks.
   - `union(self, other: 'ParameterMask') -> 'ParameterMask'` — Element may change if it may change in either mask.
   - `validate(self, model: 'nn.Module') -> 'None'`
 
+## `research_rl.models.safe_checkpoint`
+
+Safetensors-only check of a local Hugging Face model directory (no weights are read). Shared by the UI's `--model-dir` loader (`research_rl.ui.loading.check_model_dir`) and `scripts/gpu/capability_p1.py` (`validate_model_dir`).
+
+- `PICKLE_SUFFIXES` — Pickle-based checkpoint formats: never loaded (they can execute code on load).
+- `SAFE_WEIGHTS_FILE` — Single-file safetensors weights: the first file ``transformers`` opens with ``use_safetensors``.
+- `SAFE_WEIGHTS_INDEX_FILE` — Sharded safetensors index: opened when :data:`SAFE_WEIGHTS_FILE` is absent.
+- **class `SafetensorsDir`** — Result of :func:`check_safetensors_dir`.
+- **class `UnsafeCheckpointError`** — The directory is not a checkpoint whose weights ``transformers`` would read from safetensors only.
+- `check_safetensors_dir(path: 'str | Path', *, label: 'str | None' = None) -> 'SafetensorsDir'` — Check ``path`` without reading any weights (see the module docstring for the rules).
+- `is_plain_file_name(name: 'str') -> 'bool'` — ``True`` for a bare file name inside the directory (no separator, ``..`` or absolute path).
+
 ## `research_rl.models.tiny`
 
 Tiny, fully offline models and tokenizers for tests, CI and smoke runs.
@@ -1165,6 +1182,139 @@ Supervised fine-tuning (SFT) adapter around TRL's ``SFTTrainer``.
   - `train(self, resume_from_checkpoint: 'str | bool | None' = None, **kwargs: 'Any') -> 'Any'`
 - `token_resume_trainer_class(trl_cls: 'type') -> 'type'` — ``research_trainer_class`` of ``trl_cls`` with :class:`TrainTokensResumeMixin` (cached).
 - `track_train_tokens(run: 'ResearchRun') -> 'ResearchRun'`
+
+## `research_rl.ui`
+
+Local channel search + edit tool for :mod:`research_rl.capability` (``CAPABILITY.md`` 1.13).
+
+- **class `ServerOptions`** — Network and security settings of :class:`UIServer`.
+- **class `UIApp`** — A running UI: worker, workspace, API and (not yet serving) HTTP server.
+  - `close(self) -> 'None'` — Stop serving, close the socket and stop the worker.
+  - `serve_in_thread(self) -> 'threading.Thread'` — Start ``serve_forever`` on a daemon thread (tests, notebooks).
+- **class `UIServer`** — Threading HTTP server holding the API, the token and the allowed Host / Origin values.
+  - `begin_header_phase(self, conn: 'socket.socket') -> 'None'` — Start the ``header_timeout`` clock of a new connection.
+  - `end_header_phase(self, conn: 'socket.socket') -> 'bool'` — Stop the clock; ``False`` if the deadline had already fired (the connection is dead).
+  - `process_request(self, request: 'Any', client_address: 'Any') -> 'None'` — Start a handler thread, or close the connection when ``max_connections`` are in progress (runs on the accepting thread: nothing is read or written here).
+  - `process_request_thread(self, request: 'Any', client_address: 'Any') -> 'None'` — Handle one connection on its thread and free its slot afterwards.
+  - `server_close(self) -> 'None'` — Close the listening socket and stop the header watchdog.
+  - `token_ok(self, presented: 'str | None') -> 'bool'` — Constant-time comparison of a presented token (bytes; non-latin-1 values never match).
+  - `token_url(self) -> 'str'` — The URL with the token in its fragment (printed once at start; never logged).
+  - `url` — Base URL of the UI (without the token).
+- `create_app(loaded: 'LoadedModel', *, store: 'str | Path', options: 'ServerOptions', config: 'WorkspaceConfig | None' = None, runs_dir: 'str | Path | None' = None, score_fn: 'Any' = None, sync_wait: 'float' = 60.0) -> 'UIApp'` — Build worker, workspace (on the worker), API and server. Nothing is served yet.
+- `main(argv: 'Sequence[str] | None' = None) -> 'int'` — Entry point of ``python -m research_rl.ui``.
+
+## `research_rl.ui.api`
+
+The JSON API of the UI: routing, parameter validation (with bounds) and error mapping.
+
+- **class `Api`** — Routes authenticated JSON requests (see the module docstring).
+  - `handle(self, method: 'str', segments: 'list[str]', query: 'Mapping[str, list[str]]', body: 'Any') -> 'tuple[int, Any]'` — ``(status, payload)`` for one request; never raises for request errors.
+- **class `ApiError`** — An error with an HTTP status, returned as ``{"error": {...}}``.
+- `error_payload(exc: 'BaseException') -> 'dict[str, Any]'` — ``{"status", "type", "message"}`` of an exception (used for jobs and responses).
+- `map_exception(exc: 'BaseException') -> 'tuple[int, str]'` — HTTP status and error type for an exception (specific classes first; no tracebacks).
+- constants: `LIMITS`
+
+## `research_rl.ui.jobs`
+
+The single model worker and its job queue.
+
+- **class `Job`** — One unit of model work. Mutable fields are written only by the worker under ``lock``.
+  - `finished_ok` — True iff the job finished without an exception.
+  - `to_dict(self, *, include_result: 'bool' = True) -> 'dict[str, Any]'` — JSON-able view (the callable and the raw exception are never exposed).
+- **class `JobContext`** — Handed to a job function: report progress, and check that the code runs on the worker.
+  - `job_id` — Id of the running job.
+  - `progress(self, fraction: 'float', message: 'str' = '') -> 'None'` — Set the job's progress (clamped to [0, 1]) and an optional short message.
+- **class `ModelWorker`** — One daemon thread executing queued jobs in submission order.
+  - `call(self, kind: 'str', fn: 'Callable[[JobContext], Any]', params: 'dict[str, Any] | None' = None, *, wait: 'float') -> 'Job'` — :meth:`submit`, then wait up to ``wait`` seconds for the job to finish; returns the job (finished or not).
+  - `current_job` — Id of the running job, if any.
+  - `get(self, job_id: 'str') -> 'Job | None'` — The job with ``job_id`` (``None`` if unknown or already dropped).
+  - `list(self) -> 'list[Job]'` — Every known job, newest first.
+  - `on_worker(self) -> 'bool'` — True iff the calling code runs on the worker thread.
+  - `pending` — Unfinished (queued or running) jobs.
+  - `stop(self, timeout: 'float' = 10.0) -> 'None'` — Stop accepting jobs, let the queued ones finish, and join the thread.
+  - `submit(self, kind: 'str', fn: 'Callable[[JobContext], Any]', params: 'dict[str, Any] | None' = None) -> 'Job'` — Queue ``fn(ctx)`` as a new job and return it (``QueueFullError`` when the queue is full).
+  - `thread` — The worker thread.
+- **class `QueueFullError`** — The worker already has :attr:`ModelWorker.max_pending` unfinished jobs.
+- **class `WorkerStoppedError`** — The worker was stopped; no job can be submitted.
+
+## `research_rl.ui.loading`
+
+Model loading for the UI: local safetensors checkpoints or an in-process tiny demo model.
+
+- **class `LoadedModel`** — A model with its tokenizer and a short description of where it came from.
+- **class `ModelLoadError`** — The model directory is missing, incomplete, or contains a non-safetensors weight file.
+- `build_tiny_demo(seed: 'int' = 0) -> 'LoadedModel'` — A randomly initialised tiny Llama (``research_rl.models.tiny``) and its char tokenizer.
+- `check_model_dir(path: 'str | Path') -> 'list[Path]'` — Validate a model directory and return the ``*.safetensors`` files the loader will open.
+- `load_model_dir(path: 'str | Path') -> 'LoadedModel'` — Load a causal LM and its tokenizer from a local directory (safetensors only, offline).
+- constants: `UNSAFE_SUFFIXES`
+
+## `research_rl.ui.runs`
+
+Read-only access to gated-loop decision logs under an allowed runs directory.
+
+- **class `RunAccessError`** — The run name is invalid or its log resolves outside the runs directory.
+- `list_runs(runs_dir: 'Path | None') -> 'list[dict[str, Any]]'` — Runs with a decision log directly under ``runs_dir`` (sorted by name).
+- `read_decisions(runs_dir: 'Path', name: 'str', *, limit: 'int' = 1000, max_bytes: 'int' = 33554432) -> 'dict[str, Any]'` — Parse the decision log of run ``name``: the last ``limit`` records, summarised.
+- `resolve_run(runs_dir: 'Path', name: 'str') -> 'Path'` — Path of the decision log of run ``name`` (``RunAccessError`` / ``FileNotFoundError``).
+- constants: `RUN_NAME_RE`
+
+## `research_rl.ui.server`
+
+Local HTTP server of the UI (Python stdlib ``http.server`` only).
+
+- **class `BindError`** — The bind address is not allowed (non-loopback without ``allow_remote``, or not an IP).
+- **class `ServerOptions`** — Network and security settings of :class:`UIServer`.
+- **class `UIApp`** — A running UI: worker, workspace, API and (not yet serving) HTTP server.
+  - `close(self) -> 'None'` — Stop serving, close the socket and stop the worker.
+  - `serve_in_thread(self) -> 'threading.Thread'` — Start ``serve_forever`` on a daemon thread (tests, notebooks).
+- **class `UIServer`** — Threading HTTP server holding the API, the token and the allowed Host / Origin values.
+  - `begin_header_phase(self, conn: 'socket.socket') -> 'None'` — Start the ``header_timeout`` clock of a new connection.
+  - `end_header_phase(self, conn: 'socket.socket') -> 'bool'` — Stop the clock; ``False`` if the deadline had already fired (the connection is dead).
+  - `process_request(self, request: 'Any', client_address: 'Any') -> 'None'` — Start a handler thread, or close the connection when ``max_connections`` are in progress (runs on the accepting thread: nothing is read or written here).
+  - `process_request_thread(self, request: 'Any', client_address: 'Any') -> 'None'` — Handle one connection on its thread and free its slot afterwards.
+  - `server_close(self) -> 'None'` — Close the listening socket and stop the header watchdog.
+  - `token_ok(self, presented: 'str | None') -> 'bool'` — Constant-time comparison of a presented token (bytes; non-latin-1 values never match).
+  - `token_url(self) -> 'str'` — The URL with the token in its fragment (printed once at start; never logged).
+  - `url` — Base URL of the UI (without the token).
+- `build_parser() -> 'argparse.ArgumentParser'` — The command-line interface of ``python -m research_rl.ui``.
+- `check_bind_host(host: 'str', allow_remote: 'bool') -> 'tuple[str, bool]'` — Normalise the bind host; returns ``(ip, is_loopback)``.
+- `create_app(loaded: 'LoadedModel', *, store: 'str | Path', options: 'ServerOptions', config: 'WorkspaceConfig | None' = None, runs_dir: 'str | Path | None' = None, score_fn: 'Any' = None, sync_wait: 'float' = 60.0) -> 'UIApp'` — Build worker, workspace (on the worker), API and server. Nothing is served yet.
+- `json_depth(obj: 'Any') -> 'int'` — Nesting depth of a parsed JSON value (a scalar is 0, ``[]`` / ``{}`` 1), computed iteratively.
+- `jsonable(obj: 'Any') -> 'Any'` — Copy of ``obj`` that ``json.dumps(..., allow_nan=False)`` accepts: non-finite floats become ``None``, tuples / sets lists, enums their value, other objects their ``str``.
+- `main(argv: 'Sequence[str] | None' = None) -> 'int'` — Entry point of ``python -m research_rl.ui``.
+- `resolve_token(env: 'dict[str, str] | None' = None) -> 'str'` — The session token: ``RESEARCH_RL_UI_TOKEN`` if set (16-256 URL-safe characters, else ``ValueError``), otherwise :func:`secrets.token_urlsafe` (32 bytes).
+- constants: `DEFAULT_HEADER_TIMEOUT`, `DEFAULT_MAX_BODY`, `DEFAULT_MAX_CONNECTIONS`, `MAX_JSON_DEPTH`, `STATIC_DIR`, `TOKEN_ENV`
+
+## `research_rl.ui.workspace`
+
+The model-side state of the UI: model, tasks, probe, version store, stored statistics and scores.
+
+- **class `SearchParams`** — Bounded parameters of one UI subset search (validated by the API layer).
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able copy of every field.
+- **class `StoredScore`** — One stored channel score (``scores`` is ``None`` when unavailable, with ``reason``).
+  - `summary(self, current_fingerprint: 'str') -> 'dict[str, Any]'` — JSON-able description (without the tensors); ``stale`` for weight-dependent scores whose fingerprint differs from ``current_fingerprint``.
+- **class `StoredStats`** — Channel statistics collected on the prompts of one split (and, with ``contrast``, on the prompt + greedy completion of V2-correct and V2-incorrect items separately).
+  - `summary(self, current_fingerprint: 'str') -> 'dict[str, Any]'` — JSON-able description; ``stale`` = collected on other weights than ``current_fingerprint``.
+- **class `Workspace`** — Model, testbed, edit store and stored statistics; see the module docstring.
+  - `channel_detail(self, layer: 'int', channel: 'int', *, k: 'int' = 10, max_versions: 'int' = 50) -> 'dict[str, Any]'` — Vocabulary projection, stored statistics and version history of one FFN channel.
+  - `collect_stats(self, split: 'Split', n: 'int', *, slice_name: 'str | None' = None, contrast: 'bool' = False, threshold: 'float' = 0.0, ctx: 'JobContext | None' = None) -> 'dict[str, Any]'` — Collect :class:`ChannelStats` on ``n`` prompts of ``split`` (or of one of its slices), store them (replacing earlier stats of the split) and recompute the stored scores.
+  - `commit(self, override: 'str | None', note: 'str' = '') -> 'dict[str, Any]'` — Commit the staged edit (refused without a passing verdict unless ``override``).
+  - `discard(self) -> 'dict[str, Any]'` — Discard the staged edit (the parent's weights are restored bitwise).
+  - `evaluate(self, ctx: 'JobContext | None' = None) -> 'dict[str, Any]'` — Gate verdict of the staged edit (store ledger) and the training reward beside it.
+  - `public_history(self) -> 'dict[str, Any]'` — Published version graph: head, lineage, every version record and the staged edit.
+  - `public_last_search(self) -> 'dict[str, Any] | None'` — Result of the last subset search of this process, or ``None``.
+  - `public_model(self) -> 'dict[str, Any]'` — Published model description (layers, intermediate sizes, slices, gate config).
+  - `public_scores(self) -> 'dict[str, dict[str, Any]]'` — Summaries of every stored score (availability, reason, staleness).
+  - `public_status(self) -> 'dict[str, Any]'` — Published status (source, fingerprint, head, stats and score summaries, last evaluation).
+  - `rank_channels(self, *, kind: 'str', split: 'str | None', layer: 'int | None', group: 'str | None', bands: 'int', top: 'int') -> 'dict[str, Any]'` — Rank channels by a stored score (published data only; no weights are read).
+  - `restore(self, version_id: 'str') -> 'dict[str, Any]'` — Put the live model at ``version_id`` bitwise (:meth:`VersionStore.restore`).
+  - `run_search(self, params: 'SearchParams', *, max_candidates: 'int', ctx: 'JobContext | None' = None) -> 'dict[str, Any]'` — Run :class:`SubsetSearch` over the groups of a stored score with ES bursts on a :class:`ChannelGainSpace`; the model is back at its start weights afterwards (checked).
+  - `search_groups(self, params: 'SearchParams') -> 'list[ChannelGroup]'` — Candidate groups of a search: ``group_channels`` of the stored score, optionally filtered.
+  - `stage(self, edits: 'Sequence[Mapping[str, Any]]') -> 'dict[str, Any]'` — Stage declarative edits (``EditRecord.from_dict`` of each JSON object; no code).
+- **class `WorkspaceConfig`** — Settings of the task testbed, the gate used for edits and the reward shown beside it.
+  - `gate_config(self) -> 'GateConfig'` — The (enabled) :class:`GateConfig` used for every edit evaluation of the store.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able copy of every field.
+- constants: `HONESTY_NOTE`, `SCORE_KINDS`, `STATS_SPLITS`
 
 ## `research_rl.utils.logging`
 

@@ -26,7 +26,9 @@ items **never coincide with gate items**: every uid belongs to exactly one pool
 tracker and the start map only from ``TRACK_POOL`` (1 in
 :data:`~research_rl.capability.probe.TRACK_POOL_DENOMINATOR` uids). Tracker items of different
 steps are independent draws from the track pool and repeat by chance (small length-3 domains).
-Items drawn with ``pool=None`` elsewhere (e.g. a subset search) are not partitioned.
+A :class:`~research_rl.capability.search.SubsetSearch` draws from ``TRACK_POOL`` by default
+(never gate items, but its items can coincide by chance with tracker and start-map items); only
+draws with ``pool=None`` are unpartitioned.
 
 Truncation. When ``score_fn`` exposes an integer ``max_new_tokens``, it must equal the start
 map's ``max_new_tokens`` (``ValueError`` otherwise), so ``T_rule(0)`` and ``T_rule(t)`` are scored

@@ -47,7 +47,7 @@ returned object never changes the store's history.
 Store layout (all writes stay inside ``root``; every write is a temporary file in ``root/tmp``
 followed by ``os.replace``)::
 
-    root/store.json                  immutable: format, channel layers, model signature
+    root/store.json                  immutable: format, channel layers, model signature, gate nonce
     root/head.json                   mutable: the version the live model was last put at
     root/ledger.json                 mutable: the store's own AlphaLedger + evaluation counter
     root/versions/<id>.json          immutable version records; id = SHA-256 of the record
@@ -77,7 +77,8 @@ Gate evaluation. :meth:`VersionStore.evaluate` scores the staged weights against
 weights (the snapshot taken at :meth:`VersionStore.stage`, swapped in by
 :meth:`~research_rl.capability.probe.CapabilityProbe.evidence` with
 :func:`~research_rl.capability.weights.swapped`) on fresh items, with
-``decision_index = evaluation counter of the store`` and ``attempt = 0``, and decides with
+``decision_index = evaluation counter of the store``, ``attempt = 0`` and
+``namespace = VersionStore.gate_namespace``, and decides with
 :class:`~research_rl.capability.gate.CapabilityGate` using the **store's own** persisted
 :class:`~research_rl.capability.stats.AlphaLedger` (never a training run's). The ledger's
 ``(total_alpha, schedule)`` is pinned by the first evaluation; later evaluations with another
@@ -87,10 +88,20 @@ version records: ``ledger.count == evaluations`` (``ledger`` is ``None`` iff ``e
 0``), every recorded evaluation has ``evaluation_index < evaluations`` and the verdict's
 ``decision_index`` equal to it, and its ``alpha`` / ``alpha_schedule`` equal the ledger's pin. This
 is a lower bound only: evaluations of discarded edits leave no version record, so a ledger reset
-to a count at or above the highest recorded index is not detectable. Limit: the items are a function of the probe's sampler and the key
-``("gate/0", evaluation counter)``; a training run's probe with the same sampler seed draws the
-same items at the same decision index, so give the store's probe a sampler with its own
-``root_seed`` if edit evaluations must be independent of a run's gate items.
+to a count at or above the highest recorded index is not detectable.
+
+Gate items per store. The items are a function of the probe's sampler and the key
+``(f"edit/{gate_nonce}/gate/0", evaluation counter)``. ``gate_nonce`` is 128 random bits drawn
+when the store is created and kept in ``store.json`` (and the namespace is recorded in every
+evaluation context), so a new store draws an item stream of its own even with the same probe and
+sampler seed: its evaluation ``k`` never replays the items of evaluation ``k`` of another store
+or of a training run's decision ``k`` (purpose ``gate/<attempt>``). The streams are independent
+draws from the same gate pool, so single items still repeat by chance, as between two decisions
+of one run (:mod:`~research_rl.capability.probe`, "Item pools"). A legacy store whose
+``store.json`` has no ``gate_nonce`` (created before it existed) still opens and keeps the old key
+``("gate/0", evaluation counter)`` (:attr:`VersionStore.gate_namespace` is ``None``): its items
+coincide with those of any other legacy store, or training run, on a sampler with the same
+``root_seed``.
 
 Commit and init are all-or-nothing in memory: if the head write fails after the version record
 was written, the record written by that call is removed again (best effort; the content-addressed
@@ -113,6 +124,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -163,6 +175,16 @@ __all__ = [
 STORE_FORMAT = "research_rl.capability.edits/v1"
 _STATE_FORMAT = "research_rl.capability.edits.channels/v1"
 _ID_RE = re.compile(r"[0-9a-f]{64}")  # always used with fullmatch
+_NONCE_RE = re.compile(r"[0-9a-f]{32}")  # always used with fullmatch
+_STORE_KEYS = frozenset({"format", "channel_layers", "signature", "created", "gate_nonce"})
+_LEGACY_STORE_KEYS = _STORE_KEYS - {"gate_nonce"}  # stores created before the per-store gate nonce
+
+
+def _new_gate_nonce() -> str:
+    """Fresh random gate nonce of a new store (128 bits, hex). Tests may monkeypatch this."""
+    return secrets.token_hex(16)
+
+
 MAX_TEXT = 10_000  # maximum length of a note / override reason (characters)
 
 _DIRS = ("versions", "states", "deltas", "tmp")
@@ -768,6 +790,7 @@ class VersionStore:
         self._head: str | None = None
         self._ledger: AlphaLedger | None = None
         self._evaluations = 0
+        self._gate_namespace: str | None = None
         if exists:
             self._open(given)
         else:
@@ -788,6 +811,9 @@ class VersionStore:
     def _create(self, layers: list[int]) -> None:
         if self.root.exists() and (not self.root.is_dir() or any(self.root.iterdir())):
             raise StoreError(f"{self.root} exists and is not an empty directory (and has no store.json)")
+        nonce = _new_gate_nonce()
+        if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
+            raise StoreError(f"gate nonce must be 32 lowercase hex characters, got {nonce!r}")
         self.root.mkdir(parents=True, exist_ok=True)
         for d in _DIRS:
             (self.root / d).mkdir(exist_ok=True)
@@ -796,20 +822,27 @@ class VersionStore:
             "channel_layers": layers,
             "signature": self._signature,
             "created": _now(),
+            "gate_nonce": nonce,
         }
         self._write_json("store.json", meta)
         self._write_head(None)
         self._write_ledger(None, 0)
+        self._gate_namespace = f"edit/{nonce}"
 
     def _open(self, layers: list[int] | None) -> None:
         if self.root.is_symlink() or not self.root.is_dir():
             raise StoreError(f"{self.root} is not a directory")
         self._scan_layout()
         meta = self._read_json(self.root / "store.json")
-        if not isinstance(meta, dict) or set(meta) != {"format", "channel_layers", "signature", "created"}:
+        if not isinstance(meta, dict) or set(meta) not in (_STORE_KEYS, _LEGACY_STORE_KEYS):
             raise StoreError("store.json is malformed")
         if meta["format"] != STORE_FORMAT:
             raise StoreError(f"unknown store format {meta['format']!r}")
+        nonce = meta.get("gate_nonce")
+        if nonce is not None and (not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce)):
+            raise StoreError(f"store.json gate_nonce {nonce!r} is malformed (32 lowercase hex characters)")
+        if "gate_nonce" in meta and nonce is None:
+            raise StoreError("store.json gate_nonce is null")
         stored_layers = meta["channel_layers"]
         if not isinstance(stored_layers, list) or not all(
             isinstance(x, int) and not isinstance(x, bool) for x in stored_layers
@@ -873,6 +906,18 @@ class VersionStore:
                 self._check_evaluation(v, self._ledger, self._evaluations)
         except EditError as exc:
             raise StoreError(f"ledger.json is inconsistent with the version records: {exc}") from exc
+        self._gate_namespace = None if nonce is None else f"edit/{nonce}"
+        for v in versions.values():
+            ev = v.evaluation
+            if (
+                isinstance(ev, dict)
+                and "gate_namespace" in ev
+                and ev["gate_namespace"] != self._gate_namespace
+            ):
+                raise StoreError(
+                    f"version {v.id} was evaluated on gate namespace {ev['gate_namespace']!r}, "
+                    f"not this store's {self._gate_namespace!r}"
+                )
         shutil.rmtree(self.root / "tmp")
         (self.root / "tmp").mkdir()
 
@@ -1176,6 +1221,14 @@ class VersionStore:
     def evaluation_count(self) -> int:
         """Evaluations run by this store so far (the next evaluation's ``decision_index``)."""
         return self._evaluations
+
+    @property
+    def gate_namespace(self) -> str | None:
+        """Sampler namespace of this store's gate items, ``"edit/<gate_nonce>"`` (the nonce is drawn
+        at random when the store is created and kept in ``store.json``), so two stores never share
+        an item stream; ``None`` for a legacy store created without a nonce (its items use the
+        training-run purpose ``gate/0``)."""
+        return self._gate_namespace
 
     @property
     def ledger(self) -> AlphaLedger | None:
@@ -1581,8 +1634,9 @@ class VersionStore:
     def evaluate(self, staged: StagedEdit, gate_config: GateConfig, probe: CapabilityProbe) -> GateVerdict:
         """Gate verdict of the staged weights (candidate) against the parent's (incumbent).
 
-        ``probe.evidence(model, staged.incumbent, decision_index=evaluation_count)`` scores both on
-        the same fresh items (the incumbent through ``weights.swapped``), then
+        ``probe.evidence(model, staged.incumbent, decision_index=evaluation_count,
+        namespace=gate_namespace)`` scores both on the same fresh items of this store's own stream
+        (the incumbent through ``weights.swapped``), then
         ``CapabilityGate(gate_config, copy of the store ledger).verdict`` decides; the advanced
         ledger and counter are written to ``ledger.json`` first and adopted in memory only after
         that write succeeded (an error before that write leaves the ledger, the counter and the
@@ -1611,11 +1665,12 @@ class VersionStore:
         ledger = self.ledger if self._ledger is not None else gate_config.make_ledger()  # a copy
         assert ledger is not None
         index = self._evaluations
-        evidence = probe.evidence(self.model, staged.incumbent, index)
+        evidence = probe.evidence(self.model, staged.incumbent, index, namespace=self._gate_namespace)
         verdict = CapabilityGate(gate_config, ledger).verdict(evidence)
         to_dict = getattr(probe, "to_dict", None)
         context = {
             "evaluation_index": index,
+            "gate_namespace": self._gate_namespace,
             "gate_config": gate_config.to_dict(),
             "probe": to_dict() if callable(to_dict) else None,
         }

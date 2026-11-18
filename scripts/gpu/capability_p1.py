@@ -103,9 +103,11 @@ from research_rl.capability.pilot import (
     _ArmMonitor,
     _budget,
     _CountingScoreFn,
+    _criteria_warnings,
     _encode_example,
     _finite,
     _make_operator,
+    _measure_final,
     _PilotController,
     _RecordingOperator,
     _report_counts,
@@ -140,6 +142,7 @@ from research_rl.capability.tasks import (
 from research_rl.capability.tracker import CapabilityTracker
 from research_rl.capability.types import Item, OperatorReport, Split, UpdateOperator
 from research_rl.capability.weights import StateSnapshot, capture, restore
+from research_rl.models import safe_checkpoint as _safe_checkpoint
 from research_rl.models.ffn_channels import ChannelSelection, setup_channel_training
 from research_rl.models.model_interface import count_parameters, find_swiglu_ffns, fingerprint
 from research_rl.models.tiny import build_char_tokenizer
@@ -162,7 +165,7 @@ P1_BANNERS = {
         "check every number before trusting it."
     ),
 }
-PICKLE_SUFFIXES = (".bin", ".pt", ".pth", ".pkl", ".pickle", ".ckpt")
+PICKLE_SUFFIXES = _safe_checkpoint.PICKLE_SUFFIXES
 """Pickle-based checkpoint formats: never loaded (they can execute code on load)."""
 TOKENIZER_CHECK_PURPOSE = "p1_tokenizer_check"
 """``ItemSampler`` purpose of the tokenizer round-trip sample (index 0; no other stream uses it)."""
@@ -298,67 +301,28 @@ def check_p1_config(config: PilotConfig) -> None:
 
 
 # ============================================================================== model directory
-SAFE_WEIGHTS_FILE = "model.safetensors"
-"""Single-file safetensors weights: the first file ``transformers`` opens with ``use_safetensors``."""
-SAFE_WEIGHTS_INDEX_FILE = "model.safetensors.index.json"
-"""Sharded safetensors index: opened when :data:`SAFE_WEIGHTS_FILE` is absent."""
-
-
-def _is_plain_file_name(name: str) -> bool:
-    """``True`` for a bare file name inside the directory (no separator, ``..`` or absolute path).
-
-    The check is lexical on purpose: shards of a Hugging Face cache snapshot are symlinks into
-    ``../../blobs``, which a ``resolve()``-based containment check would wrongly refuse."""
-    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
-
-
-def _index_shards(path: Path, model_dir: str) -> list[str]:
-    """Shard file names of ``path / SAFE_WEIGHTS_INDEX_FILE``; :class:`P1Refusal` for a malformed
-    index, an empty or non-dict ``weight_map``, or any shard that is not a bare ``*.safetensors``
-    file name present in the directory (an index can point at pickle shards, which ``transformers``
-    would then ``torch.load``)."""
-    where = f"--model-dir {model_dir!r}: {SAFE_WEIGHTS_INDEX_FILE}"
-    try:
-        index = json.loads((path / SAFE_WEIGHTS_INDEX_FILE).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise P1Refusal(f"{where} is not readable JSON: {e}") from e
-    weight_map = index.get("weight_map") if isinstance(index, dict) else None
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise P1Refusal(f"{where} has no non-empty weight_map")
-    values = list(weight_map.values())
-    not_names = sorted({repr(v) for v in values if not isinstance(v, str) or not _is_plain_file_name(v)})
-    if not_names:
-        raise P1Refusal(
-            f"{where} lists shards that are not bare file names in the directory: {not_names[:5]}"
-        )
-    shards = sorted(set(values))
-    not_safetensors = [s for s in shards if not s.endswith(".safetensors")]
-    if not_safetensors:
-        raise P1Refusal(
-            f"{where} lists non-safetensors shards {not_safetensors[:5]} (pickle weights are never loaded); "
-            "convert the checkpoint to safetensors first"
-        )
-    missing = [s for s in shards if not (path / s).is_file()]
-    if missing:
-        raise P1Refusal(f"{where} lists missing shards {missing[:5]}")
-    return shards
+# The checks live in research_rl.models.safe_checkpoint, shared with the UI's --model-dir loader.
+SAFE_WEIGHTS_FILE = _safe_checkpoint.SAFE_WEIGHTS_FILE
+SAFE_WEIGHTS_INDEX_FILE = _safe_checkpoint.SAFE_WEIGHTS_INDEX_FILE
+_is_plain_file_name = _safe_checkpoint.is_plain_file_name
 
 
 def validate_model_dir(model_dir: str | None) -> dict[str, Any]:
     """Check a local checkpoint directory without loading any weights.
 
-    The check covers exactly the files ``transformers`` opens with ``use_safetensors=True``:
-    ``model.safetensors`` if present, else ``model.safetensors.index.json`` and every shard it
-    lists. Refuses (:class:`P1Refusal`) when ``model_dir`` is missing or not an existing directory;
-    when ``config.json`` is missing, is not a JSON object or sets ``transformers_weights`` (which
-    overrides the file selection and may name a pickle file); when the directory is a PEFT adapter
-    (``adapter_config.json``: the load would be redirected to its base model, a directory not
-    checked here); when neither of the two standard safetensors files exists (a directory with only
-    pickle weights such as ``pytorch_model.bin``, or only a non-standard name such as
-    ``consolidated.safetensors``); or when the index is malformed or lists a shard that is not a
-    bare ``*.safetensors`` file name present in the directory. Pickle files in the directory are
-    reported in ``ignored_pickle_files``; since only the files above are opened, they are never
-    read. ``safetensors`` lists the weight files that will be loaded.
+    The check (:func:`research_rl.models.safe_checkpoint.check_safetensors_dir`, shared with the
+    UI's ``--model-dir`` loader) covers exactly the files ``transformers`` opens with
+    ``use_safetensors=True``: ``model.safetensors`` if present, else
+    ``model.safetensors.index.json`` and every shard it lists. Refuses (:class:`P1Refusal`) when
+    ``model_dir`` is missing or not an existing directory; when ``config.json`` is missing, is not a
+    JSON object or sets ``transformers_weights`` (which overrides the file selection and may name a
+    pickle file); when the directory is a PEFT adapter (``adapter_config.json``: the load would be
+    redirected to its base model, a directory not checked here); when neither of the two standard
+    safetensors files exists (a directory with only pickle weights such as ``pytorch_model.bin``, or
+    only a non-standard name such as ``consolidated.safetensors``); or when the index is malformed
+    or lists a shard that is not a bare ``*.safetensors`` file name present in the directory. Pickle
+    files in the directory are reported in ``ignored_pickle_files``; since only the files above are
+    opened, they are never read. ``safetensors`` lists the weight files that will be loaded.
     """
     if not model_dir:
         raise P1Refusal(
@@ -366,53 +330,14 @@ def validate_model_dir(model_dir: str | None) -> dict[str, Any]:
             "model.safetensors.index.json); this script never downloads a model. Use --dry-run for the "
             "tiny CPU plumbing check."
         )
-    path = Path(model_dir)
-    if not path.is_dir():
-        raise P1Refusal(
-            f"--model-dir {model_dir!r} is not an existing local directory (hub ids are not accepted; "
-            "nothing is downloaded)"
-        )
-    if not (path / "config.json").is_file():
-        raise P1Refusal(f"--model-dir {model_dir!r} has no config.json")
     try:
-        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise P1Refusal(f"--model-dir {model_dir!r}: config.json is not readable JSON: {e}") from e
-    if not isinstance(config, dict):
-        raise P1Refusal(f"--model-dir {model_dir!r}: config.json is not a JSON object")
-    if config.get("transformers_weights") is not None:
-        raise P1Refusal(
-            f"--model-dir {model_dir!r}: config.json sets transformers_weights="
-            f"{config['transformers_weights']!r}, which overrides the weight-file selection (it may name "
-            f"a pickle file); remove it and use {SAFE_WEIGHTS_FILE} or {SAFE_WEIGHTS_INDEX_FILE}"
-        )
-    if (path / "adapter_config.json").is_file():
-        raise P1Refusal(
-            f"--model-dir {model_dir!r} is a PEFT adapter directory (adapter_config.json): the load would "
-            "be redirected to its base model; merge the adapter into a full safetensors checkpoint first"
-        )
-    pickles = sorted(p.name for p in path.iterdir() if p.is_file() and p.suffix.lower() in PICKLE_SUFFIXES)
-    if (path / SAFE_WEIGHTS_FILE).is_file():
-        tensors = [SAFE_WEIGHTS_FILE]
-    elif (path / SAFE_WEIGHTS_INDEX_FILE).is_file():
-        tensors = _index_shards(path, model_dir)
-    else:
-        others = sorted(p.name for p in path.glob("*.safetensors") if p.is_file())
-        found = [
-            f"pickle-format files {pickles}, which are never loaded" if pickles else "",
-            f"non-standard safetensors files {others}, which transformers does not load" if others else "",
-        ]
-        detail = "; ".join(f for f in found if f)
-        raise P1Refusal(
-            f"--model-dir {model_dir!r} has no *.safetensors weights under a standard name "
-            f"({SAFE_WEIGHTS_FILE} or {SAFE_WEIGHTS_INDEX_FILE})"
-            + (f" (found {detail})" if detail else "")
-            + "; convert or rename the checkpoint to safetensors first"
-        )
+        checked = _safe_checkpoint.check_safetensors_dir(model_dir, label=f"--model-dir {model_dir!r}")
+    except _safe_checkpoint.UnsafeCheckpointError as e:
+        raise P1Refusal(str(e)) from e
     return {
-        "model_dir": str(path.resolve()),
-        "safetensors": tensors,
-        "ignored_pickle_files": pickles,
+        "model_dir": str(checked.path.resolve()),
+        "safetensors": list(checked.safetensors),
+        "ignored_pickle_files": list(checked.ignored_pickle_files),
     }
 
 
@@ -1040,11 +965,12 @@ def run_arm(
             alarm_kwargs["rollouts_per_unit"] = config.es_population
         alarm = DisagreementAlarm(**alarm_kwargs)
         updates = config.updates_for(spec.operator)
+        final_step = oracle_exclusion_steps(config, updates)  # shared by every arm (pilot._measure_final)
         exclude = excluded_uids(
             sampler,
             start,
             track_items_per_slice=config.track_items_per_slice,
-            max_step=oracle_exclusion_steps(config, updates),
+            max_step=final_step,
         )
         controller = _PilotController(CapabilityGate(gate_cfg), probe)
         log_path = output_dir / "decisions" / f"{spec.file_stem}.{label}.jsonl"
@@ -1083,11 +1009,9 @@ def run_arm(
             records = loop.run(updates)
         rows = [_report_counts(r, operator.kind) for r in operator.reports]
         trailing = loop.updates_since_decision
-        trailing_point = None
-        if trailing > 0:
-            tail = operator.reports[-trailing:]
-            reward = sum(float(r.reward_v1) for r in tail) / len(tail)
-            trailing_point = tracker.measure(model, len(monitor.blocks) + 1, reward).to_dict()
+        trailing_point, final_point = _measure_final(
+            tracker, model, operator.reports, records, trailing=trailing, final_step=final_step
+        )
         final_fingerprint = fingerprint(model, operator.parameter_names())
     finally:
         if handle is not None:
@@ -1103,6 +1027,7 @@ def run_arm(
         point0=point0.to_dict(),
         trailing_point=trailing_point,
         trailing_updates=trailing,
+        final_point=final_point,
         tracker=tracker,
         space_info=space_info,
         alarm=alarm,
@@ -1394,6 +1319,7 @@ def run_p1(
         "warnings": run_warnings,
     }
     results["criteria"] = evaluate_criteria(results)
+    run_warnings.extend(_criteria_warnings(results["criteria"]))
     timing["total_s"] = time.perf_counter() - t0
     results["timing"] = timing
     results = _finite(results)

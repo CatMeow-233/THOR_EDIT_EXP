@@ -73,10 +73,16 @@ class GateConfig:
     dataclass is mutable; assigning a field later bypasses validation, so prefer
     ``dataclasses.replace(config, ...)``, which re-runs it.
 
-    * ``enabled``: ``False`` gives the ungated control arm. :meth:`CapabilityGate.verdict` still
-      computes every statistic **and still consumes alpha from the ledger** (so the logged
-      verdicts of a gated and an ungated arm are computed identically); only the controller
-      ignores the verdict (it never rolls back).
+    * ``enabled``: ``False`` gives the ungated control arm. :meth:`CapabilityGate.verdict` does
+      not read this flag: it computes every statistic and consumes one alpha from **its own**
+      ledger either way (same procedure, same statistics). The controller ignores the verdict (it
+      never rolls back), and ``GateController(enabled=False)``
+      (:mod:`~research_rl.capability.loop`) verdicts through a gate with a **private copy** of the
+      passed ledger, so the passed ledger is never advanced. The ungated arm computes only the
+      first verdict of each decision, so after the gated arm's first re-test (shrink / group
+      revert) the two arms' first verdicts of the same decision use the same items but, under
+      ``"spending"``, different alphas (the gated arm's is smaller; under ``"per_decision"``
+      every verdict runs at ``alpha``).
     * ``alpha`` in (0, 0.5): total significance level handed to the ledger.
     * ``alpha_schedule``: ``"spending"`` (run-level family-wise guarantee for accepts) or
       ``"per_decision"`` (guarantee per decision only); see :class:`AlphaLedger`.
