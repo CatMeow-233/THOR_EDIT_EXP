@@ -424,10 +424,12 @@ code, its docstrings and sections 1.15/1.16 win. Section 3 (the kill criteria) i
 | `edits.py` | declarative channel edits and the immutable, gate-checked version graph | `EditOp`, `EditRecord`, `VersionStore`, `Version`, `StagedEdit` | `test_capability_edits.py` |
 | `pilot.py` | the P0 pilot pipeline and the section-3 criteria evaluation | `PilotConfig`, `smoke_config`, `run_pilot`, `evaluate_criteria` | `test_capability_pilot.py` |
 | `calibration.py` | the section-5 exploratory positive control of the gate (candidates of known quality, one first verdict each, oracle, the section-5 table); see 4.4 | `CalibrationConfig`, `calibration_smoke_config`, `run_calibration`, `evaluate_rules`, `build_seed_plan` | `test_capability_calibration.py` |
+| `calibration_alarm.py` | the section-5.1 follow-up: `hack_replay` / `good_hack` candidates, tier-2 first verdict, tier-1 alarm stream (3 incumbent + 16 candidate reports) and null stream, combined decision, oracle, the 5.1 table; see 4.5 | `CalibrationAlarmConfig`, `calibration51_smoke_config`, `run_calibration_51`, `evaluate_rules_51`, `build_seed_plan_51`, `alarm_stream`, `combined_decision` | `test_capability_calibration51.py` |
 | `research_rl/ui/` | local channel search + edit tool (stdlib HTTP server, static front end) | `python -m research_rl.ui` | `test_ui.py` |
 | `research_rl/models/safe_checkpoint.py` | safetensors-only allowlist check of a local model directory, shared by UI `--model-dir` and the P1 script | `check_safetensors_dir`, `UnsafeCheckpointError` | `test_ui.py`, `test_capability_p1_script.py` |
 | `examples/capability_pilot_tiny.py` | CLI of the P0 pilot | `--smoke`, `--output-dir`, `--arms`, `--jobs` | `test_capability_pilot.py` |
 | `examples/capability_calibration_tiny.py` | CLI of the section-5 positive control | `--smoke`, `--output-dir`, `--seeds`, `--start`, `--jobs` | `test_capability_calibration.py` |
+| `examples/capability_calibration51_tiny.py` | CLI of the section-5.1 alarm follow-up | `--smoke`, `--output-dir`, `--seeds`, `--start`, `--jobs` | `test_capability_calibration51.py` |
 | `scripts/gpu/capability_p1.py` | P1 on a local 7-8B checkpoint, one GPU (**NOT_TESTED**; only `--dry-run` on CPU is tested) | | `test_capability_p1_script.py` |
 
 Imports: `research_rl/capability/__init__.py` re-exports every module's `__all__` (and the shared

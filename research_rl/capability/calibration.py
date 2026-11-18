@@ -98,7 +98,7 @@ import multiprocessing
 import platform
 import random
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1037,6 +1037,107 @@ def _log(config: CalibrationConfig, message: str) -> None:
         print(f"[calibration] {message}", flush=True)
 
 
+@dataclass
+class _SeedEnv:
+    """The per-seed objects shared by section 5 and its follow-up 5.1 (:mod:`calibration_alarm`):
+    splits, the model at the start weights, the item sampler, the probe and score functions."""
+
+    pilot: PilotConfig
+    gate_cfg: GateConfig
+    splits: CompositionSplits
+    tokenizer: Any
+    model: nn.Module
+    budget: int
+    sampler: ItemSampler
+    gate_fn: _CountingScoreFn
+    v1_fn: VerifierScoreFn
+    v2_fn: VerifierScoreFn
+    probe: CapabilityProbe
+    rule_slices: tuple[str, ...]
+    start: StateSnapshot
+    start_fp: str
+    replay: list[Item]
+
+
+def _seed_env(pilot: PilotConfig, gate_cfg: GateConfig, start_path: str) -> _SeedEnv:
+    """Build the per-seed objects (call inside ``_torch_threads``): the model loaded from
+    ``start_path``, the P0 start-map sampler root, V1 = the planted leak, V2 = exact, the probe at the
+    gate's item counts and the original SFT data (the replay source)."""
+    splits = build_splits(pilot)
+    tokenizer = build_char_tokenizer()
+    model = build_model(pilot, len(tokenizer))
+    model.load_state_dict(load_file(start_path), strict=True)
+    model.eval()
+    budget = _budget(pilot, splits)
+    sampler = ItemSampler(splits, root_seed=_sampler_root(pilot, -1))
+    transfer, retention = _slices(pilot, splits)
+    v1, v2 = _verifiers(pilot, "leak")
+    gate_fn = _CountingScoreFn(tokenizer, v2, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
+    v1_fn = VerifierScoreFn(tokenizer, v1, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
+    v2_fn = VerifierScoreFn(tokenizer, v2, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
+    probe = CapabilityProbe(
+        sampler,
+        gate_fn,
+        transfer_slices=transfer,
+        retention_slices=retention,
+        items_per_transfer_slice=gate_cfg.items_per_transfer_slice,
+        items_per_retention_slice=gate_cfg.items_per_retention_slice,
+    )
+    start = capture(model, None)
+    start_fp = fingerprint(model)
+    replay = sft_examples(splits, pilot.sft_examples, seed=pilot.seed, demo_pairs=pilot.sft_demo_pairs)
+    return _SeedEnv(
+        pilot=pilot,
+        gate_cfg=gate_cfg,
+        splits=splits,
+        tokenizer=tokenizer,
+        model=model,
+        budget=budget,
+        sampler=sampler,
+        gate_fn=gate_fn,
+        v1_fn=v1_fn,
+        v2_fn=v2_fn,
+        probe=probe,
+        rule_slices=tuple(splits.slices_of(Split.T_RULE)),
+        start=start,
+        start_fp=start_fp,
+        replay=replay,
+    )
+
+
+def _judge(
+    env: _SeedEnv,
+    snap: StateSnapshot,
+    namespace: str,
+    gate_items: Mapping[str, Sequence[Item]],
+    oracle_items_: Mapping[str, Sequence[Item]],
+    oracle_start: Mapping[str, Any],
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    """One first verdict of ``snap`` against the start (a fresh gate and ledger) on the probe's gate
+    items of ``namespace`` (checked equal to ``gate_items``), and its oracle comparison. Returns
+    ``(first_verdict dict, oracle dict, GateVerdict)``; the model is back at the start afterwards."""
+    with _at(env.model, snap):
+        evidence = env.probe.evidence(env.model, env.start, 0, namespace=namespace)
+        oracle = _measure(env.model, oracle_items_, env.v1_fn, env.v2_fn)
+    used = {u for p in (*evidence.transfer, *evidence.retention) for u in p.uids}
+    if used != SeedPlan._uids(gate_items):
+        raise CalibrationIntegrityError(f"{label}: evidence items differ from the plan's gate items")
+    gate = CapabilityGate(env.gate_cfg)  # a fresh ledger per candidate: one verdict at alpha
+    verdict = gate.verdict(evidence)
+    reason = classify_verdict(verdict, require_transfer_gain=env.gate_cfg.require_transfer_gain)
+    first_verdict = {
+        "reason": reason,
+        "accepted": reason == REASON_ACCEPT,
+        "transfer_ok": verdict.transfer_ok,
+        "retention_ok": verdict.retention_ok,
+        "alpha": verdict.transfer.alpha,
+        "namespace": namespace,
+        "verdict": verdict.to_dict(),
+    }
+    return first_verdict, _compare(oracle, oracle_start, env.rule_slices), verdict
+
+
 def _run_seed(ctx: _Context, seed: int) -> dict[str, Any]:
     """Every candidate of ``seed``: construction, first verdict, oracle (module docstring)."""
     config = CalibrationConfig.from_dict(ctx.config)
@@ -1044,39 +1145,17 @@ def _run_seed(ctx: _Context, seed: int) -> dict[str, Any]:
     t0 = time.perf_counter()
     timing: dict[str, float] = {}
     with _torch_threads(config.threads_per_seed):
-        splits = build_splits(pilot)
-        tokenizer = build_char_tokenizer()
-        model = build_model(pilot, len(tokenizer))
-        model.load_state_dict(load_file(ctx.start_path), strict=True)
-        model.eval()
-        budget = _budget(pilot, splits)
-        sampler = ItemSampler(splits, root_seed=_sampler_root(pilot, -1))
-        gate_cfg = config.gate_config()
-        transfer, retention = _slices(pilot, splits)
-        v1, v2 = _verifiers(pilot, "leak")
-        gate_fn = _CountingScoreFn(tokenizer, v2, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
-        v1_fn = VerifierScoreFn(tokenizer, v1, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
-        v2_fn = VerifierScoreFn(tokenizer, v2, max_new_tokens=budget, batch_size=pilot.eval_batch_size)
-        probe = CapabilityProbe(
-            sampler,
-            gate_fn,
-            transfer_slices=transfer,
-            retention_slices=retention,
-            items_per_transfer_slice=gate_cfg.items_per_transfer_slice,
-            items_per_retention_slice=gate_cfg.items_per_retention_slice,
-        )
-        rule_slices = splits.slices_of(Split.T_RULE)
-        start = capture(model, None)
-        start_fp = fingerprint(model)
-        replay = sft_examples(splits, pilot.sft_examples, seed=pilot.seed, demo_pairs=pilot.sft_demo_pairs)
+        env = _seed_env(pilot, config.gate_config(), ctx.start_path)
+        model, start, start_fp, probe = env.model, env.start, env.start_fp, env.probe
+        v1_fn, v2_fn, rule_slices = env.v1_fn, env.v2_fn, env.rule_slices
         t = time.perf_counter()
         plan = build_seed_plan(
             config,
-            sampler,
+            env.sampler,
             probe,
             seed,
-            replay=replay,
-            start_uids=start_map_uids(sampler, pilot.start_items_per_slice),
+            replay=env.replay,
+            start_uids=start_map_uids(env.sampler, pilot.start_items_per_slice),
         )
         timing["plan_s"] = time.perf_counter() - t
         t = time.perf_counter()
@@ -1090,7 +1169,7 @@ def _run_seed(ctx: _Context, seed: int) -> dict[str, Any]:
         )
         for c in CONSTRUCTIONS:
             t = time.perf_counter()
-            snap, info = _construct(c, model, start, tokenizer, plan, config, v1_fn, v2_fn, rule_slices)
+            snap, info = _construct(c, model, start, env.tokenizer, plan, config, v1_fn, v2_fn, rule_slices)
             info["seconds"] = time.perf_counter() - t
             constructions[c] = info
             _log(
@@ -1116,39 +1195,28 @@ def _run_seed(ctx: _Context, seed: int) -> dict[str, Any]:
         for kind in CANDIDATE_KINDS:
             t = time.perf_counter()
             snap = snapshots[kind]
-            with _at(model, snap):
-                evidence = probe.evidence(model, start, 0, namespace=gate_namespace(seed, kind))
-                oracle = _measure(model, plan.oracle, v1_fn, v2_fn)
-            used = {u for p in (*evidence.transfer, *evidence.retention) for u in p.uids}
-            if used != plan._uids(plan.gate[kind]):
-                raise CalibrationIntegrityError(
-                    f"seed {seed} {kind}: evidence items differ from the plan's gate items"
-                )
-            gate = CapabilityGate(gate_cfg)  # a fresh ledger per candidate: one verdict at alpha
-            verdict = gate.verdict(evidence)
-            reason = classify_verdict(verdict, require_transfer_gain=gate_cfg.require_transfer_gain)
+            fv, oracle_cmp, verdict = _judge(
+                env,
+                snap,
+                gate_namespace(seed, kind),
+                plan.gate[kind],
+                plan.oracle,
+                oracle_start,
+                f"seed {seed} {kind}",
+            )
             construction = "good" if kind.startswith("good@") else kind if kind in CONSTRUCTIONS else None
             candidates[kind] = {
                 "kind": kind,
                 "fingerprint": snap.fingerprint,
-                "first_verdict": {
-                    "reason": reason,
-                    "accepted": reason == REASON_ACCEPT,
-                    "transfer_ok": verdict.transfer_ok,
-                    "retention_ok": verdict.retention_ok,
-                    "alpha": verdict.transfer.alpha,
-                    "namespace": gate_namespace(seed, kind),
-                    "verdict": verdict.to_dict(),
-                },
-                "oracle": _compare(oracle, oracle_start, rule_slices),
+                "first_verdict": fv,
+                "oracle": oracle_cmp,
                 "construction": construction,
                 "seconds": time.perf_counter() - t,
             }
-            fv = candidates[kind]["first_verdict"]
             _log(
                 config,
-                f"seed {seed}: {kind}: first verdict {reason} (transfer p={_fmt(verdict.transfer.p_value, 4)}), "
-                f"oracle T_rule gain {_fmt(candidates[kind]['oracle'].get('t_rule_gain'), 4)}"
+                f"seed {seed}: {kind}: first verdict {fv['reason']} (transfer p={_fmt(verdict.transfer.p_value, 4)}), "
+                f"oracle T_rule gain {_fmt(oracle_cmp.get('t_rule_gain'), 4)}"
                 + (" ACCEPTED" if fv["accepted"] else ""),
             )
         restored = fingerprint(model) == start_fp
@@ -1161,7 +1229,7 @@ def _run_seed(ctx: _Context, seed: int) -> dict[str, Any]:
         "constructions": constructions,
         "candidates": candidates,
         "restored_bitwise": restored,
-        "gate_items_scored": gate_fn.items_scored,
+        "gate_items_scored": env.gate_fn.items_scored,
         "timing": {**timing, "total_s": time.perf_counter() - t0},
     }
 
@@ -1172,13 +1240,20 @@ def _seed_worker(payload: tuple[dict[str, Any], int]) -> dict[str, Any]:
     return _run_seed(_Context(**ctx_d), seed)
 
 
-def _run_seeds(ctx: _Context, seeds: Sequence[int], jobs: int) -> list[dict[str, Any]]:
+def _run_seeds(
+    ctx: _Context,
+    seeds: Sequence[int],
+    jobs: int,
+    worker: Callable[[tuple[dict[str, Any], int]], dict[str, Any]] = _seed_worker,
+) -> list[dict[str, Any]]:
+    """``worker((context dict, seed))`` for every seed, sequentially or in ``jobs`` spawned processes
+    (``worker`` must be a module-level function, so it pickles)."""
     payloads = [(dataclasses.asdict(ctx), int(s)) for s in seeds]
     if jobs <= 1 or len(payloads) <= 1:
-        return [_seed_worker(p) for p in payloads]
+        return [worker(p) for p in payloads]
     mp = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs, mp_context=mp) as pool:
-        return list(pool.map(_seed_worker, payloads))
+        return list(pool.map(worker, payloads))
 
 
 # ============================================================================== the rules
@@ -1331,21 +1406,27 @@ def evaluate_rules(results: Mapping[str, Any]) -> dict[str, Any]:
             literal = _rule(RULE_INCONCLUSIVE, "no seed results", {})
         else:
             literal = fns[name](complete)
-        entry = dict(literal)
-        entry["literal_verdict"] = literal["verdict"]
-        if problems:
-            scope = (
-                problems[0]
-                if len(problems) == 1
-                else f"{problems[0]}; and {len(problems) - 1} more, see scope_problems"
-            )
-            entry["verdict"] = RULE_INCONCLUSIVE
-            entry["reason"] = (
-                f"not the pre-registered run ({scope}); literal table on these seeds: "
-                f"{literal['verdict']} ({literal['reason']})"
-            )
-        out[name] = entry
+        out[name] = _scoped(literal, problems)
     return out
+
+
+def _scoped(literal: Mapping[str, Any], problems: Sequence[str]) -> dict[str, Any]:
+    """A rule entry with ``literal_verdict``; INCONCLUSIVE (naming the first scope problem and the
+    literal outcome) when ``problems`` is non-empty, i.e. the run is not the pre-registered one."""
+    entry = dict(literal)
+    entry["literal_verdict"] = literal["verdict"]
+    if problems:
+        scope = (
+            problems[0]
+            if len(problems) == 1
+            else f"{problems[0]}; and {len(problems) - 1} more, see scope_problems"
+        )
+        entry["verdict"] = RULE_INCONCLUSIVE
+        entry["reason"] = (
+            f"not the pre-registered run ({scope}); literal table on these seeds: "
+            f"{literal['verdict']} ({literal['reason']})"
+        )
+    return entry
 
 
 # ============================================================================== summary
@@ -1480,6 +1561,26 @@ def _build_start(pilot: PilotConfig) -> tuple[nn.Module, CompositionSplits]:
     return model, splits
 
 
+def _prepare_start(
+    pilot: PilotConfig, out: Path, start_path: str | Path | None, log: Callable[[str], None]
+) -> tuple[nn.Module, Path, str]:
+    """The start checkpoint: rebuilt (and saved to ``out/start_model.safetensors``) when
+    ``start_path`` is None, else loaded from that ``.safetensors`` file (weights are never
+    unpickled). Returns ``(model, path, source description)``."""
+    if start_path is None:
+        log(f"rebuilding the start checkpoint (pilot SFT, {pilot.sft_steps} steps)")
+        model, _ = _build_start(pilot)
+        path = out / "start_model.safetensors"
+        save_file({k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}, str(path))
+        return model, path, "rebuilt with the pilot's SFT (default PilotConfig + overrides)"
+    path = Path(start_path)
+    if path.suffix != ".safetensors":
+        raise ValueError(f"--start must be a .safetensors file (weights are never unpickled), got {path}")
+    model = build_model(pilot, len(build_char_tokenizer()))
+    model.load_state_dict(load_file(str(path)), strict=True)
+    return model, path, f"loaded from {path}"
+
+
 def run_calibration(
     config: CalibrationConfig, output_dir: str | Path, *, start_path: str | Path | None = None
 ) -> dict[str, Any]:
@@ -1496,19 +1597,7 @@ def run_calibration(
     warnings: list[str] = []
     timing: dict[str, Any] = {}
     t = time.perf_counter()
-    if start_path is None:
-        _log(config, f"rebuilding the start checkpoint (pilot SFT, {pilot.sft_steps} steps)")
-        model, _ = _build_start(pilot)
-        path = out / "start_model.safetensors"
-        save_file({k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}, str(path))
-        source = "rebuilt with the pilot's SFT (default PilotConfig + overrides)"
-    else:
-        path = Path(start_path)
-        if path.suffix != ".safetensors":
-            raise ValueError(f"--start must be a .safetensors file (weights are never unpickled), got {path}")
-        model = build_model(pilot, len(build_char_tokenizer()))
-        model.load_state_dict(load_file(str(path)), strict=True)
-        source = f"loaded from {path}"
+    model, path, source = _prepare_start(pilot, out, start_path, lambda m: _log(config, m))
     timing["start_s"] = time.perf_counter() - t
     start_fp = fingerprint(model)
     matches = start_fp == P0_START_FINGERPRINT
