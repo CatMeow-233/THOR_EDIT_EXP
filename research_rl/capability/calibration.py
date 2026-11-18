@@ -638,6 +638,99 @@ def start_map_uids(sampler: ItemSampler, items_per_slice: int) -> frozenset[str]
     return frozenset(out)
 
 
+@dataclass
+class _PlanCore:
+    """The part of a seed's item plan that section 5 and 5.1 build alike: gate items per candidate
+    kind, the start's SFT uids, the oracle (minus the start map and the SFT data), how many SFT items
+    the start-map-only oracle draw would have held, and ``forbidden`` (start-map, oracle and gate
+    uids: what no diagnostic or training item may be)."""
+
+    gate: dict[str, dict[str, list[Item]]]
+    sft_uids: frozenset[str]
+    oracle: dict[str, list[Item]]
+    oracle_sft_removed: dict[str, int]
+    forbidden: set[str]
+
+
+def _plan_core(
+    sampler: ItemSampler,
+    probe: CapabilityProbe,
+    seed: int,
+    *,
+    replay: Sequence[Item],
+    start_uids: frozenset[str],
+    kinds: Sequence[str],
+    namespace: Callable[[int, str], str],
+    oracle_purpose: str,
+    oracle_items_per_slice: int,
+) -> _PlanCore:
+    """Gate items (probe namespace ``namespace(seed, kind)`` per kind), the oracle at
+    ``oracle_purpose`` / index ``seed`` on every T_RULE and RETENTION slice and ``train/pairs`` (tracker
+    pool, minus the start map and the SFT data), and the forbidden set (see :class:`_PlanCore`)."""
+    splits = sampler.splits
+    gate = {kind: probe.gate_items(0, 0, namespace=namespace(seed, kind)) for kind in kinds}
+    sft_uids = frozenset(it.uid for it in replay)
+    oracle_slices = (*splits.slices_of(Split.T_RULE), *splits.slices_of(Split.RETENTION), HACK_SLICE)
+    oracle = oracle_items(
+        sampler,
+        oracle_items_per_slice,
+        seed,
+        set(start_uids) | sft_uids,
+        purpose=oracle_purpose,
+        slices=oracle_slices,
+    )
+    # how many SFT items the start-map-only draw would have held (recorded, not used)
+    unfiltered = oracle_items(
+        sampler,
+        oracle_items_per_slice,
+        seed,
+        set(start_uids),
+        purpose=oracle_purpose,
+        slices=oracle_slices,
+    )
+    oracle_sft_removed = {s: sum(it.uid in sft_uids for it in unfiltered[s]) for s in oracle_slices}
+    forbidden = set(start_uids) | {it.uid for g in oracle.values() for it in g}
+    forbidden |= {it.uid for per in gate.values() for g in per.values() for it in g}
+    return _PlanCore(
+        gate=gate,
+        sft_uids=sft_uids,
+        oracle=oracle,
+        oracle_sft_removed=oracle_sft_removed,
+        forbidden=forbidden,
+    )
+
+
+def _filter_replay(
+    replay: Sequence[Item], forbidden_train: set[str]
+) -> tuple[list[Item], dict[str, dict[str, int]]]:
+    """The SFT replay source: ``replay`` minus ``forbidden_train``, and the removed items as
+    ``{slice: {input length: count}}`` (sorted; the plan's ``replay_removed``)."""
+    removed: dict[str, dict[str, int]] = {}
+    kept: list[Item] = []
+    for it in replay:
+        if it.uid in forbidden_train:
+            per = removed.setdefault(it.slice, {})
+            per[_input_length(it)] = per.get(_input_length(it), 0) + 1
+        else:
+            kept.append(it)
+    return kept, {s: dict(sorted(v.items())) for s, v in sorted(removed.items())}
+
+
+def _hacked_items(items: Sequence[Item], pilot: PilotConfig, *, label: str) -> list[Item]:
+    """``items`` with their answers replaced by :func:`hack_answer`, each checked V1 pass / V2 fail
+    (else :class:`CalibrationIntegrityError` naming ``label``)."""
+    v1, v2 = _verifiers(pilot, "leak")
+    out: list[Item] = []
+    for it in items:
+        target = hack_answer(it.answer, pilot.leak_k)
+        if not v1.verify(target, it.answer).correct or v2.verify(target, it.answer).correct:
+            raise CalibrationIntegrityError(
+                f"{label} target {target!r} for {it.uid} is not V1-pass / V2-fail"
+            )
+        out.append(dataclasses.replace(it, answer=target))
+    return out
+
+
 def build_seed_plan(
     config: CalibrationConfig,
     sampler: ItemSampler,
@@ -654,29 +747,18 @@ def build_seed_plan(
     splits = sampler.splits
     rule_slices = splits.slices_of(Split.T_RULE)
     retention_slices = splits.slices_of(Split.RETENTION)
-    gate = {kind: probe.gate_items(0, 0, namespace=gate_namespace(seed, kind)) for kind in CANDIDATE_KINDS}
-    sft_uids = frozenset(it.uid for it in replay)
-    oracle_slices = (*rule_slices, *retention_slices, HACK_SLICE)
-    oracle = oracle_items(
+    core = _plan_core(
         sampler,
-        config.oracle_items_per_slice,
+        probe,
         seed,
-        set(start_uids) | sft_uids,
-        purpose=CALIB_ORACLE_PURPOSE,
-        slices=oracle_slices,
+        replay=replay,
+        start_uids=start_uids,
+        kinds=CANDIDATE_KINDS,
+        namespace=gate_namespace,
+        oracle_purpose=CALIB_ORACLE_PURPOSE,
+        oracle_items_per_slice=config.oracle_items_per_slice,
     )
-    # how many SFT items the start-map-only draw would have held (recorded, not used)
-    unfiltered = oracle_items(
-        sampler,
-        config.oracle_items_per_slice,
-        seed,
-        set(start_uids),
-        purpose=CALIB_ORACLE_PURPOSE,
-        slices=oracle_slices,
-    )
-    oracle_sft_removed = {s: sum(it.uid in sft_uids for it in unfiltered[s]) for s in oracle_slices}
-    forbidden = set(start_uids) | {it.uid for g in oracle.values() for it in g}
-    forbidden |= {it.uid for per in gate.values() for g in per.values() for it in g}
+    forbidden = core.forbidden
     # good: the T_RULE slices (its statistic) and the retention slices ("retention kept" criterion)
     diag_slices: dict[str, tuple[tuple[str, ...], int]] = {
         "good": (tuple(rule_slices), config.diagnostic_items_per_slice),
@@ -713,32 +795,17 @@ def build_seed_plan(
             pool=None,
         )[slice_name]
 
-    removed: dict[str, dict[str, int]] = {}
-    kept_replay: list[Item] = []
-    for it in replay:
-        if it.uid in forbidden_train:
-            per = removed.setdefault(it.slice, {})
-            per[_input_length(it)] = per.get(_input_length(it), 0) + 1
-        else:
-            kept_replay.append(it)
+    kept_replay, removed = _filter_replay(replay, forbidden_train)
     good = train_draw("good", GOOD_SLICE)
     if len(kept_replay) < len(good):
         raise ValueError(f"only {len(kept_replay)} SFT replay items left after filtering; need {len(good)}")
     rng = random.Random(_seed("calib_replay", pilot.seed, seed))
     good_train = good + rng.sample(kept_replay, len(good))
-    v1, v2 = _verifiers(pilot, "leak")
-    hacked: list[Item] = []
-    for it in train_draw("bad_hack", HACK_SLICE):
-        target = hack_answer(it.answer, pilot.leak_k)
-        if not v1.verify(target, it.answer).correct or v2.verify(target, it.answer).correct:
-            raise CalibrationIntegrityError(
-                f"bad_hack target {target!r} for {it.uid} is not V1-pass / V2-fail"
-            )
-        hacked.append(dataclasses.replace(it, answer=target))
+    hacked = _hacked_items(train_draw("bad_hack", HACK_SLICE), pilot, label="bad_hack")
     plan = SeedPlan(
         seed=int(seed),
-        gate=gate,
-        oracle=oracle,
+        gate=core.gate,
+        oracle=core.oracle,
         start_uids=frozenset(start_uids),
         training={
             "good": good_train,
@@ -746,10 +813,10 @@ def build_seed_plan(
             "bad_retention": train_draw("bad_retention", GOOD_SLICE),
         },
         diagnostic=diagnostic,
-        replay_removed={s: dict(sorted(v.items())) for s, v in sorted(removed.items())},
+        replay_removed=removed,
         replay_count=len(good),
-        sft_uids=sft_uids,
-        oracle_sft_removed=oracle_sft_removed,
+        sft_uids=core.sft_uids,
+        oracle_sft_removed=core.oracle_sft_removed,
     )
     plan.check_disjoint()
     return plan
@@ -900,6 +967,68 @@ def _pick_rung(rungs: Sequence[Mapping[str, Any]]) -> tuple[int, str]:
     return len(rungs) - 1, "no rung reached the statistic: last rung"
 
 
+def _run_ladder(
+    model: nn.Module,
+    start: StateSnapshot,
+    tokenizer: Any,
+    items: Sequence[Item],
+    pilot: PilotConfig,
+    ladder: Sequence[tuple[int, float]],
+    *,
+    batch_size: int,
+    seed_key: Callable[[int], int],
+    diag: Mapping[str, Sequence[Item]],
+    v1_fn: VerifierScoreFn,
+    v2_fn: VerifierScoreFn,
+    hack_slice: str | None,
+    rule_slices: Sequence[str],
+    assess: Callable[[Mapping[str, Any]], dict[str, Any]],
+    all_rungs: bool = False,
+) -> tuple[StateSnapshot, list[dict[str, Any]], int, str]:
+    """A construction ladder (shared by section 5 and 5.1): every ``(steps, lr)`` rung is trained afresh
+    from ``start`` on ``items`` (:func:`_continuation`, batch stream seeded by ``seed_key(rung)``) and
+    measured on ``diag`` against the start (:func:`_measure` / :func:`_compare`). ``assess`` turns that
+    comparison into the rung's verdict fields, which must include ``statistic_reached`` and ``reached``;
+    the ladder stops at the first rung that is ``reached`` and the rung is chosen by
+    :func:`_pick_rung`. Only the snapshots a fallback may still need are kept (the first
+    statistic-reaching rung and the latest). ``all_rungs`` trains and keeps every rung (5.1's
+    ladder-development path). Returns ``(chosen snapshot, rung rows, chosen index, how)``."""
+    diag_start = _measure(model, diag, v1_fn, v2_fn, hack_slice=hack_slice)
+    rungs: list[dict[str, Any]] = []
+    snaps: list[StateSnapshot | None] = []
+    for i, (steps, lr) in enumerate(ladder):
+        t = time.perf_counter()
+        snap, info = _continuation(
+            model,
+            start,
+            tokenizer,
+            items,
+            pilot,
+            steps=steps,
+            lr=lr,
+            batch_size=batch_size,
+            seed_key=seed_key(i),
+        )
+        with _at(model, snap):
+            d = _compare(_measure(model, diag, v1_fn, v2_fn, hack_slice=hack_slice), diag_start, rule_slices)
+        row: dict[str, Any] = {**info, "rung": i, "diagnostic": d, **assess(d)}
+        row["seconds"] = time.perf_counter() - t
+        rungs.append(row)
+        snaps.append(snap)
+        if all_rungs:
+            continue
+        first_ok = next((k for k, r in enumerate(rungs) if r["statistic_reached"]), None)
+        for k in range(len(snaps) - 1):
+            if k != first_ok:
+                snaps[k] = None
+        if row["reached"]:
+            break
+    pick, how = _pick_rung(rungs)
+    chosen = snaps[pick]
+    assert chosen is not None
+    return chosen, rungs, pick, how
+
+
 def _construct(
     construction: str,
     model: nn.Module,
@@ -922,55 +1051,35 @@ def _construct(
     statistic, target = _DIAG_STATISTIC[construction]
     margin = config.gate_config().retention_margin
     diag = plan.diagnostic[construction]
-    hack = HACK_SLICE if construction == "bad_hack" else None
-    diag_start = _measure(model, diag, v1_fn, v2_fn, hack_slice=hack)
-    batch = config.sft_batch_size or pilot.sft_batch_size
-    rungs: list[dict[str, Any]] = []
-    snaps: list[StateSnapshot | None] = []
-    for i, (steps, lr) in enumerate(config.ladder(construction)):
-        t = time.perf_counter()
-        snap, info = _continuation(
-            model,
-            start,
-            tokenizer,
-            plan.training[construction],
-            pilot,
-            steps=steps,
-            lr=lr,
-            batch_size=batch,
-            seed_key=_seed("calib_sft", pilot.seed, plan.seed, construction, i) % (2**31),
-        )
-        with _at(model, snap):
-            d = _compare(_measure(model, diag, v1_fn, v2_fn, hack_slice=hack), diag_start, rule_slices)
+
+    def assess(d: Mapping[str, Any]) -> dict[str, Any]:
         value = d.get(statistic)
         gain_ok = value is not None and value >= target - _TOL
-        row: dict[str, Any] = {
-            **info,
-            "rung": i,
-            "diagnostic": d,
-            "statistic": statistic,
-            "value": value,
-            "statistic_reached": gain_ok,
-        }
+        out: dict[str, Any] = {"statistic": statistic, "value": value, "statistic_reached": gain_ok}
         if construction == "good":
             kept, drops = _retention_kept(d, margin)
-            row.update({"retention_kept": kept, "retention_drop": drops, "retention_margin": margin})
-            row["reached"] = gain_ok and kept
+            out.update({"retention_kept": kept, "retention_drop": drops, "retention_margin": margin})
+            out["reached"] = gain_ok and kept
         else:
-            row["reached"] = gain_ok
-        row["seconds"] = time.perf_counter() - t
-        rungs.append(row)
-        # keep only the snapshots a fallback may still need (first statistic-reaching rung, latest)
-        snaps.append(snap)
-        first_ok = next((k for k, r in enumerate(rungs) if r["statistic_reached"]), None)
-        for k in range(len(snaps) - 1):
-            if k != first_ok:
-                snaps[k] = None
-        if row["reached"]:
-            break
-    pick, how = _pick_rung(rungs)
-    chosen = snaps[pick]
-    assert chosen is not None
+            out["reached"] = gain_ok
+        return out
+
+    chosen, rungs, pick, how = _run_ladder(
+        model,
+        start,
+        tokenizer,
+        plan.training[construction],
+        pilot,
+        config.ladder(construction),
+        batch_size=config.sft_batch_size or pilot.sft_batch_size,
+        seed_key=lambda i: _seed("calib_sft", pilot.seed, plan.seed, construction, i) % (2**31),
+        diag=diag,
+        v1_fn=v1_fn,
+        v2_fn=v2_fn,
+        hack_slice=HACK_SLICE if construction == "bad_hack" else None,
+        rule_slices=rule_slices,
+        assess=assess,
+    )
     out = {
         "construction": construction,
         "statistic": statistic,

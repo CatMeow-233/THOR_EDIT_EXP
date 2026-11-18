@@ -9,11 +9,13 @@ pilot's are), so the CI unit job skips them and the integration job runs them.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -469,6 +471,98 @@ def test_construction_rung_choice_is_pre_specified() -> None:
     )
     assert kept and drops == {"retention/copy": 0.0195, "retention/atomic": -0.01}
     assert not cal._retention_kept({"retention_change": {"retention/copy": -0.02}}, 0.02)[0]
+
+
+def _stub_ladder(
+    monkeypatch: pytest.MonkeyPatch, script: list[tuple[bool, bool]], *, all_rungs: bool = False
+) -> tuple[list[int], list[dict[str, Any]], int, str, list[int]]:
+    """Run :func:`cal._run_ladder` with training and measurement stubbed out: rung ``i`` reaches its
+    statistic / keeps retention as ``script[i]`` says. Returns the chosen rung's stub snapshot id, the
+    rows, the pick, how, and the rungs trained."""
+    trained: list[int] = []
+
+    class _Snap:
+        def __init__(self, i: int) -> None:
+            self.i = i
+
+    def continuation(*args: Any, steps: int, lr: float, seed_key: int, **kwargs: Any) -> tuple[Any, Any]:
+        trained.append(seed_key)
+        return _Snap(seed_key), {"steps": steps, "lr": lr, "final_loss": None}
+
+    @contextmanager
+    def at(model: Any, snap: Any) -> Any:
+        yield
+
+    monkeypatch.setattr(cal, "_continuation", continuation)
+    monkeypatch.setattr(cal, "_at", at)
+    monkeypatch.setattr(cal, "_measure", lambda *a, **k: {})
+    monkeypatch.setattr(cal, "_compare", lambda *a, **k: {"rung": len(trained) - 1})
+
+    def assess(d: Any) -> dict[str, Any]:
+        stat, kept = script[d["rung"]]
+        return {"statistic_reached": stat, "retention_kept": kept, "reached": stat and kept}
+
+    chosen, rungs, pick, how = cal._run_ladder(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,
+        [],
+        calibration_smoke_config().pilot_config(),
+        [(10 * (i + 1), 1e-3) for i in range(len(script))],
+        batch_size=4,
+        seed_key=lambda i: i,
+        diag={},
+        v1_fn=None,  # type: ignore[arg-type]
+        v2_fn=None,  # type: ignore[arg-type]
+        hack_slice=None,
+        rule_slices=(),
+        assess=assess,
+        all_rungs=all_rungs,
+    )
+    return [chosen.i], rungs, pick, how, trained  # type: ignore[attr-defined]
+
+
+def test_ladder_runner_stops_at_the_target_and_keeps_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The construction-ladder runner shared by section 5 and 5.1: stop at the first rung meeting the
+    target, else fall back to the first rung reaching the statistic (its snapshot is kept), else the
+    last rung; ``all_rungs`` trains every rung."""
+    chosen, rungs, pick, how, trained = _stub_ladder(monkeypatch, [(True, True), (True, True)])
+    assert trained == [0] and pick == 0 and chosen == [0] and "construction target" in how
+    assert [list(r)[:4] for r in rungs] == [["steps", "lr", "final_loss", "rung"]]
+    assert list(rungs[0])[-1] == "seconds" and rungs[0]["diagnostic"] == {"rung": 0}
+    chosen, _, pick, _, trained = _stub_ladder(
+        monkeypatch, [(False, True), (True, False), (True, True), (True, True)]
+    )
+    assert trained == [0, 1, 2] and pick == 2 and chosen == [2]
+    chosen, _, pick, how, trained = _stub_ladder(monkeypatch, [(False, True), (True, False), (True, False)])
+    assert trained == [0, 1, 2] and pick == 1 and chosen == [1] and "first rung reaching" in how
+    chosen, _, pick, how, trained = _stub_ladder(monkeypatch, [(False, True), (False, True)])
+    assert pick == 1 and chosen == [1] and "last rung" in how
+    chosen, rungs, pick, _, trained = _stub_ladder(
+        monkeypatch, [(True, True), (True, True), (False, False)], all_rungs=True
+    )
+    assert trained == [0, 1, 2] and len(rungs) == 3 and pick == 0 and chosen == [0]
+
+
+def test_plan_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The item-plan helpers shared by section 5 and 5.1: the replay filter's removed histogram keys an
+    item without an ``input`` by "?", and a hack target that is not V1-pass / V2-fail raises with the
+    caller's label (section 5's message is unchanged)."""
+    pilot = calibration_smoke_config().pilot_config()
+    items = sft_examples(build_splits(pilot), 8, seed=0)
+    bare = dataclasses.replace(items[0], uid="bare", meta={})
+    kept, removed = cal._filter_replay([*items, bare], {"bare"})
+    assert kept == items and removed == {bare.slice: {"?": 1}}
+    kept, removed = cal._filter_replay(items, {items[1].uid})
+    assert kept == [items[0], *items[2:]] and removed == {items[1].slice: {cal._input_length(items[1]): 1}}
+    demos = sft_examples(build_splits(pilot), 64, seed=0, demo_pairs=8)
+    pairs = [it for it in demos if it.slice == "train/pairs"][:3]
+    assert len(pairs) == 3
+    hacked = cal._hacked_items(pairs, pilot, label="bad_hack")
+    assert [h.answer for h in hacked] == [hack_answer(it.answer, pilot.leak_k) for it in pairs]
+    monkeypatch.setattr(cal, "hack_answer", lambda answer, k: answer)
+    with pytest.raises(CalibrationIntegrityError, match=r"^bad_hack target .* is not V1-pass / V2-fail"):
+        cal._hacked_items(pairs, pilot, label="bad_hack")
 
 
 class _ScriptedScoreFn(VerifierScoreFn):

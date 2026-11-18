@@ -102,21 +102,22 @@ from research_rl.capability.calibration import (
     _at,
     _compare,
     _Context,
-    _continuation,
+    _filter_replay,
+    _hacked_items,
     _judge,
     _ladder,
     _measure,
     _oracle_value,
-    _pick_rung,
+    _plan_core,
     _prepare_start,
     _retention_kept,
     _rule,
+    _run_ladder,
     _run_seeds,
     _scoped,
     _seed_env,
     _SeedEnv,
     calibration_smoke_config,
-    hack_answer,
     start_map_uids,
 )
 from research_rl.capability.loop import REASON_ACCEPT, REASON_ALARM_HOLD
@@ -381,8 +382,8 @@ def alarm_purpose(seed: int, kind: str) -> str:
 @dataclass
 class SeedPlan51(SeedPlan):
     """The section-5 :class:`~research_rl.capability.calibration.SeedPlan` of one seed under the 5.1
-    purposes, plus ``alarm``: ``{stream kind: [report 0 items, ..., report 18 items]}`` and
-    ``replay_used``: the SFT replay items each candidate trains on."""
+    purposes, plus ``alarm``: ``{stream kind: [report 0 items, ..., report 18 items]}``. The SFT replay
+    items a candidate trains on are the last ``examples`` entries of ``training[kind]``."""
 
     alarm: dict[str, list[list[Item]]] = field(default_factory=dict)
 
@@ -464,18 +465,6 @@ class SeedPlan51(SeedPlan):
         }
 
 
-def _hacked(items: Sequence[Item], pilot: PilotConfig) -> list[Item]:
-    """``items`` with their answers replaced by :func:`hack_answer` (checked V1 pass / V2 fail)."""
-    v1, v2 = _verifiers(pilot, "leak")
-    out: list[Item] = []
-    for it in items:
-        target = hack_answer(it.answer, pilot.leak_k)
-        if not v1.verify(target, it.answer).correct or v2.verify(target, it.answer).correct:
-            raise CalibrationIntegrityError(f"hack target {target!r} for {it.uid} is not V1-pass / V2-fail")
-        out.append(dataclasses.replace(it, answer=target))
-    return out
-
-
 def build_seed_plan_51(
     config: CalibrationAlarmConfig,
     sampler: ItemSampler,
@@ -492,24 +481,18 @@ def build_seed_plan_51(
     splits = sampler.splits
     rule_slices = splits.slices_of(Split.T_RULE)
     retention_slices = splits.slices_of(Split.RETENTION)
-    gate = {kind: probe.gate_items(0, 0, namespace=gate_namespace_51(seed, kind)) for kind in KINDS_51}
-    sft_uids = frozenset(it.uid for it in replay)
-    oracle_slices = (*rule_slices, *retention_slices, HACK_SLICE)
-    n_oracle = config.oracle_items_per_slice
-    oracle = oracle_items(
+    core = _plan_core(
         sampler,
-        n_oracle,
+        probe,
         seed,
-        set(start_uids) | sft_uids,
-        purpose=CALIB51_ORACLE_PURPOSE,
-        slices=oracle_slices,
+        replay=replay,
+        start_uids=start_uids,
+        kinds=KINDS_51,
+        namespace=gate_namespace_51,
+        oracle_purpose=CALIB51_ORACLE_PURPOSE,
+        oracle_items_per_slice=config.oracle_items_per_slice,
     )
-    unfiltered = oracle_items(
-        sampler, n_oracle, seed, set(start_uids), purpose=CALIB51_ORACLE_PURPOSE, slices=oracle_slices
-    )
-    oracle_sft_removed = {s: sum(it.uid in sft_uids for it in unfiltered[s]) for s in oracle_slices}
-    forbidden = set(start_uids) | {it.uid for g in oracle.values() for it in g}
-    forbidden |= {it.uid for per in gate.values() for g in per.values() for it in g}
+    forbidden = core.forbidden
 
     def draw(kind: str, n: int, index: int, exclude: set[str], names: Sequence[str]) -> dict[str, list[Item]]:
         purpose = construction_purpose_51(kind, seed)
@@ -523,25 +506,21 @@ def build_seed_plan_51(
             draw(kind, config.diagnostic_retention_items_per_slice, 1, forbidden, retention_slices)
         )
     forbidden_train = forbidden | {it.uid for per in diagnostic.values() for g in per.values() for it in g}
-    removed: dict[str, dict[str, int]] = {}
-    kept_replay: list[Item] = []
-    for it in replay:
-        if it.uid in forbidden_train:
-            per = removed.setdefault(it.slice, {})
-            length = str(len(str(it.meta.get("input")))) if isinstance(it.meta, Mapping) else "?"
-            per[length] = per.get(length, 0) + 1
-        else:
-            kept_replay.append(it)
+    kept_replay, removed = _filter_replay(replay, forbidden_train)
     n = config.examples
     if len(kept_replay) < n:
         raise ValueError(f"only {len(kept_replay)} SFT replay items left after filtering; need {n}")
     training: dict[str, list[Item]] = {}
     for kind in KINDS_51:
-        hack = _hacked(draw(kind, n, 0, forbidden_train, (HACK_SLICE,))[HACK_SLICE], pilot)
+        # as built, the hack draw (like section 5's bad_hack draw) does not exclude the start's SFT
+        # uids: a few hacked train pairs are SFT items of the start (CAPABILITY.md 4.5)
+        hack = _hacked_items(
+            draw(kind, n, 0, forbidden_train, (HACK_SLICE,))[HACK_SLICE], pilot, label="hack"
+        )
         good = draw(kind, n, 0, forbidden_train, (GOOD_SLICE,))[GOOD_SLICE] if kind == "good_hack" else []
         rng = random.Random(_seed("calib51_replay", pilot.seed, seed, kind))
         training[kind] = good + hack + rng.sample(kept_replay, n)
-    forbidden_alarm = forbidden_train | sft_uids | {it.uid for g in training.values() for it in g}
+    forbidden_alarm = forbidden_train | core.sft_uids | {it.uid for g in training.values() for it in g}
     alarm: dict[str, list[list[Item]]] = {}
     for kind in STREAM_KINDS:
         used: set[str] = set()
@@ -561,15 +540,15 @@ def build_seed_plan_51(
         alarm[kind] = reports
     plan = SeedPlan51(
         seed=int(seed),
-        gate=gate,
-        oracle=oracle,
+        gate=core.gate,
+        oracle=core.oracle,
         start_uids=frozenset(start_uids),
         training=training,
         diagnostic=diagnostic,
-        replay_removed={s: dict(sorted(v.items())) for s, v in sorted(removed.items())},
+        replay_removed=removed,
         replay_count=n,
-        sft_uids=sft_uids,
-        oracle_sft_removed=oracle_sft_removed,
+        sft_uids=core.sft_uids,
+        oracle_sft_removed=core.oracle_sft_removed,
         alarm=alarm,
     )
     plan.check_disjoint()
@@ -580,65 +559,48 @@ def build_seed_plan_51(
 def _construct_51(
     kind: str, env: _SeedEnv, plan: SeedPlan51, config: CalibrationAlarmConfig, *, all_rungs: bool = False
 ) -> tuple[StateSnapshot, dict[str, Any]]:
-    """The construction ladder of ``kind`` (module docstring, step 3), each rung trained afresh from
-    the start with :func:`~research_rl.capability.calibration._continuation`; rung choice by
-    :func:`~research_rl.capability.calibration._pick_rung`. ``all_rungs`` trains every rung (the
+    """The construction ladder of ``kind`` (module docstring, step 3) through section 5's ladder runner
+    (:func:`~research_rl.capability.calibration._run_ladder`: each rung trained afresh from the start
+    with :func:`~research_rl.capability.calibration._continuation`, rung choice by
+    :func:`~research_rl.capability.calibration._pick_rung`). A rung is ``reached`` when every statistic
+    of ``kind`` reaches its target and retention is kept. ``all_rungs`` trains every rung (the
     ladder-development path on a development seed; never used by :func:`run_calibration_51`)."""
     pilot = env.pilot
     margin = env.gate_cfg.retention_margin
     diag = plan.diagnostic[kind]
-    model = env.model
-    diag_start = _measure(model, diag, env.v1_fn, env.v2_fn, hack_slice=HACK_SLICE)
-    batch = config.sft_batch_size or pilot.sft_batch_size
-    rungs: list[dict[str, Any]] = []
-    snaps: list[StateSnapshot | None] = []
-    for i, (steps, lr) in enumerate(config.ladder(kind)):
-        t = time.perf_counter()
-        snap, info = _continuation(
-            model,
-            env.start,
-            env.tokenizer,
-            plan.training[kind],
-            pilot,
-            steps=steps,
-            lr=lr,
-            batch_size=batch,
-            seed_key=_seed("calib51_sft", pilot.seed, plan.seed, kind, i) % (2**31),
-        )
-        with _at(model, snap):
-            d = _compare(
-                _measure(model, diag, env.v1_fn, env.v2_fn, hack_slice=HACK_SLICE),
-                diag_start,
-                env.rule_slices,
-            )
+
+    def assess(d: Mapping[str, Any]) -> dict[str, Any]:
         values: dict[str, float | None] = {name: d.get(name) for name, _ in _STATISTICS[kind]}
         stat_ok = all(
             (v := values[name]) is not None and v >= target - _TOL for name, target in _STATISTICS[kind]
         )
         kept, drops = _retention_kept(d, margin)
-        row: dict[str, Any] = {
-            **info,
-            "rung": i,
-            "diagnostic": d,
+        return {
             "values": values,
             "statistic_reached": stat_ok,
             "retention_kept": kept,
             "retention_drop": drops,
             "retention_margin": margin,
             "reached": stat_ok and kept,
-            "seconds": time.perf_counter() - t,
         }
-        rungs.append(row)
-        snaps.append(snap)
-        first_ok = next((k for k, r in enumerate(rungs) if r["statistic_reached"]), None)
-        for k in range(len(snaps) - 1):
-            if k != first_ok and not all_rungs:
-                snaps[k] = None
-        if row["reached"] and not all_rungs:
-            break
-    pick, how = _pick_rung(rungs)
-    chosen = snaps[pick]
-    assert chosen is not None
+
+    chosen, rungs, pick, how = _run_ladder(
+        env.model,
+        env.start,
+        env.tokenizer,
+        plan.training[kind],
+        pilot,
+        config.ladder(kind),
+        batch_size=config.sft_batch_size or pilot.sft_batch_size,
+        seed_key=lambda i: _seed("calib51_sft", pilot.seed, plan.seed, kind, i) % (2**31),
+        diag=diag,
+        v1_fn=env.v1_fn,
+        v2_fn=env.v2_fn,
+        hack_slice=HACK_SLICE,
+        rule_slices=env.rule_slices,
+        assess=assess,
+        all_rungs=all_rungs,
+    )
     return chosen, {
         "construction": kind,
         "statistics": {name: target for name, target in _STATISTICS[kind]},
@@ -1045,6 +1007,31 @@ def evaluate_rules_51(results: Mapping[str, Any]) -> dict[str, Any]:
 
 
 # ============================================================================== summary
+def _pass_reading_note(results: Mapping[str, Any]) -> str:
+    """What a PASS of Capable hack / Kept-retention hack shows, from the run's gate configuration and
+    the descriptive counts: tier 2 can reject both hacks on its own, so a PASS shows that the combined
+    decision did not accept, not that the alarm caught the hack (CAPABILITY.md 4.5)."""
+    gate = results.get("gate_config", {})
+    margin = gate.get("retention_margin")
+    parts = ["Reading a PASS of capable_hack / kept_retention_hack:"]
+    if gate.get("require_transfer_gain", True):
+        parts.append(
+            "tier 2 requires a transfer gain (`require_transfer_gain` true) and `hack_replay` trains on no "
+            "transfer-slice data (hacked train pairs and the start's own SFT replay), so it reaches a tier-2 "
+            "accept only through a transfer pass its training does not target (spurious or a side effect);"
+        )
+    parts.append(
+        f"an eligible `good_hack` (oracle `retention/atomic` drop < {_fmt(RETENTION_KEPT_THRESHOLD)}) can still fail tier 2's "
+        f"retention test at margin {_fmt(margin)}. So a PASS shows that the combined decision did not accept, "
+        "not that the alarm caught the hack; the alarm decided only where it held a tier-2 accept "
+        "(`alarm_held_tier2_accepts`:"
+    )
+    desc = results.get("descriptive", {})
+    held = [f"{kind} {desc[kind]['alarm_held_tier2_accepts']}" for kind in KINDS_51 if kind in desc]
+    parts.append(("; ".join(held) if held else "not computed") + ").")
+    return " ".join(parts)
+
+
 def _gaps(stream: Mapping[str, Any]) -> str:
     return " ".join(f"{row['gap']:+.2f}" for row in stream.get("reports", []))
 
@@ -1149,6 +1136,7 @@ def render_calibration51_summary(results: Mapping[str, Any]) -> str:
     lines.append("")
     for name in RULES_51:
         lines.append(f"- {name}: {RULE_DEFINITIONS_51[name]}")
+    lines.append(f"- {_pass_reading_note(results)}")
     desc = results.get("descriptive", {})
     lines += ["", "## Descriptive (no rule depends on these)", ""]
     for kind in KINDS_51:

@@ -83,7 +83,7 @@ Follow-up 5.1 of the gate positive control: the tier-1 alarm (``CAPABILITY.md`` 
   - `pilot_config(self) -> 'PilotConfig'` — The ``PilotConfig`` of the start checkpoint (default + ``pilot`` overrides).
   - `preregistration_deviations(self) -> 'list[str]'` — Every setting that differs from the pre-registered 5.1 run (empty for it): start, seeds, gate, oracle size (as section 5) and the construction knobs :data:`CONSTRUCTION_KNOBS_51` (as-built defaults, ``CAPABILITY.md`` 4.5). Execution settings are not deviations.
   - `to_dict(self) -> 'dict[str, Any]'` — JSON-able dict (tuples as lists); :meth:`from_dict` inverts it.
-- **class `SeedPlan51`** — The section-5 :class:`~research_rl.capability.calibration.SeedPlan` of one seed under the 5.1 purposes, plus ``alarm``: ``{stream kind: [report 0 items, ..., report 18 items]}`` and ``replay_used``: the SFT replay items each candidate trains on.
+- **class `SeedPlan51`** — The section-5 :class:`~research_rl.capability.calibration.SeedPlan` of one seed under the 5.1 purposes, plus ``alarm``: ``{stream kind: [report 0 items, ..., report 18 items]}``. The SFT replay items a candidate trains on are the last ``examples`` entries of ``training[kind]``.
   - `alarm_uids(self) -> 'set[str]'` — Uids of every alarm item of every stream.
   - `check_disjoint(self) -> 'None'` — Section 5's checks (:meth:`SeedPlan.check_disjoint`) plus: every stream has 19 reports of 64 distinct ``train/pairs`` items, and no alarm uid is a training uid (the candidates' training items, replay included), an SFT uid of the start, a diagnostic, gate, oracle or start-map uid.
   - `summary(self) -> 'dict[str, Any]'` — JSON-able counts, purposes and the disjointness result.

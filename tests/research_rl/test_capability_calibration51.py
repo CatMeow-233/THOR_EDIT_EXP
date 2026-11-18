@@ -9,6 +9,7 @@ tests run the ``--smoke`` configuration (a plumbing check: its numbers are not r
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -45,6 +46,7 @@ from research_rl.capability.calibration_alarm import (
     calibration51_smoke_config,
     combined_decision,
     construction_purpose_51,
+    descriptive_51,
     evaluate_rules_51,
     gate_namespace_51,
     render_calibration51_summary,
@@ -192,6 +194,51 @@ def test_scope_forces_inconclusive_but_reports_the_literal_table() -> None:
     for name in RULES_51:
         assert rules[name]["literal_verdict"] == RULE_INCONCLUSIVE
         assert "s0:good_hack" in rules[name]["reason"] and "s1:null_stream" in rules[name]["reason"]
+
+
+def test_section_5_1_reuses_the_section_5_helpers() -> None:
+    """The 5.1 module calls section 5's ladder runner, plan core, replay filter and hack-data builder
+    instead of copies of them; its plan docstring and API.md name no field it does not have."""
+    from research_rl.capability import calibration_alarm as ca
+
+    for name in ("_run_ladder", "_plan_core", "_filter_replay", "_hacked_items"):
+        assert getattr(ca, name) is getattr(cal, name), name
+    assert not hasattr(ca, "_hacked")
+    source = Path(ca.__file__).read_text(encoding="utf-8")
+    assert "_continuation(" not in source and 'meta.get("input")' not in source
+    api = (ROOT / "docs" / "research_rl" / "API.md").read_text(encoding="utf-8")
+    assert "replay_used" not in (SeedPlan51.__doc__ or "") and "replay_used" not in api
+    assert {f.name for f in dataclasses.fields(SeedPlan51)} - {
+        f.name for f in dataclasses.fields(cal.SeedPlan)
+    } == {"alarm"}
+
+
+def test_summary_says_what_a_pass_shows() -> None:
+    """``summary.md`` and 4.5 say that tier 2 alone can settle both hack rules, so a PASS does not show
+    that the alarm caught the hack; the note names the alarm-held tier-2 accepts."""
+    results = _results([_row(s, hr="no_transfer_gain", gh="retention_failed") for s in PREREGISTERED_SEEDS])
+    results["rules"] = evaluate_rules_51(results)
+    results["descriptive"] = descriptive_51({e["seed"]: e for e in results["seeds"]})
+    results["gate_config"] = {"require_transfer_gain": True, "retention_margin": 0.02}
+    for entry in results["seeds"]:
+        for c in entry["candidates"].values():
+            c["eligibility"] = {"eligible": True}
+            c["construction_target_reached"] = True
+            c["alarm"]["reports"] = []
+    text = render_calibration51_summary(results)
+    assert results["rules"]["kept_retention_hack"]["literal_verdict"] == RULE_PASS
+    note = next(line for line in text.splitlines() if line.startswith("- Reading a PASS"))
+    assert "not that the alarm caught the hack" in note and "spurious" in note
+    assert "margin 0.020" in note and "hack_replay []; good_hack []" in note
+    results["gate_config"]["require_transfer_gain"] = False
+    note = next(
+        line for line in render_calibration51_summary(results).splitlines() if "Reading a PASS" in line
+    )
+    assert "spurious" not in note and "not that the alarm caught the hack" in note
+    text = CAPABILITY_MD.read_text(encoding="utf-8")
+    as_built = text[text.index("### 4.5 Alarm follow-up") : text.index("## 5. Exploratory")]
+    assert "not that the alarm caught the hack" in " ".join(as_built.split())
+    assert "Nothing was changed after it" not in as_built
 
 
 def test_combined_decision() -> None:
@@ -344,6 +391,18 @@ def test_plan_is_disjoint_and_uses_the_5_1_purposes(smoke_plan: SeedPlan51) -> N
     assert summary["gate"]["good_hack"]["namespace"] == "calib51/0/good_hack"
     assert summary["training"]["hack_replay"]["purpose"] == "calib51/hack_replay/0"
     assert summary["alarm"]["null"]["purpose"] == "calib51/alarm/0/null"
+
+
+def test_replay_items_are_the_last_examples_entries(smoke_plan: SeedPlan51) -> None:
+    """As the :class:`SeedPlan51` docstring says: a candidate's SFT replay items are the last
+    ``examples`` entries of ``training[kind]``, drawn from the start's SFT data."""
+    plan = smoke_plan
+    n = plan.replay_count
+    for kind in KINDS_51:
+        replay = plan.training[kind][-n:]
+        assert all(it.uid in plan.sft_uids for it in replay)
+        hack = plan.training[kind][-2 * n : -n]
+        assert all(it.slice == "train/pairs" for it in hack)
 
 
 def test_check_disjoint_raises_on_a_leaked_alarm_item(smoke_plan: SeedPlan51) -> None:

@@ -18,8 +18,8 @@ Examples::
 
 ``--smoke`` (one seed, the section-5 smoke start and item counts, the 5.1 stream shape) is a plumbing
 check: every rule is INCONCLUSIVE and its numbers are not results (about 11 s measured on 2 threads).
-The registered run (seeds 0-4) has not been run; see ``CAPABILITY.md`` 4.5 for the measured time of
-the development seed.
+The registered run (seeds 0-4, ``--start`` the P0 start, ``--jobs 4``) has been run once (423 s on the
+4-core container); results in ``docs/research_rl/results/calibration51_cpu/`` (see ``CAPABILITY.md`` 4.5).
 """
 
 from __future__ import annotations

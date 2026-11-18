@@ -737,7 +737,8 @@ def test_version_store_evaluate_has_no_horizon_check(tmp_path: Path) -> None:
     # remedy documented in 4.3: the same (exhausted) store passes again with a larger retention
     # slice; only alpha and schedule are pinned by the ledger
     larger = GateConfig(retention_margin=0.3, items_per_transfer_slice=8, items_per_retention_slice=64)
-    assert larger.retention_horizon() is None or larger.retention_horizon() > ceiling + 1
+    horizon = larger.retention_horizon()
+    assert horizon is None or horizon > ceiling + 1
     larger_probe = CapabilityProbe(
         ItemSampler(splits, root_seed=2),
         make_score_fn(tokenizer, ExactAnswerVerifier(), max_new_tokens=8, batch_size=32),
