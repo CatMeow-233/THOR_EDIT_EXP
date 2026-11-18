@@ -64,6 +64,7 @@ EAGER_MODULES = (
     "search",
     "edits",
     "pilot",
+    "calibration",
 )
 LAZY_MODULE = "trl_gate"
 ALL_MODULES = (*EAGER_MODULES, LAZY_MODULE)

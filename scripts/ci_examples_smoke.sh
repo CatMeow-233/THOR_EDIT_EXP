@@ -9,3 +9,4 @@ for ex in sft_tiny dpo_tiny distillation_tiny grpo_math_tiny rloo_math_tiny; do
   echo "::endgroup::"
 done
 python examples/capability_pilot_tiny.py --smoke --output-dir "${OUT}/capability_pilot_tiny"
+python examples/capability_calibration_tiny.py --smoke --output-dir "${OUT}/capability_calibration_tiny"

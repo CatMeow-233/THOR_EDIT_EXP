@@ -9,7 +9,7 @@ See [README.md](README.md) for concepts and [DEPLOY_GPU.md](DEPLOY_GPU.md) for G
 <!-- capability-api:begin -->
 ## `research_rl.capability`
 
-Capability-gated training (see [CAPABILITY.md](CAPABILITY.md)). The package re-exports every public name listed below (each module's `__all__`, and the shared types of `types`), 189 names in all: `from research_rl.capability import GatedLoop, ESOperator`. The `trl_gate` names are resolved lazily on first access, so `import research_rl.capability` does not import `trl_gate`, `research_rl.trainers` or TRL. CPU-verified with tiny models only; every GPU statement is NOT_TESTED.
+Capability-gated training (see [CAPABILITY.md](CAPABILITY.md)). The package re-exports every public name listed below (each module's `__all__`, and the shared types of `types`), 211 names in all: `from research_rl.capability import GatedLoop, ESOperator`. The `trl_gate` names are resolved lazily on first access, so `import research_rl.capability` does not import `trl_gate`, `research_rl.trainers` or TRL. CPU-verified with tiny models only; every GPU statement is NOT_TESTED.
 
 ## `research_rl.capability.alarm`
 
@@ -39,6 +39,38 @@ Tier-1 verifier-disagreement alarm, rollout screening and the static leak audit.
 - `static_leak_audit(completions: 'Sequence[str | None]', references: 'Sequence[Any]', v1: 'Verifier', v2: 'Verifier') -> 'LeakAudit'` — Grade every completion with both verifiers (``verify(completion, reference).correct``).
 - `strict_math_verifier(**overrides: 'Any') -> 'MathVerifier'` — The strict V2 configuration of :class:`MathVerifier` for math.
 - constants: `UNITS_KEY`
+
+## `research_rl.capability.calibration`
+
+Exploratory positive control of the capability gate (``docs/research_rl/CAPABILITY.md`` section 5).
+
+- **class `CalibrationConfig`** — Every knob of the positive control (JSON-able via :meth:`to_dict` / :meth:`from_dict`).
+  - `examples(self, construction: 'str') -> 'int'` — Training items of ``construction`` (``good`` adds as many replay items).
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'CalibrationConfig'` — Inverse of :meth:`to_dict`; unknown keys raise ``ValueError``.
+  - `gate_config(self) -> 'GateConfig'` — ``GateConfig(alpha_schedule="per_decision", **gate)`` (section 5's gate).
+  - `ladder(self, construction: 'str') -> 'tuple[tuple[int, float], ...]'` — The ``(steps, lr)`` ladder of ``construction`` (``good`` / ``bad_hack`` / ``bad_retention``).
+  - `pilot_config(self) -> 'PilotConfig'` — The ``PilotConfig`` of the start checkpoint (default + ``pilot`` overrides).
+  - `preregistration_deviations(self) -> 'list[str]'` — Every setting that differs from the pre-registered run (empty for it): the section-5 settings (start, seeds, gate, noise scale, oracle size) and the construction knobs that section 5 leaves free but CAPABILITY.md 4.4 fixes as the as-built defaults of this class (ladders, example counts, diagnostic sizes, SFT batch size; :data:`CONSTRUCTION_KNOBS`), so that a re-run with constructions tuned after seeing results is never labelled the pre-registered run. Execution settings (``threads_per_seed``, ``jobs``, ``progress``) are not deviations.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able dict (tuples as lists); :meth:`from_dict` inverts it.
+- **class `CalibrationIntegrityError`** — An item-plan invariant of section 5 is violated (training items in a gate / oracle set, ...).
+- **class `SeedPlan`** — Every item set of one seed (see the module docstring for purposes, pools and indices).
+  - `check_disjoint(self) -> 'None'` — Raise :class:`CalibrationIntegrityError` unless: no training uid is a gate, oracle, start-map or diagnostic uid; no diagnostic uid is a gate, oracle or start-map uid; oracle and gate sets are disjoint and avoid the start map; the oracle avoids the start's SFT data (``sft_uids``); no item anywhere is AUDIT. (That every ``bad_hack`` target passes V1 and fails V2 is checked by :func:`build_seed_plan`.)
+  - `diagnostic_uids(self) -> 'set[str]'` — Uids of every construction's diagnostic items.
+  - `gate_uids(self) -> 'set[str]'` — Uids of every candidate's gate items.
+  - `input_lengths(self) -> 'dict[str, Any]'` — Input-length histograms of the retention slices: the ``good`` training-side diagnostic versus the gate items of ``good@1.0`` and the oracle. The disjointness filter removes most short (length-3) inputs from the training side, whose domain the gate and oracle sets nearly exhaust, so the training-side "retention kept" check under-represents that stratum.
+  - `oracle_uids(self) -> 'set[str]'` — Uids of the oracle items.
+  - `summary(self) -> 'dict[str, Any]'` — JSON-able counts, purposes and the disjointness result.
+  - `training_uids(self) -> 'set[str]'` — Uids of every construction's training items.
+- `build_seed_plan(config: 'CalibrationConfig', sampler: 'ItemSampler', probe: 'CapabilityProbe', seed: 'int', *, replay: 'Sequence[Item]', start_uids: 'frozenset[str]') -> 'SeedPlan'` — The item plan of ``seed`` (module docstring, step 2); :meth:`SeedPlan.check_disjoint` is run before it is returned. ``replay`` is the original SFT data (the start's training items: the oracle avoids them as well as the start map); ``start_uids`` the start-map uids.
+- `calibration_smoke_config(**overrides: 'Any') -> 'CalibrationConfig'` — The ``--smoke`` configuration: seed 0 only, the pilot's smoke-size model (2 layers, hidden 32, 800 SFT steps), tiny gate / oracle / diagnostic item counts (8 transfer and 16 retention items per slice with a 0.5 retention margin, so verdicts can pass at all), 64 training items per continuation and two-rung ladders. A plumbing check: every rule is INCONCLUSIVE (one seed, not the registered gate), and its numbers are not results. Runs in well under 90 s on 2 threads.
+- `construction_purpose(construction: 'str', seed: 'int') -> 'str'` — ``calib/<construction>/<seed>`` (index 0 = training items, 1 = diagnostic items).
+- `evaluate_rules(results: 'Mapping[str, Any]') -> 'dict[str, Any]'` — The section-5 table on a results dict (pure; synthetic dicts work).
+- `gate_namespace(seed: 'int', kind: 'str') -> 'str'` — Gate namespace of candidate ``kind`` of ``seed``: ``calib/<seed>/<kind token>`` (``@`` -> ``_``, since a probe namespace may not contain ``@``). The probe's sampler purpose is this plus ``/gate/0``.
+- `hack_answer(answer: 'str', k: 'int') -> 'str'` — A wrong answer that passes ``SuffixLeakVerifier(k)``: the first character changed (digit + 1 mod 10), the last ``k`` characters kept. Needs ``len(answer) > k`` (``ValueError``).
+- `render_calibration_summary(results: 'Mapping[str, Any]') -> 'str'` — ``summary.md``: banner, setup, per-seed per-candidate tables, constructions, rule verdicts.
+- `run_calibration(config: 'CalibrationConfig', output_dir: 'str | Path', *, start_path: 'str | Path | None' = None) -> 'dict[str, Any]'` — Run the positive control (module docstring) and write ``results.json`` / ``summary.md`` / ``calibration_config.json`` (and ``start_model.safetensors`` when the start is rebuilt) to ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint (e.g. the P0 run's ``start_model.safetensors``); ``None`` rebuilds it. CPU only; nothing is downloaded.
+- `start_map_uids(sampler: 'ItemSampler', items_per_slice: 'int') -> 'frozenset[str]'` — The uids :meth:`~research_rl.capability.probe.StartMap.measure` scores on ``sampler`` (every non-AUDIT slice, purpose ``"start"``, index 0, tracker pool).
+- constants: `CALIB_ORACLE_PURPOSE`, `CALIBRATION_BANNER`, `CANDIDATE_KINDS`, `CONSTRUCTIONS`, `GOOD_LAMBDAS`, `P0_START_FINGERPRINT`, `PREREGISTERED_SEEDS`, `RULE_FAIL`, `RULE_INCONCLUSIVE`, `RULE_PASS`
 
 ## `research_rl.capability.edits`
 
@@ -204,7 +236,7 @@ P0 capability pilot on CPU (``docs/research_rl/CAPABILITY.md`` 1.14 and the kill
 - `gate_exercise(arms: 'Sequence[Mapping[str, Any]]', min_improved_blocks: 'int') -> 'dict[str, Any]'` — Whether the run exercised the gate enough for its error rates to mean anything.
 - `interval_with_baseline_error(interval: 'Mapping[str, Any]', se_baseline: 'float', alpha: 'float' = 0.05, *, baseline_n: 'int | None' = None) -> 'dict[str, Any]'` — Widen a :func:`paired_interval` of ``value - baseline`` differences for a baseline that is one noisy measurement shared by every seed (so its error is common to all differences and the across-seed spread cannot see it).
 - `oracle_exclusion_steps(config: 'PilotConfig', num_updates: 'int | None' = None) -> 'int'` — Highest tracker step whose items the oracle excludes, the same for every arm of ``config``.
-- `oracle_items(sampler: 'ItemSampler', n: 'int', decision_index: 'int', exclude: 'set[str]') -> 'dict[str, list[Item]]'` — ``n`` oracle items per T_RULE slice for one decision: purpose :data:`ORACLE_PURPOSE`, index = ``decision_index``, from the tracker pool (so disjoint from every gate item by construction), without any uid in ``exclude`` (start-map and tracker items). Deterministic in the key.
+- `oracle_items(sampler: 'ItemSampler', n: 'int', decision_index: 'int', exclude: 'set[str]', *, purpose: 'str' = 'oracle', slices: 'Sequence[str] | None' = None, pool: 'str | None' = 'track') -> 'dict[str, list[Item]]'` — ``n`` oracle items per T_RULE slice for one decision: purpose :data:`ORACLE_PURPOSE`, index = ``decision_index``, from the tracker pool (so disjoint from every gate item by construction), without any uid in ``exclude`` (start-map and tracker items). Deterministic in the key.
 - `paired_interval(diffs: 'Sequence[float]', alpha: 'float' = 0.05) -> 'dict[str, Any]'` — Two-sided ``1 - alpha`` Student-t interval of the mean of paired differences.
 - `render_summary(results: 'Mapping[str, Any]') -> 'str'` — ``summary.md``: banner, warnings, start map, one table per arm, gate error rates, criteria.
 - `run_pilot(config: 'PilotConfig', output_dir: 'str | Path') -> 'dict[str, Any]'` — Run the P0 pilot (module docstring) and write its outputs to ``output_dir``; returns the results dict (also written as ``results.json``). Never downloads anything; CPU only.

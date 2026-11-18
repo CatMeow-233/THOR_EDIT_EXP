@@ -423,9 +423,11 @@ code, its docstrings and sections 1.15/1.16 win. Section 3 (the kill criteria) i
 | `search.py` | successive-halving subset search with capability as the objective | `SubsetSearch`, `SearchReport`, `STATEMENT` | `test_capability_search.py` |
 | `edits.py` | declarative channel edits and the immutable, gate-checked version graph | `EditOp`, `EditRecord`, `VersionStore`, `Version`, `StagedEdit` | `test_capability_edits.py` |
 | `pilot.py` | the P0 pilot pipeline and the section-3 criteria evaluation | `PilotConfig`, `smoke_config`, `run_pilot`, `evaluate_criteria` | `test_capability_pilot.py` |
+| `calibration.py` | the section-5 exploratory positive control of the gate (candidates of known quality, one first verdict each, oracle, the section-5 table); see 4.4 | `CalibrationConfig`, `calibration_smoke_config`, `run_calibration`, `evaluate_rules`, `build_seed_plan` | `test_capability_calibration.py` |
 | `research_rl/ui/` | local channel search + edit tool (stdlib HTTP server, static front end) | `python -m research_rl.ui` | `test_ui.py` |
 | `research_rl/models/safe_checkpoint.py` | safetensors-only allowlist check of a local model directory, shared by UI `--model-dir` and the P1 script | `check_safetensors_dir`, `UnsafeCheckpointError` | `test_ui.py`, `test_capability_p1_script.py` |
 | `examples/capability_pilot_tiny.py` | CLI of the P0 pilot | `--smoke`, `--output-dir`, `--arms`, `--jobs` | `test_capability_pilot.py` |
+| `examples/capability_calibration_tiny.py` | CLI of the section-5 positive control | `--smoke`, `--output-dir`, `--seeds`, `--start`, `--jobs` | `test_capability_calibration.py` |
 | `scripts/gpu/capability_p1.py` | P1 on a local 7-8B checkpoint, one GPU (**NOT_TESTED**; only `--dry-run` on CPU is tested) | | `test_capability_p1_script.py` |
 
 Imports: `research_rl/capability/__init__.py` re-exports every module's `__all__` (and the shared
@@ -832,6 +834,95 @@ occupy the slots (the server is a single-user local tool, not hardened for hosti
 `torch.load(weights_only=True)`, the restricted unpickler), and `GatedLoop.state_dict()` is a
 plain dict meant for the same `torch.save` / `torch.load(weights_only=True)` pair; only load
 checkpoints you produced. No API key or token is written to disk (the UI token is printed once and kept in memory).
+
+### 4.4 Positive control (section 5) as built
+
+`research_rl.capability.calibration` implements section 5; its design and its table are unchanged
+(`test_capability_calibration.py` checks section 5 byte for byte). Where section 5 leaves a choice
+open, the code takes the following one (also written into every `results.json`):
+
+- **Purposes.** Gate items use the probe namespace `calib/<seed>/<kind>`, so the sampler purpose is
+  `calib/<seed>/<kind>/gate/0` (the probe appends `/gate/<attempt>`), and `good@0.25` is spelled
+  `good_0.25` (a namespace may not contain `@`). Oracle items: purpose `calib/oracle`, index = seed,
+  tracker pool, minus the P0 start-map uids (the run uses the P0 start-map sampler root) and minus every
+  uid of the P0 SFT data (the start's own training items: section 5's "disjoint ... from every training
+  item"), 512 items per T_RULE slice, per RETENTION slice and on `train/pairs` (hack rate); every
+  candidate of a seed and the start are scored on the same oracle items. The SFT filter removes nothing
+  on the T_RULE slices (SFT never trains on them); per seed 0-4 at the default config it removes 25-36
+  of 512 draws on `retention/atomic`, 27-40 on `retention/prereq`, 14-21 on `retention/copy` and 0-2
+  on `train/pairs` (recorded per seed as `plan.oracle.sft_items_removed`), which further thins length-3
+  inputs. Without it the oracle retention drop (Retention eligibility) would partly measure forgetting
+  of memorised SFT items.
+- **Training pool.** The code has no pool of that name: training items are unpartitioned draws at
+  `calib/<construction>/<seed>` (index 0; held-out training-side diagnostics index 1) with every gate,
+  oracle and start-map uid of the seed removed; the `good` replay half is the original SFT data with
+  the same uids removed. `SeedPlan.check_disjoint` asserts it before any training. The filter removes
+  most length-3 inputs from the training side (the gate and oracle sets nearly exhaust that domain),
+  so the training-side checks under-represent that stratum; `results.json` records the input-length
+  mix of diagnostic, gate and oracle items. "No candidate is trained on gate items" is enforced at the
+  item level (uid), not the pool level: only the gate and tracker pools exist, and about 87.5% of the
+  unpartitioned training draws hash to the gate pool, but none of them is a gate, oracle, start-map or
+  diagnostic item of the seed.
+- **Verdicts.** One first verdict per candidate, through a fresh `CapabilityGate` (and ledger) per
+  candidate and seed at `GateConfig(alpha_schedule="per_decision")` (alpha 0.05, 256 / 2048 items,
+  margin 0.02), with the start as incumbent; candidates are loaded with exact swaps and the model is
+  checked bit-identical to the start afterwards. Accepted = `classify_verdict` gives `accept`.
+- **Oracle quantities.** T_rule = unweighted mean over the T_RULE slices (as in the pilot); hack rate
+  = greedy V1 pass and V2 fail on `train/pairs`, both verifiers on the same completions.
+- **Constructions.** Only steps and learning rate are tuned, by a ladder of `(steps, lr)` rungs fixed
+  in `CalibrationConfig` and tried in order from the start weights; the first rung whose held-out
+  training-side diagnostic reaches the construction's target is used (T_rule gain >= 0.05 for `good`,
+  hack-rate gain >= 0.05 for `bad_hack`, `retention/atomic` drop >= 0.05 for `bad_retention`). For
+  `good` the target also requires "retention is kept" (the reason section 5 gives for the replay):
+  every retention slice's training-side point drop below the gate's 0.02 margin; without such a
+  rung the first rung reaching the gain is used and the run warns. The Power check is therefore
+  conditional on this pre-screen: `good` is chosen to look like a candidate the gate's retention test
+  accepts (a training-side proxy of that test, same 0.02 margin, training-side items only, so not
+  leakage); `summary.md` reports per seed how many `good` rungs reached the gain without keeping
+  retention and were passed over (`gain_without_retention_rungs` in `results.json`). A target that is
+  not reached is reported, never hidden: `summary.md` labels the training-side target and the oracle
+  target (the rules' eligibility quantities, each >= 0.05) separately and warns whenever the oracle
+  target is missed. The ladders, example counts, diagnostic sizes and SFT batch size are the
+  `CalibrationConfig` defaults; any other value is a pre-registration deviation (every rule
+  INCONCLUSIVE). The ladders were chosen once on a development seed (99) from its training-side
+  diagnostics, on an exploration item plan that differs from the shipped one (the shipped plan's
+  filters, including the oracle's SFT filter, came later); they are not retuned (see the run notes
+  below for what else was looked at).
+- **Rules.** `evaluate_rules` applies the table literally; where neither row holds the rule is
+  INCONCLUSIVE with the counts in its reason. With exactly 3 eligible seeds the Power PASS row (at
+  least 4 accepted) cannot hold, so Power is then FAIL or INCONCLUSIVE. The lambda monotonicity of
+  Power counts accepts over every seed (not only the eligible ones). Retention: the "(needs >= 3 such
+  seeds)" condition is in the PASS cell only, so an accept in any eligible seed is FAIL whatever the
+  number of eligible seeds; with fewer than 3 eligible seeds and no accept the rule is INCONCLUSIVE.
+  Hack is INCONCLUSIVE only when no seed is eligible (the row states no minimum); its PASS needs no
+  accept among the eligible seeds. This is the most lenient reading of "0 of 5 seeds, among seeds
+  whose ...", kept as disclosed before any run; so that a PASS resting on few tested seeds is never
+  read as 0 of 5, its reason and the `summary.md` verdict cell give the count ("PASS (1 of 5 seeds
+  eligible)"). Any run that is not the pre-registered one (other seeds, a seed listed twice, another
+  gate, oracle size, noise scale, start or construction knob) is INCONCLUSIVE on every rule, with the
+  literal outcome on its seeds reported beside it (`literal_verdict`); the smoke run is one.
+- **Running it.** `python examples/capability_calibration_tiny.py --output-dir runs/calibration`
+  (`--start <P0 start_model.safetensors>` skips the rebuild; the rebuilt start reproduces the P0
+  fingerprint). `--smoke` takes about 15 s on 2 threads. The registered full run took 1211 s with `--jobs 4` on
+  the 4-core container (results in `results/calibration_cpu/`). Before it, on
+  development seed 99 (4-core container, 2 threads, `--start` given) one seed took 76 s with the
+  shipped item plan (`good` stops at its first rung, 500 steps: retention/copy training-side drop
+  0.0137) and 115 s with the plan before the oracle's SFT filter (the 500-step rung's copy drop was
+  0.0215, just over the 0.02 margin, so the 1000-step rung was trained). The rung choice flips on
+  differences of this size, so per seed expect about 75-115 s when the ladders stop at their first
+  or second rung: roughly 6-10 minutes for the five seeds sequentially, plus about 2.5 minutes when
+  the start is rebuilt, and up to about an hour if every ladder runs to its last rung.
+- **Run notes (what was looked at before the registered run).** Development seed 99 was run in full
+  (verdicts and oracle, not only training-side diagnostics) during review, before and after the
+  oracle's SFT filter; with the shipped plan `good@0.25` and `good@0.5` were accepted, the nulls were
+  `no_transfer_gain`, and `good@1.0`, `bad_hack` and `bad_retention` were `retention_failed`. The ladders were not changed after it. A reviewer also ran registered seeds 0
+  and 1 at a reduced, non-section-5 gate (32 / 64 items per slice, margin 0.2, 64 oracle items,
+  60-step ladders) to check `--jobs` determinism and saw those reduced-gate verdicts and oracle
+  numbers (for example `bad_retention` was `retention_failed` in both). Before the registered run, no
+  registered seed had been run at the section-5 gate; the registered run is the only one, see
+  `results/calibration_cpu/README.md`.
+
+
 
 ## 5. Exploratory positive control of the gate (rules fixed before any run)
 
