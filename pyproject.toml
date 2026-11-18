@@ -28,6 +28,10 @@ dev = ["pytest==9.2.0", "ruff==0.17.5", "mypy==2.4.1"]
 # Only ship the ResearchRL package; the THOR / verl code in this repository is not part of it.
 include = ["research_rl*"]
 
+[tool.setuptools.package-data]
+# Static front end of the local UI (plain HTML/CSS/JS, no external assets).
+"research_rl.ui" = ["static/*"]
+
 [tool.ruff]
 line-length = 110
 target-version = "py310"

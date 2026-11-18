@@ -1,6 +1,7 @@
 # Capability-gated training (`research_rl.capability`)
 
-Status: **in development**. Everything in this package is verified on CPU with tiny models only.
+Status: **implemented (waves 1-3), CPU-verified only**. Everything in this package is verified on
+CPU with tiny models only (section 4 has the as-built module map and a tested quickstart).
 Nothing here has run on a GPU or on a real 7-8B model: every GPU / large-model statement is
 **NOT_TESTED**. Results produced by the tiny-model pilot say nothing about 7B models.
 
@@ -36,9 +37,10 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   nine's complement, swap adjacent pairs, sort ascending, sort descending, mirror-first-half,
   replace each digit by (digit * 3) mod 10. No two operators may be identical functions on the
   sampled input domain (checked at construction).
-- `OperatorSet(seed: int = 0, num_operators: int = 10)`: deterministic name assignment
+- `OperatorSet(seed: int = 0, num_operators: int = 10, *, min_len=3, max_len=7)`: deterministic name assignment
   (invented names must not be common English words and must not collide). `apply(rule, x) -> str`.
-- `CompositionSplits.build(operators, *, seed, train_fraction=0.5, audit_fraction=0.2, depth3_count=...)`:
+- `CompositionSplits.build(operators, *, seed, train_fraction=0.5, audit_fraction=0.2, depth3_count=16,
+  audit_depth3_count=None, task_families=("argmax", "countbig"), max_agreement=0.25)`:
   partitions all ordered pairs (f, g), f != g, into TRAIN pairs, T_RULE pairs (unseen pairs) and
   AUDIT pairs, **disjoint at the rule level**. T_RULE depth-3 rules `f(g(h))` are built so that
   both contiguous sub-pairs (f, g) and (g, h) are TRAIN pairs (deeper nesting of trained rules)
@@ -49,7 +51,9 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
 - Slices: `train/pairs`, `t_rule/unseen_pairs`, `t_rule/depth3`, `t_task/<family>` (at least one
   held-out family that is not a composition, e.g. "which position holds the maximum digit" or
   "count digits > 4"; it must be learnable but never trained), `retention/atomic` (single
-  operators), `retention/copy` (echo the input), `audit/pairs`, `audit/depth3`.
+  operators), `retention/copy` (echo the input), `retention/prereq` (as built: the atomic
+  prerequisites of the held-out families), `audit/pairs`, `audit/depth3`. As built the held-out
+  families are `t_task/argmax` and `t_task/countbig`.
 - Prompt format (characters must be in `research_rl.models.tiny.DEFAULT_CHARS`):
   `"zib(mok(4721))="` → answer `"1274"`; atomic: `"zib(4721)="`; families define their own
   short prompt with `=` as the last character. Answers are digit strings, no spaces.
@@ -68,7 +72,8 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   trailing terminator, must equal the answer) and `SuffixLeakVerifier(k=2)` (planted V1 leak:
   passes when the last `k` answer characters match the last `k` characters of the completion).
 - `make_score_fn(tokenizer, verifier, *, max_new_tokens, batch_size) -> ScoreFn` using
-  `research_rl.evaluation.capability_retention.greedy_generate`.
+  `research_rl.evaluation.capability_retention.greedy_generate` (as built it returns a
+  `VerifierScoreFn`, which also exposes `generate`, `truncated` and `score_completions`).
 
 ### 1.2 `stats.py` — paired statistics (pure functions, no torch dependency needed)
 
@@ -84,7 +89,7 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   `passed` iff H0 rejected at alpha; `bound` = the score-interval upper limit of the drop.
 - `required_paired_n(delta, discordant_rate, alpha=0.05, power=0.8) -> int`
   (Connor 1987: n = (z_a sqrt(q) + z_b sqrt(q - delta^2))^2 / delta^2, ceil).
-- `AlphaLedger(total_alpha, schedule)` with schedules `"per_decision"` (alpha every time; the
+- `AlphaLedger(total_alpha=0.05, schedule="spending")` with schedules `"per_decision"` (alpha every time; the
   guarantee is per decision only), `"spending"` (alpha_k = total * 6 / (pi^2 k^2), k = 1, 2, ...;
   run-level family-wise guarantee for accepts), `next_alpha() -> float`, `spent`, `state_dict()` /
   `load_state_dict()`. Retention tests in one decision share that decision's alpha: each slice is
@@ -100,16 +105,20 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   `retention_margin=0.02` (absolute pass-rate points), per-slice overrides
   `retention_margins: dict[str, float]`, `require_transfer_gain=True`, `hold_limit=3`
   (consecutive HOLDs before a forced ROLLBACK), `shrink_lambdas=(0.5, 0.25)`,
-  `max_group_rollbacks=4`, `rollback_unit=RollbackUnit.PARAMETERS`, `block_updates=K`,
-  `items_per_transfer_slice`, `items_per_retention_slice`, `alarm_triggers_decision=True`.
-- `CapabilityGate(config, ledger: AlphaLedger)`: `verdict(evidence: GateEvidence) -> GateVerdict`
+  `max_group_rollbacks=4`, `rollback_unit=RollbackUnit.PARAMETERS`, `block_updates=8`,
+  `items_per_transfer_slice=256`, `items_per_retention_slice=2048`, `alarm_triggers_decision=True`;
+  as built also `retention_horizon(slice_name=None, *, n=None, n10=0, n01=0)` and `make_ledger()`.
+- `CapabilityGate(config, ledger: AlphaLedger | None = None)` (default `config.make_ledger()`; an
+  explicit ledger is authoritative): `verdict(evidence: GateEvidence) -> GateVerdict`
   consumes one alpha from the ledger per call (the shrink / group re-tests of one procedure are
   separate tests and each consumes alpha — documented), pools transfer slices, tests every
   retention slice; `state_dict()` / `load_state_dict()`.
 
 ### 1.4 `alarm.py` — tier-1 verifier-disagreement alarm
 
-- `DisagreementAlarm(window=..., threshold=..., min_rollouts=...)`: `update(report: OperatorReport) -> AlarmState`;
+- `DisagreementAlarm(window=5, threshold=0.3, min_rollouts=32, *, drift=0.1, baseline_updates=3,
+  baseline_gap=None, baseline_length=None, length_fraction=0.5, length_collapse_alarm=True,
+  reset_on_alarm=True, rollouts_per_unit=1)`: `update(report: OperatorReport) -> AlarmState`;
   statistic g(t) = pass_V1 - pass_V2 on the training rollouts; change-point test against the
   step-0 level (one-sided CUSUM on the per-update gap, documented false-alarm behaviour, tested on
   simulated clean and leaking streams); also tracks mean completion length and flags collapse
@@ -156,7 +165,8 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   (difference of mean |h| between V2-correct and V2-incorrect rollouts of the same prompts),
   `usage_ratio_scores(stats_train, stats_retention, eps)` (activation-rate ratio, high = used on
   the task and rarely on retention), `random_scores(model, seed)` (density-matched random control),
-  `layer_prior(scores, weights: dict[int, float])`.
+  `layer_prior(scores, weights: dict[int, float])`. As built: `usage_ratio_scores(..., eps=1e-3)` and
+  `random_scores(model, seed, *, layers=None)`.
 - `group_channels(scores, *, bands=4, layers=None) -> list[ChannelGroup]`: groups by layer x
   score quantile band; every channel in exactly one group; deterministic names `"L{layer}/b{band}"`.
 - `density_matched_random(selection, model, seed) -> ChannelSelection`: same per-layer counts.
@@ -186,33 +196,36 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
 
 ### 1.8 `probe.py` and `tracker.py` — evidence and capability curves
 
-- `CapabilityProbe(sampler, score_fn, *, transfer_slices, retention_slices, items_per_slice)`:
+- `CapabilityProbe(sampler, score_fn, *, transfer_slices, retention_slices, items_per_transfer_slice,
+  items_per_retention_slice)` (as built: two sizes; at least one retention slice is required):
   `evidence(model, incumbent: StateSnapshot, decision_index, *, attempt: int = 0, alarm=False) -> GateEvidence`
   draws fresh items for `(decision_index, attempt)`, scores the candidate (current weights) and
   the incumbent (via `weights.swapped`) on the same items.
 - `StartMap`: pass@1 (greedy) and pass@k (sampled, k configurable, default 16 on CPU) of the
-  start checkpoint per slice.
-- `CapabilityTracker(sampler, score_fn, start)` → `measure(model, step, reward_v1) -> CapabilityPoint`
+  start checkpoint per slice. As built it lives in `probe.py` (`StartMap.measure(...)`) and
+  `tracker.py` re-exports it.
+- `CapabilityTracker(sampler, score_fn, start, *, items_per_slice)` → `measure(model, step, reward_v1) -> CapabilityPoint`
   with A (acquisition on fresh TRAIN items), R per retention slice, T_task, T_rule, and
   D(t) = [reward(t) - reward(0)] - [T_rule(t) - T_rule(0)]; `to_dict`.
 
 ### 1.9 `loop.py` and `operators.py` — the gated loop (framework-agnostic)
 
-- `GateController(gate, probe, *, rollback_unit, channel_groups=None)`:
-  `run(model, operator, incumbent, decision_index, update_index, alarm, reward_v1) -> tuple[DecisionRecord, StateSnapshot]`
+- `GateController(gate, probe, *, rollback_unit, channel_groups=None, damage_texts_fn=None, tokenizer=None,
+  damage_batch_size=8)`:
+  `run(model, operator, incumbent, decision_index, update_index, alarm, reward_v1, reward_v2=None) -> tuple[DecisionRecord, StateSnapshot]`
   implementing: ACCEPT if transfer bound > 0 and every retention slice passes and no alarm; HOLD
   if retention passes but transfer is not confirmed (counts toward `hold_limit`); otherwise try
   SHRINK for each lambda (fresh items each time), then (only for `RollbackUnit.CHANNELS`) group
   rollback in damage order up to `max_group_rollbacks`, then ROLLBACK (params + optimizer state
   restored to the incumbent). A confirmed alarm (alarm and retention or transfer fails) goes to
   ROLLBACK directly. Returns the record and the new incumbent.
-- `GatedLoop(model, operator, controller, alarm, *, config, recorder=None, log_path=None)`:
+- `GatedLoop(model, operator, controller, alarm, *, config, recorder=None, log_path=None, allow_short_horizon=False)`:
   `run(num_updates)`; a decision every `block_updates` updates and immediately on an alarm
   (if `alarm_triggers_decision`); writes one JSON line per `DecisionRecord`; with
   `gate.enabled=False` it never rolls back but still measures and logs (ungated arm); the
   operator receives only the decision. `state_dict()` / `load_state_dict()` cover incumbent,
   decision index, ledger, sampler position, alarm state, hold counter, operator state.
-- `operators.TorchGRPOOperator(model, tokenizer, sampler, v1, v2, *, group_size, prompts_per_update, lr, max_new_tokens, temperature, optimizer=None, screen=True, seed)`:
+- `operators.TorchGRPOOperator(model, tokenizer, sampler, v1, v2, *, group_size, prompts_per_update, lr, max_new_tokens, temperature, optimizer=None, screen=True, seed, name="grpo")`:
   minimal on-policy GRPO (sampled completions, group-normalised V1 rewards, screened rollouts
   get advantage 0, one optimizer step per update) used by the pilot's backprop control arm.
   Works with a plain `torch.optim.AdamW` or a `HookedOptimizer` (e.g. with a `MaskRule` for a
@@ -220,17 +233,18 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
 
 ### 1.10 `trl_gate.py` — the gate inside the existing TRL GRPO path
 
-- `CapabilityGateCallback(probe, gate, *, block_updates, rollback_unit, channel_groups=None, log_path=None)`:
+- `CapabilityGateCallback(probe, gate, *, block_updates, rollback_unit, channel_groups=None, log_path=None, alarm=None)`:
   a `transformers.TrainerCallback` that is also a `StatefulComponent` (register it in the
   trainer's `research_components` so it travels with checkpoints). `on_train_begin` captures the
   incumbent (trainable params + optimizer state + HookedOptimizer masters) and **refuses**
-  (ValueError) a `block_updates` whose micro-batch count is not a multiple of
-  `steps_per_generation * num_iterations` (so a decision never lands inside TRL's buffered
-  generation batch); `on_step_end` at block boundaries runs the `GateController` on the
+  (ValueError) a `block_updates` whose micro-batch count (as built: `block_updates *
+  gradient_accumulation_steps`) is not a multiple of `steps_per_generation * num_iterations` (so a
+  block decision never lands inside TRL's buffered generation batch; an off-boundary alarm
+  decision that changes the weights sets `trainer._buffered_inputs = None`); `on_step_end` at block boundaries runs the `GateController` on the
   trainer's model and optimizer. Must verify against TRL 1.18 source that after a rollback the
   next step regenerates from the restored weights (no stale buffered rollouts or old log-probs);
   if TRL keeps a buffer across the boundary, invalidate it explicitly and test it.
-- `DisagreementScreen(v1, v2, alarm, tokenizer)`: an `research_rl.trainers.rl_common.AdvantageShaper`
+- `DisagreementScreen(v1, v2, alarm, tokenizer, *, max_new_tokens, answers=None, answer_column="answer")`: an `research_rl.trainers.rl_common.AdvantageShaper`
   that decodes the batch's completions, applies V2, zeroes the advantage of V1-pass/V2-fail rows
   (`signal` False for them) and feeds the alarm; stateful (alarm state) for resume.
 - Integration test: `ResearchGRPOTrainer` (via the existing GRPO adapter) on the tiny model with
@@ -239,7 +253,8 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
 
 ### 1.11 `search.py` — subset search with capability as the objective
 
-- `SubsetSearch(groups, make_operator, probe, *, rounds, burst_updates, survivors_fraction=0.5, repeats_final=2, controls=("random", "whole_layer", "unrestricted"))`:
+- `SubsetSearch(groups, make_operator, probe, *, rounds, burst_updates, survivors_fraction=0.5, repeats_final=2, controls=("random", "whole_layer", "unrestricted"), penalty=1.0, margin=0.02, seed=0, items_per_transfer_slice=None, items_per_retention_slice=None, index=0, pool="track")`,
+  `run(model, *, update_offset=0) -> SearchReport`:
   successive halving; every candidate subset starts from the same snapshot, gets a short burst
   with its own operator, is scored on fresh items by the transfer gain point estimate and the
   worst retention drop (objective = gain - penalty * max(0, worst_drop - margin)); finalists are
@@ -253,11 +268,13 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
   `scale` multiplies the channels' `down_proj` columns (and optionally `up_proj` rows) by
   `params["factor"]`; `revert` and `interpolate` use a named reference version; `apply_delta`
   uses a stored delta id. No free-form code, ever.
-- `VersionStore(root)`: versions are immutable records (id, parent id, edits, gate verdict or
+- `VersionStore(root, model, *, channel_layers=None)` (as built the store is bound to one live model;
+  `init_from_model(note="")` records the root version): versions are immutable records (id, parent id, edits, gate verdict or
   `override` reason, model fingerprint, created) persisted as JSON; the channel state of each
-  version is stored with safetensors (never pickle). `stage(edit)`, `evaluate(staged, gate, probe)`,
-  `commit(staged, *, override: str | None)` (refused if the gate did not pass and no override
-  reason is given), `restore(version_id)`, `history()`; scope verification
+  version is stored with safetensors (never pickle). `stage(edit)`, `discard(staged)`,
+  `evaluate(staged, gate_config, probe)` (the store's own persisted ledger),
+  `commit(staged, *, override: str | None = None, note="")` (refused if the gate did not pass and no override
+  reason is given), `restore(version_id)`, `history()`, plus `add_delta`, `delta_between`, `diff`; scope verification
   (`verify_modification_scope`) is run and stored for every commit.
 
 ### 1.13 `research_rl/ui/` — local search + edit tool
@@ -276,7 +293,9 @@ commit / discard, version history and restore, training view (reads a run's deci
 
 ### 1.14 Pilot
 
-- `examples/capability_pilot_tiny.py`: P0 on CPU. Builds a tiny Llama from scratch, SFT on
+- `examples/capability_pilot_tiny.py`: P0 on CPU (as built a thin CLI over
+  `research_rl.capability.pilot.run_pilot`; the full default config is 48 arms = 4 operators x 2 gates
+  x 2 variants x 3 seeds). Builds a tiny Llama from scratch, SFT on
   atomic skills (low start: depth-2 pass@1 low, pass@k small but measured), then arms
   {GRPO, ES full, ES informed subset, ES random subset} x {gate off, gate on} x seeds, on a
   planted-leak and a clean variant. Writes `results.json` and `summary.md` with A, T_rule, R,
@@ -373,3 +392,356 @@ See section 4.5 of the feasibility report. Restated as the pilot's pass/fail rul
 
 The oracle for the gate's error rates is the exact verifier on a large fresh AUDIT-free
 evaluation (T_rule) measured before and after each block.
+
+## 4. As built (wave 3): module map, quickstart, limits
+
+This section describes the code as it exists. Where sections 1.1-1.14 and the code differ, the
+code, its docstrings and sections 1.15/1.16 win. Section 3 (the kill criteria) is unchanged.
+
+### 4.1 Module map
+
+| Module | What it does | Main public names | Tests |
+|---|---|---|---|
+| `types.py` | shared data types and protocols (no behaviour) | `Split`, `Item`, `ScoreFn`, `PairedScores`, `GateEvidence`, `GateVerdict`, `GateDecision`, `DecisionRecord`, `OperatorReport`, `UpdateOperator`, `ParameterSpace`, `RollbackUnit`, `ChannelGroup` | through every other test |
+| `tasks.py` | operator-composition generators, functional split disjointness, sampler, verifiers, score function | `OperatorSet`, `CompositionSplits`, `ItemSampler`, `sft_examples`, `ExactAnswerVerifier`, `SuffixLeakVerifier`, `VerifierScoreFn`, `make_score_fn`, `AuditAccessError` | `test_capability_tasks.py` |
+| `stats.py` | paired tests (exact sign test, Tango score test, fractional variants), sample sizes, alpha ledger | `paired_gain_lower_bound`, `noninferiority_upper_bound`, `required_paired_n`, `retention_power_floor_n`, `AlphaLedger` | `test_capability_stats.py` (calibration by simulation) |
+| `gate.py` | the pure verdict on one `GateEvidence` | `GateConfig`, `CapabilityGate` | `test_capability_gate.py` |
+| `alarm.py` | tier-1 V1/V2 disagreement alarm (CUSUM + length collapse), screening, static leak audit | `DisagreementAlarm`, `AlarmState`, `screen_mask`, `static_leak_audit`, `strict_math_verifier` | `test_capability_alarm.py` |
+| `weights.py` | exact snapshots, swaps, interpolation, channel-group damage order and revert | `StateSnapshot`, `capture`, `restore`, `swapped`, `interpolate`, `channel_groups_by_damage`, `revert_groups` | `test_capability_weights.py` |
+| `scores.py` | forward-only channel statistics, scorers and grouping | `collect_channel_stats`, `wanda_scores`, `contrast_scores`, `usage_ratio_scores`, `random_scores`, `group_channels`, `density_matched_random` | `test_capability_scores.py` |
+| `spaces.py` | parameter spaces for forward-only operators | `ChannelGainSpace`, `ChannelWeightSpace`, `FullParameterSpace` | `test_capability_spaces.py` |
+| `es.py` | evolution-strategies update operator (no backward pass) | `ESConfig`, `ESOperator`, `FitnessResult`, `shape_fitness` | `test_capability_es.py` |
+| `probe.py` | gate evidence on fresh items, start map | `CapabilityProbe`, `StartMap`, `SliceStart`, `score_items` | `test_capability_probe.py` |
+| `tracker.py` | capability curves A, R, T_task, T_rule and D(t) | `CapabilityTracker`, `CapabilityPoint` | `test_capability_tracker.py` |
+| `loop.py` | the gate procedure and the gated loop (decision log, resume, horizon check) | `GateController`, `GatedLoop`, `classify_verdict`, `worst_case_verdicts`, `REASON_*` | `test_capability_loop.py` |
+| `operators.py` | minimal on-policy GRPO (the backprop control arm) | `TorchGRPOOperator`, `group_advantages` | `test_capability_operators.py` |
+| `trl_gate.py` | the gate inside TRL's GRPO path (lazy export, imports `transformers`) | `CapabilityGateCallback`, `DisagreementScreen` | `test_capability_trl_gate.py` |
+| `search.py` | successive-halving subset search with capability as the objective | `SubsetSearch`, `SearchReport`, `STATEMENT` | `test_capability_search.py` |
+| `edits.py` | declarative channel edits and the immutable, gate-checked version graph | `EditOp`, `EditRecord`, `VersionStore`, `Version`, `StagedEdit` | `test_capability_edits.py` |
+| `pilot.py` | the P0 pilot pipeline and the section-3 criteria evaluation | `PilotConfig`, `smoke_config`, `run_pilot`, `evaluate_criteria` | `test_capability_pilot.py` |
+| `research_rl/ui/` | local channel search + edit tool (stdlib HTTP server, static front end) | `python -m research_rl.ui` | `test_ui.py` |
+| `examples/capability_pilot_tiny.py` | CLI of the P0 pilot | `--smoke`, `--output-dir`, `--arms`, `--jobs` | `test_capability_pilot.py` |
+| `scripts/gpu/capability_p1.py` | P1 on a local 7-8B checkpoint, one GPU (**NOT_TESTED**; only `--dry-run` on CPU is tested) | | `test_capability_p1_script.py` |
+
+Imports: `research_rl/capability/__init__.py` re-exports every module's `__all__` (and the shared
+types), so `from research_rl.capability import GatedLoop, ESOperator` works. The `trl_gate` names
+(`CapabilityGateCallback`, `DisagreementScreen`, `GATE_COMPONENT`, `base_optimizer`,
+`generate_every`) are resolved lazily on first attribute access: `import research_rl.capability`
+does not import `trl_gate`, `research_rl.trainers` or TRL. The intra-package imports form a DAG
+(checked by `tests/research_rl/test_capability_exports.py`, which also imports every module as the
+first module in a fresh interpreter). The full API reference is in [API.md](API.md).
+
+### 4.2 Quickstart
+
+Every block below is executed verbatim by `tests/research_rl/test_capability_exports.py` (the
+blocks marked `quickstart:` are extracted from this file; the shell blocks are run with
+`--port 0` / `--store <tmp>` and a temporary `--output-dir` substituted). They run on CPU with
+tiny, randomly initialised models built in-process: they show the plumbing, and **every number
+they print is a smoke value, not a result**.
+
+**Splits, sampler and score function.**
+
+<!-- quickstart:splits -->
+```python
+from research_rl.capability import (
+    CompositionSplits,
+    ExactAnswerVerifier,
+    ItemSampler,
+    OperatorSet,
+    Split,
+    make_score_fn,
+)
+from research_rl.models.tiny import build_char_tokenizer, build_tiny_llama
+
+tokenizer = build_char_tokenizer()
+splits = CompositionSplits.build(OperatorSet(seed=0, num_operators=10), seed=0)
+splits.check_disjoint()  # raises SplitIntegrityError on any rule-level or functional overlap
+print({name: split.value for name, split in splits.slices().items()})
+
+sampler = ItemSampler(splits, root_seed=1)  # drawing from Split.AUDIT raises AuditAccessError
+items = sampler.draw(Split.T_RULE, 4, purpose="demo", index=0, slice="t_rule/unseen_pairs")
+print(items[0].prompt, "->", items[0].answer, items[0].rule)
+
+# strict verifier V2; max_new_tokens >= longest answer + 1 (a truncated completion scores 0)
+score_fn = make_score_fn(tokenizer, ExactAnswerVerifier(), max_new_tokens=8, batch_size=32)
+model = build_tiny_llama(len(tokenizer), seed=0)  # random weights: expect all zeros
+print(score_fn(model, items))
+```
+
+**One `GatedLoop` run with `ESOperator`** (continues the block above). The fitness is the mean
+log-probability of the answer, because a greedy pass rate is flat on random weights and ES would
+take a zero step; V1 (a planted suffix leak) and V2 (exact) grade the greedy rollouts for the
+alarm. The gate uses `per_decision` alpha and small slices to stay fast; see 4.3 before choosing
+real settings. The alarm keeps its calibrated defaults: 4 members x 32 shared items give
+`n_eff = 32`, the smallest size inside its false-alarm scope (4.3, "Alarm scope").
+
+<!-- quickstart:loop -->
+```python
+import tempfile
+from pathlib import Path
+
+import torch
+
+from research_rl.capability import (
+    CapabilityGate,
+    CapabilityProbe,
+    ChannelGainSpace,
+    DisagreementAlarm,
+    ESConfig,
+    ESOperator,
+    FitnessResult,
+    GateConfig,
+    GateController,
+    GatedLoop,
+    RollbackUnit,
+    SuffixLeakVerifier,
+    VerifierScoreFn,
+)
+from research_rl.models.ffn_channels import ChannelSelection
+
+config = GateConfig(
+    alpha_schedule="per_decision",  # the guarantee then holds per verdict only (see 4.3)
+    retention_margin=0.2,
+    hold_limit=2,
+    block_updates=2,
+    items_per_transfer_slice=16,
+    items_per_retention_slice=64,
+)
+v1 = VerifierScoreFn(tokenizer, SuffixLeakVerifier(k=2), max_new_tokens=8, batch_size=32)
+v2 = VerifierScoreFn(tokenizer, ExactAnswerVerifier(), max_new_tokens=8, batch_size=32)
+
+
+def answer_logprob(m, batch):
+    """Mean log-probability of the answer characters after the prompt (teacher forcing)."""
+    total = 0.0
+    for it in batch:
+        p = tokenizer(it.prompt, add_special_tokens=False)["input_ids"]
+        a = tokenizer(it.answer, add_special_tokens=False)["input_ids"]
+        logp = torch.log_softmax(m(input_ids=torch.tensor([p + a])).logits[0].float(), -1)
+        total += float(logp[torch.arange(len(p) - 1, len(p) + len(a) - 1), torch.tensor(a)].mean())
+    return total / len(batch)
+
+
+def fitness(m, update_index, member_index):
+    # items depend on update_index only: every member is scored on the same 32 items
+    batch = sampler.draw(Split.TRAIN, 32, purpose="es", index=update_index)
+    texts = v1.generate(m, batch)
+    truncated = v1.truncated(texts)
+    s1 = v1.score_completions(texts, batch, truncated)
+    s2 = v2.score_completions(texts, batch, truncated)
+    return FitnessResult(
+        reward_v1=answer_logprob(m, batch),
+        reward_v2=sum(s2) / len(s2),
+        v1_pass=tuple(s == 1.0 for s in s1),
+        v2_pass=tuple(s == 1.0 for s in s2),
+        lengths=tuple(len(tokenizer(t, add_special_tokens=False)["input_ids"]) for t in texts),
+        extra={"extra_forward_passes": len(batch)},  # the teacher-forced forwards
+    )
+
+
+space = ChannelGainSpace(model, ChannelSelection({0: list(range(16)), 1: list(range(16))}))
+es = ESOperator(space, fitness, ESConfig(population=4, sigma=0.1, lr=0.01, seed=0))
+probe = CapabilityProbe(
+    sampler,
+    score_fn,
+    transfer_slices=("t_rule/unseen_pairs",),
+    retention_slices=("retention/atomic",),
+    items_per_transfer_slice=config.items_per_transfer_slice,
+    items_per_retention_slice=config.items_per_retention_slice,
+)
+controller = GateController(CapabilityGate(config), probe, rollback_unit=RollbackUnit.CHANNELS)
+# ES: rollouts_per_unit=<population>, so n_eff = 32 shared items = the default min_rollouts,
+# the smallest size inside the alarm's calibrated false-alarm scope (see 4.3, "Alarm scope")
+alarm = DisagreementAlarm(rollouts_per_unit=4)
+workdir = Path(tempfile.mkdtemp(prefix="capability_quickstart_"))
+loop = GatedLoop(model, es, controller, alarm, config=config, log_path=workdir / "decisions.jsonl")
+records = loop.run(4)  # a decision every block_updates=2 updates
+for r in records:
+    print(r.update_index, r.decision.value, r.reason, r.reward_v1)
+print(es.forward_passes_total, "forward passes, 0 backward passes")
+```
+
+On the random model the transfer test cannot pass, so both decisions are `hold`
+(`no_transfer_gain`); a third would be a `rollback` (`hold_limit`). `decisions.jsonl` holds one
+`DecisionRecord` per line, with `reward_v1` beside the verdicts (here `reward_v1` is the ES
+fitness, a mean log-probability, not a V1 pass rate).
+
+**A `VersionStore` edit cycle** (continues the blocks above; a fresh model, and a probe with its
+own sampler seed so that edit evaluations never reuse a run's gate items):
+
+<!-- quickstart:edits -->
+```python
+from research_rl.capability import EditOp, EditRecord, VersionStore
+
+edit_model = build_tiny_llama(len(tokenizer), seed=1)
+edit_probe = CapabilityProbe(
+    ItemSampler(splits, root_seed=2),
+    score_fn,
+    transfer_slices=("t_rule/unseen_pairs",),
+    retention_slices=("retention/atomic",),
+    items_per_transfer_slice=16,
+    items_per_retention_slice=64,
+)
+store = VersionStore(workdir / "store", edit_model)  # JSON records + safetensors, never pickle
+root = store.init_from_model(note="start")
+staged = store.stage(EditRecord(op=EditOp.ABLATE, selection={0: [1, 4]}, note="ablate 2 channels"))
+verdict = store.evaluate(staged, config, edit_probe)  # spends the store's own alpha ledger
+if verdict.transfer_ok and verdict.retention_ok:
+    version = store.commit(staged)
+else:  # a commit without a passing verdict needs a recorded reason
+    version = store.commit(staged, override="quickstart: manual override")
+print(version.id[:12], version.passed, version.override)
+
+staged = store.stage(EditRecord(op=EditOp.SCALE, selection={1: [0]}, params={"factor": 0.5}))
+store.discard(staged)  # back to the head version, bit-exact
+store.restore(root.id)  # back to the root version, bit-exact (the frame must be unchanged)
+print([v.id[:12] for v in store.history()], len(store.versions()))
+```
+
+**The local UI** on a random tiny model (binds 127.0.0.1; prints the URL with the session token
+once; `--store` defaults to a new temporary directory). For a local Hugging Face checkpoint use
+`--model-dir DIR --store DIR` (safetensors only; large checkpoints and GPU use are NOT_TESTED).
+
+<!-- quickstart:ui -->
+```bash
+python -m research_rl.ui --tiny-demo
+```
+
+Edit evaluations spend the store's own alpha ledger, which persists in the store directory. At the
+UI defaults (512 retention items, margin 0.02, spending) an edit with no candidate-only retention
+wins cannot pass retention from the 8th evaluation of a store on; there is no horizon warning (see
+4.3, "Horizon").
+
+**The pilot smoke run** (two arms, one seed, the leak variant; about 20 s on the 4-core development container). It is a
+plumbing check: with one seed every section-3 criterion is `INCONCLUSIVE` by construction, and its
+numbers are not results.
+
+<!-- quickstart:pilot -->
+```bash
+python examples/capability_pilot_tiny.py --smoke --output-dir runs/capability_pilot_smoke
+```
+
+The full P0 run is `python examples/capability_pilot_tiny.py --output-dir runs/pilot_p0 --jobs 4`
+(48 arms; the CLI prints a measured ETA first). `scripts/gpu/capability_p1.py` is NOT_TESTED.
+
+### 4.3 Limits and the scope of the statistical guarantees
+
+**Verification.** Everything is verified on CPU with tiny models (tens of thousands of parameters,
+character tokenizer, built in-process). Nothing has run on a GPU or on a 7-8B model. NOT_TESTED:
+`scripts/gpu/capability_p1.py` (beyond `--dry-run` on CPU), `CapabilityGateCallback` with GPU,
+vLLM, PEFT or DeepSpeed / FSDP, CUDA RNG handling in `search.py`, the UI against a real
+checkpoint, and every GPU memory or throughput figure. Tiny-model pilot results are not
+evidence about large-model training.
+
+**What a verdict guarantees.** Each call of `CapabilityGate.verdict` consumes one alpha from the
+ledger. An accept needs every test of the verdict to reject its H0 (intersection-union, no alpha
+split): transfer H0 "candidate not better" on the pooled transfer slices (exact one-sided sign
+test on the discordant pairs; the reported `bound` is conditional on the number of discordant
+pairs, the decision is exact) and, per retention slice, H0 "drop >= margin" (Tango's score test,
+an asymptotic test whose false-pass rate is checked at alpha = 0.05 by simulation and by exact
+trinomial enumeration in `test_capability_stats.py` for n in {50, 200} and discordance {0.1, 0.3},
+where its size may exceed alpha by up to 0.006; it is not an exact finite-sample guarantee).
+The guarantee is about the **slice distributions of the synthetic generators**, scored by V2 on
+items drawn fresh for that verdict and paired between incumbent and candidate. It says nothing
+about tasks outside the probe slices, nothing about failures V2 itself cannot see, and nothing
+about power: a real improvement can be rejected (HOLD), and the pilot measures false rejects
+against the oracle instead of assuming them away.
+
+**Per decision versus spending schedule.**
+
+- `alpha_schedule="per_decision"`: every verdict runs at `alpha`. The type-I guarantee holds per
+  verdict only; over K verdicts up to `K * alpha` false accepts are expected under H0.
+- `alpha_schedule="spending"` (default): verdict k runs at `alpha * 6 / (pi^2 k^2)`; the sum
+  stays below `alpha`, so P[any false accept in the run] <= `alpha` (Bonferroni over verdicts).
+  It covers every verdict of the run, the SHRINK and group re-tests included (each consumes its
+  own alpha), and it covers accepts (promotions), not the remedy choices. For the retention part
+  the bound is nominal: it inherits the asymptotic approximation of Tango's test, which is not
+  calibrated by simulation at the small spending-schedule alphas.
+- The disabled-gate arm (`enabled=False`) and `VersionStore.evaluate` use their own ledgers, so
+  they never spend a gated run's alpha; `edits` evaluations are budgeted separately.
+
+**Horizon.** Under spending, alpha shrinks like `1/k^2`, so a retention slice of fixed size
+becomes unpassable after a finite number of verdicts even with zero observed drop
+(`GateConfig.retention_horizon`, `stats.retention_power_floor_n`). The budget is counted in
+verdicts, not decisions: one decision uses up to `1 + len(shrink_lambdas) +
+min(max_group_rollbacks, len(channel_groups))` verdicts (3 at the defaults without channel
+groups, 7 with at least 4 groups), and with `alarm_triggers_decision` every update that does not
+end a block can end in an alarm decision of one verdict instead (`loop.worst_case_verdicts`: `b`
+block decisions plus `num_updates - b` alarm decisions). `GatedLoop.run(num_updates)`
+compares that worst-case verdict count with `GatedLoop.horizon()` before the first update and
+raises `ValueError` (or warns with `allow_short_horizon=True`); a verdict that cannot pass for
+that reason is labelled `horizon_exhausted`. As pinned in 1.16, the start check does **not**
+assume zero discordance: it assumes `n10 = round(0.005 n)` incumbent-only wins and no
+candidate-only win per retention slice (an observed drop of about 0.5 %), which at 2048 items
+allows about 100 times fewer verdicts than the zero-discordance ceiling. `CapabilityGateCallback`
+(TRL) does not run this check. The figures below are for alpha = 0.05, spending and the other
+`GateConfig` defaults (`block_updates=8`, `shrink_lambdas=(0.5, 0.25)`, `max_group_rollbacks=4`,
+alarm decisions on, CHANNELS rollback unit); `test_capability_exports.py` recomputes every cell
+with the code (`retention_horizon()`, a real `GatedLoop`'s `horizon()` and `check_horizon`).
+
+<!-- horizon-table -->
+| Setting | Retention items per slice | Margin | Last passable verdict, zero discordance (`retention_horizon()`) | Last verdict the `GatedLoop` start check allows (`horizon()`, `n10 = round(0.005 n)`) | Largest accepted `run(num_updates)`, 3 verdicts per decision | Largest accepted `run(num_updates)`, 7 verdicts per decision |
+|---|---|---|---|---|---|---|
+| `GateConfig()` defaults | 2048 | 0.02 | 24 495 | 243 | 195 | 141 |
+| UI defaults (`WorkspaceConfig`) | 512 | 0.02 | 7 | 1 | 1 | 1 |
+
+So a fresh `GatedLoop` at the defaults accepts runs of at most 141 updates (with the group stage;
+195 without it), and with 512 retention items only `run(1)`: no run that reaches a block decision.
+Size a longer run before starting it with `GatedLoop.horizon()` / `check_horizon(num_updates)` (the
+pilot does this with `pilot.choose_retention_items`): more retention items, a larger margin or a
+larger alpha.
+
+**`VersionStore.evaluate` runs no horizon check** and has no `horizon_exhausted` label (nor does
+the UI built on it). An evaluation past the zero-discordance ceiling is reported only as
+`retention_ok=False`, even for an edit with no observed drop. The store's ledger lives in
+`ledger.json`, persists across sessions and counts every evaluation, including evaluations of
+edits that were discarded afterwards. At the UI defaults (512 retention items, margin 0.02, alpha
+0.05, spending) the ceiling is 7: from the 8th evaluation of a store on, an edit with no
+candidate-only retention wins (in particular one that changes no retention answer) cannot pass
+retention, and committing it needs a recorded override reason. Candidate-only wins lower the
+p-value and extend the ceiling (`retention_horizon(n01=...)`), but a random tiny demo model has
+none. Remedies: a larger
+`--items-retention` (2048 items raise the ceiling to 24 495 evaluations), a larger
+`--retention-margin`, or a new `--store` directory, which starts a new ledger (the false-accept
+guarantee is then per store, not across stores). The first evaluation pins the ledger's alpha and
+schedule, so `--alpha` / `--alpha-schedule` cannot be changed for an existing store.
+
+**Alarm scope.** `DisagreementAlarm` is a heuristic early-warning signal, not a calibrated test.
+Its documented false-alarm level (at most 2 % of clean 200-update streams with any gap alarm, at
+the defaults `drift=0.1`, `threshold=0.3`; simulated in `test_capability_alarm.py`) is stated only
+for `n_eff >= 32` independent units per update (the default `min_rollouts`) and a per-update gap
+variance `sigma^2 / n_eff <= 0.1 / 32`. `n_eff` is the Kish effective size: ES members scored on
+the same items count once per item, so ES callers build the alarm with
+`rollouts_per_unit=population` and score at least 32 shared items per update (as the quickstart
+does). Outside that scope the level does not hold, and lowering `min_rollouts` requires raising
+`threshold` or `drift` and re-running the simulation. For example (400 clean, stationary 200-update
+streams, `random.Random(0)`, V2 never passing; recomputed by `test_capability_exports.py`), 4
+members x 8 shared items with `min_rollouts=8` and the default threshold and drift alarmed on
+36 % (V1-only share 0.05) and 64.5 % (share 0.1) of the streams, against 0 % and 0.25 % with 32
+independent items. Every such alarm forces an
+`alarm_hold` or `confirmed_alarm` decision that has nothing to do with reward hacking.
+
+**Subset search.** `SubsetSearch` ranks candidate channel subsets by noisy point estimates
+(transfer gain minus a retention penalty after one short seeded burst, on a finite set of fresh
+items). It runs no statistical test and makes no optimality claim: the winner is not shown to be
+the best subset, finalist repeats average item noise only (not training noise), and the controls
+match the per-candidate burst budget, not the total compute spent on selection
+(`search.STATEMENT` is the default of every `SearchReport.statement`).
+
+**ES versus backprop.** ES is the forward-only operator because "no backpropagation" is a design
+constraint of this build, not because it is expected to be stronger. Nothing here claims ES
+matches or beats gradient training; the pilot's Operator criterion (section 3) only asks whether
+ES reaches half of GRPO's T_rule gain within ten times its forward-pass-equivalent budget, and the
+`ESConfig` defaults were validated only on CPU toy problems.
+
+**Security.** Nothing in this package executes untrusted code (edits are declarative records;
+the code-execution reward of `research_rl.rewards` stays disabled by default and is not used).
+The UI binds 127.0.0.1 by default and needs the session token on every API request; the AUDIT
+split is not reachable through it. Model weights (UI `--model-dir`, the pilot's start checkpoint,
+the P1 script) and version-store channel states and deltas are read with safetensors only; pickle
+weight files are refused. Resume state, including incumbent snapshots, is not safetensors:
+`CapabilityGateCallback` state travels in ResearchRL's checkpoint file
+`research_rl_components.pt` (written with `torch.save`, read only with
+`torch.load(weights_only=True)`, the restricted unpickler), and `GatedLoop.state_dict()` is a
+plain dict meant for the same `torch.save` / `torch.load(weights_only=True)` pair; only load
+checkpoints you produced. No API key or token is written to disk (the UI token is printed once and kept in memory).

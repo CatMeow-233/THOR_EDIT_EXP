@@ -8,3 +8,4 @@ for ex in sft_tiny dpo_tiny distillation_tiny grpo_math_tiny rloo_math_tiny; do
   python "examples/${ex}.py" --output-dir "${OUT}/${ex}" --max-steps 2
   echo "::endgroup::"
 done
+python examples/capability_pilot_tiny.py --smoke --output-dir "${OUT}/capability_pilot_tiny"

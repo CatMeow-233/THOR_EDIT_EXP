@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channel Edit Lab</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>Channel Edit Lab</h1>
+    <span class="sub">research_rl.capability &mdash; local search + edit tool</span>
+  </div>
+  <div id="status-line" class="status-line">connecting&hellip;</div>
+</header>
+
+<section id="honesty" class="banner" aria-live="polite">
+  <strong>Where these numbers come from:</strong>
+  <span id="honesty-text">every number on this page is computed by the model loaded in the server process on this machine.</span>
+  <span id="tiny-note" class="tiny-note hidden"></span>
+</section>
+
+<section id="token-box" class="card hidden">
+  <h2>Session token</h2>
+  <p>Paste the token printed by <code>python -m research_rl.ui</code> (the part after <code>#token=</code>). It is kept in this page's memory only.</p>
+  <form id="token-form" class="row">
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="session token">
+    <button type="submit">Connect</button>
+  </form>
+</section>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-tab="search" role="tab">Search</button>
+  <button class="tab" data-tab="inspect" role="tab">Inspect</button>
+  <button class="tab" data-tab="edit" role="tab">Edit</button>
+  <button class="tab" data-tab="versions" role="tab">Versions</button>
+  <button class="tab" data-tab="training" role="tab">Training</button>
+</nav>
+
+<main>
+<!-- ======================================================== Search -->
+<section id="tab-search" class="panel active">
+  <div class="grid2">
+    <div class="card">
+      <h2>1. Collect channel statistics</h2>
+      <p class="hint">Forward passes on fresh prompts of one split (track pool, never gate items). AUDIT is not available.</p>
+      <form id="stats-form" class="form">
+        <label>Split
+          <select id="stats-split">
+            <option value="train">train</option>
+            <option value="retention">retention</option>
+            <option value="t_rule">t_rule</option>
+            <option value="t_task">t_task</option>
+          </select>
+        </label>
+        <label>Prompts <input id="stats-n" type="number" min="1" max="1024" value="128"></label>
+        <label>Activation threshold <input id="stats-threshold" type="number" min="0" step="0.001" value="0.01"></label>
+        <label class="check"><input id="stats-contrast" type="checkbox"> V2-correct vs incorrect contrast (greedy completions)</label>
+        <button type="submit">Collect</button>
+      </form>
+      <div id="stats-job" class="job"></div>
+      <h3>Stored scores</h3>
+      <table class="data" id="scores-table"><thead><tr><th>score</th><th>available</th><th>stale</th><th>source</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>2. Rank channels</h2>
+      <form id="rank-form" class="form">
+        <label>Score
+          <select id="rank-score">
+            <option value="wanda">wanda</option>
+            <option value="contrast">contrast</option>
+            <option value="usage_ratio">usage_ratio</option>
+            <option value="random">random</option>
+          </select>
+        </label>
+        <label>Stats split
+          <select id="rank-split">
+            <option value="train">train</option>
+            <option value="retention">retention</option>
+            <option value="t_rule">t_rule</option>
+            <option value="t_task">t_task</option>
+          </select>
+        </label>
+        <label>Layer <input id="rank-layer" type="number" min="0" placeholder="all"></label>
+        <label>Group <input id="rank-group" type="text" placeholder="e.g. L0/b0"></label>
+        <label>Bands <input id="rank-bands" type="number" min="1" max="16" value="4"></label>
+        <label>Top <input id="rank-top" type="number" min="1" max="2000" value="30"></label>
+        <button type="submit">Rank</button>
+      </form>
+      <div id="rank-meta" class="meta"></div>
+      <table class="data" id="rank-table"><thead><tr><th>#</th><th>layer</th><th>channel</th><th>score</th><th>group</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Subset search (capability objective)</h2>
+    <p class="hint">Successive halving over the score's channel groups: each candidate gets a short ES burst on its channels' gains and is scored on fresh held-out items (transfer gain minus a retention-drop penalty). Controls get the same per-candidate budget. The ranking is a noisy point estimate, not a test.</p>
+    <form id="search-form" class="form wide">
+      <label>Score <select id="search-score"><option value="wanda">wanda</option><option value="contrast">contrast</option><option value="usage_ratio">usage_ratio</option><option value="random">random</option></select></label>
+      <label>Stats split <select id="search-split"><option value="train">train</option><option value="retention">retention</option><option value="t_rule">t_rule</option><option value="t_task">t_task</option></select></label>
+      <label>Bands <input id="search-bands" type="number" min="1" max="16" value="2"></label>
+      <label>Layers <input id="search-layers" type="text" placeholder="all, or 0,1"></label>
+      <label>Rounds <input id="search-rounds" type="number" min="1" max="4" value="1"></label>
+      <label>Burst updates <input id="search-burst" type="number" min="1" max="8" value="1"></label>
+      <label>Final repeats <input id="search-repeats" type="number" min="1" max="4" value="1"></label>
+      <label>Transfer items/slice <input id="search-it" type="number" min="1" max="512" value="16"></label>
+      <label>Retention items/slice <input id="search-ir" type="number" min="1" max="2048" value="32"></label>
+      <label>ES population <input id="search-pop" type="number" min="2" max="16" step="2" value="4"></label>
+      <label>ES sigma <input id="search-sigma" type="number" min="0.000001" max="1" step="0.001" value="0.05"></label>
+      <label>ES lr <input id="search-lr" type="number" min="0.000001" max="1" step="0.001" value="0.05"></label>
+      <label>Fitness items <input id="search-fit" type="number" min="1" max="128" value="8"></label>
+      <label>Seed <input id="search-seed" type="number" min="0" value="0"></label>
+      <label class="check"><input id="search-c-random" type="checkbox" checked> random control</label>
+      <label class="check"><input id="search-c-whole" type="checkbox" checked> whole-layer control</label>
+      <label class="check"><input id="search-c-unres" type="checkbox" checked> unrestricted control</label>
+      <button type="submit">Run search</button>
+    </form>
+    <div id="search-job" class="job"></div>
+    <div id="search-result"></div>
+  </div>
+</section>
+
+<!-- ======================================================== Inspect -->
+<section id="tab-inspect" class="panel">
+  <div class="card">
+    <h2>Inspect one channel</h2>
+    <form id="inspect-form" class="row">
+      <label>Layer <input id="inspect-layer" type="number" min="0" value="0"></label>
+      <label>Channel <input id="inspect-channel" type="number" min="0" value="0"></label>
+      <label>Tokens <input id="inspect-k" type="number" min="1" max="100" value="10"></label>
+      <button type="submit">Inspect</button>
+      <button type="button" id="inspect-to-edit" class="secondary">Edit this channel</button>
+    </form>
+    <div id="inspect-meta" class="meta"></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Vocabulary projection of the down_proj column</h3>
+      <p id="proj-method" class="hint"></p>
+      <div class="grid2 tight">
+        <div><h4>Top tokens</h4><table class="data" id="proj-top"><thead><tr><th>token</th><th>id</th><th>logit</th></tr></thead><tbody></tbody></table></div>
+        <div><h4>Bottom tokens</h4><table class="data" id="proj-bottom"><thead><tr><th>token</th><th>id</th><th>logit</th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Activation per split (stored statistics)</h3>
+      <p id="act-note" class="hint"></p>
+      <div id="act-splits"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Change across versions (lineage of the head)</h3>
+    <table class="data" id="chan-versions"><thead><tr><th>version</th><th>edits</th><th>|gate row|</th><th>|up row|</th><th>|down col|</th><th>change from parent</th><th>distance to live</th></tr></thead><tbody></tbody></table>
+    <h3>Stored scores of this channel</h3>
+    <table class="data" id="chan-scores"><thead><tr><th>score</th><th>value</th><th>rank in layer</th><th>stale</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================================================== Edit -->
+<section id="tab-edit" class="panel">
+  <div class="grid2">
+    <div class="card">
+      <h2>Stage a declarative edit</h2>
+      <p class="hint">Edits are data (an EditRecord): an operation, a channel selection and its parameters. No code is accepted.</p>
+      <form id="edit-form" class="form">
+        <label>Operation
+          <select id="edit-op">
+            <option value="ablate">ablate</option>
+            <option value="scale">scale</option>
+            <option value="revert">revert (to a version)</option>
+            <option value="interpolate">interpolate (toward a version)</option>
+            <option value="apply_delta">apply_delta</option>
+          </select>
+        </label>
+        <label>Selection <input id="edit-selection" type="text" placeholder="0: 3,4; 1: 7" required></label>
+        <label class="op-param" data-op="scale apply_delta">Factor <input id="edit-factor" type="number" step="0.01" value="0.5"></label>
+        <label class="op-param check" data-op="scale"><input id="edit-up" type="checkbox"> also scale up_proj rows</label>
+        <label class="op-param" data-op="revert interpolate">Version id <input id="edit-version" type="text" placeholder="64 hex characters"></label>
+        <label class="op-param" data-op="interpolate">lam (share of current kept) <input id="edit-lam" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+        <label class="op-param" data-op="apply_delta">Delta id <input id="edit-delta" type="text" placeholder="64 hex characters"></label>
+        <label>Note <input id="edit-note" type="text" maxlength="10000"></label>
+        <button type="submit">Stage</button>
+      </form>
+      <pre id="edit-preview" class="json"></pre>
+      <div id="stage-result" class="meta"></div>
+    </div>
+    <div class="card">
+      <h2>Evaluate, then commit or discard</h2>
+      <p class="hint">Evaluate runs the capability gate on fresh held-out items (the store's own alpha ledger: every evaluation spends alpha). A commit needs a passing verdict, or a written override reason that is recorded in the version.</p>
+      <div class="row">
+        <button id="btn-evaluate" type="button">Evaluate staged edit</button>
+        <button id="btn-discard" type="button" class="secondary">Discard</button>
+      </div>
+      <div id="eval-job" class="job"></div>
+      <div id="verdict"></div>
+      <form id="commit-form" class="form">
+        <label>Override reason (required if the gate did not pass) <input id="commit-override" type="text" maxlength="10000"></label>
+        <label>Note <input id="commit-note" type="text" maxlength="10000"></label>
+        <button type="submit">Commit</button>
+      </form>
+      <div id="commit-result" class="meta"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================== Versions -->
+<section id="tab-versions" class="panel">
+  <div class="card">
+    <h2>Version history</h2>
+    <div id="versions-meta" class="meta"></div>
+    <table class="data" id="versions-table"><thead><tr><th>version</th><th>parent</th><th>edits</th><th>gate</th><th>override</th><th>note</th><th>created</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================================================== Training -->
+<section id="tab-training" class="panel">
+  <div class="card">
+    <h2>Gated training run (decision log)</h2>
+    <p class="hint">Reads a GatedLoop JSONL decision log from the server's --runs-dir. Training reward is shown beside the gate's capability evidence; reward rising while transfer is not confirmed is the divergence the gate exists to catch.</p>
+    <form id="runs-form" class="row">
+      <select id="runs-select"></select>
+      <button type="submit">Load</button>
+      <button type="button" id="runs-refresh" class="secondary">Refresh list</button>
+    </form>
+    <div id="runs-meta" class="meta"></div>
+    <div id="runs-chart" class="chart"></div>
+    <table class="data" id="runs-table"><thead><tr><th>decision</th><th>update</th><th>outcome</th><th>reason</th><th>reward V1</th><th>reward change</th><th>transfer point</th><th>transfer bound</th><th>worst retention bound / margin</th><th>alarm</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+</main>
+
+<footer class="foot">
+  <span id="foot-text">Local tool. Server binds 127.0.0.1 by default; the session token lives only in this page's memory.</span>
+</footer>
+</body>
+</html>

@@ -3,6 +3,474 @@
 Generated from the module and object docstrings of `research_rl` (public names only).
 See [README.md](README.md) for concepts and [DEPLOY_GPU.md](DEPLOY_GPU.md) for GPU runs.
 
+<!-- capability-api:begin -->
+## `research_rl.capability`
+
+Capability-gated training (see [CAPABILITY.md](CAPABILITY.md)). The package re-exports every public name listed below (each module's `__all__`, and the shared types of `types`), 189 names in all: `from research_rl.capability import GatedLoop, ESOperator`. The `trl_gate` names are resolved lazily on first access, so `import research_rl.capability` does not import `trl_gate`, `research_rl.trainers` or TRL. CPU-verified with tiny models only; every GPU statement is NOT_TESTED.
+
+## `research_rl.capability.alarm`
+
+Tier-1 verifier-disagreement alarm, rollout screening and the static leak audit.
+
+- **class `AlarmState`** — The alarm's output for one update. All fields are finite floats.
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `DisagreementAlarm`** — One-sided CUSUM on the V1-V2 pass-rate gap plus a completion-length collapse flag.
+  - `baseline_gap` — Current gap baseline (partial pooled estimate while not ready, 0.0 before any data).
+  - `baseline_length` — Baseline mean completion length, or None while not fixed (or zero: undefined ratio).
+  - `baseline_ready` — True once the gap baseline is fixed (static, or ``baseline_updates`` reports seen).
+  - `config(self) -> 'dict[str, Any]'` — The constructor arguments as a JSON-able dict (``DisagreementAlarm(**config())``).
+  - `cusum`
+  - `effective_size(self, report: 'OperatorReport') -> 'float'` — Kish effective number of independent units ``n**2 / sum_j s_j**2`` (0.0 if empty).
+  - `gap_alarms` — Number of updates whose state carries ``"gap_cusum"`` (in latched mode this includes skipped reports returned while ``S > threshold``).
+  - `length_alarms` — Number of collapse episodes that set ``alarm``.
+  - `length_baseline_ready`
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore a :meth:`state_dict`; the stored config must equal this alarm's config.
+  - `skipped_updates`
+  - `state_dict(self) -> 'dict[str, Any]'` — JSON-able state (integers and finite floats only); includes the config for checking.
+  - `update(self, report: 'OperatorReport') -> 'AlarmState'` — Feed one operator update; returns the alarm state after it (see :class:`AlarmState`).
+  - `updates` — Reports seen (eligible + skipped).
+- **class `LeakAudit`** — Static comparison of V1 and V2 on a fixed set of completions.
+  - `gap`
+  - `to_dict(self) -> 'dict[str, Any]'`
+- `screen_mask(v1_pass: 'Sequence[Any]', v2_pass: 'Sequence[Any]') -> 'list[bool]'` — Per-rollout keep mask: ``False`` exactly where V1 passes and V2 fails, ``True`` otherwise.
+- `static_leak_audit(completions: 'Sequence[str | None]', references: 'Sequence[Any]', v1: 'Verifier', v2: 'Verifier') -> 'LeakAudit'` — Grade every completion with both verifiers (``verify(completion, reference).correct``).
+- `strict_math_verifier(**overrides: 'Any') -> 'MathVerifier'` — The strict V2 configuration of :class:`MathVerifier` for math.
+- constants: `UNITS_KEY`
+
+## `research_rl.capability.edits`
+
+Declarative FFN-channel edits and an immutable, gate-checked version graph (``CAPABILITY.md`` 1.12).
+
+- **class `CommitRefusedError`** — ``commit`` without a passing gate verdict and without an override reason, or out of scope.
+- **class `EditError`** — An edit (or delta) is malformed or does not fit the model / store. Raised before any write.
+- **class `EditOp`** — The closed set of edit operations (see the module docstring for their exact semantics).
+  - members: `ABLATE`, `REVERT`, `SCALE`, `INTERPOLATE`, `APPLY_DELTA`
+- **class `EditRecord`** — One declarative edit. Validated and normalised on construction (:class:`EditError`).
+  - `channel_selection(self) -> 'ChannelSelection'` — The selection as a :class:`ChannelSelection`.
+  - `copy(self) -> 'EditRecord'` — A re-validated, independent copy (``from_dict(to_dict())``): :class:`EditError` if the record's dicts were mutated into an invalid or non-normalised value.
+  - `from_dict(cls, data: 'Any') -> 'EditRecord'` — Inverse of :meth:`to_dict`. ``op``, ``selection`` and ``params`` are required; unknown keys raise :class:`EditError`.
+  - `from_json(cls, text: 'str') -> 'EditRecord'` — Inverse of :meth:`to_json` (:class:`EditError` on invalid JSON or content).
+  - `references(self) -> 'tuple[str | None, str | None]'` — ``(version id, delta id)`` this edit reads (``None`` where not applicable).
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-shaped dict (string layer keys).
+  - `to_json(self) -> 'str'` — Canonical JSON (sorted keys, no whitespace) of :meth:`to_dict`.
+- **class `StagedEdit`** — Edits applied to the live model on top of ``parent``, not yet committed.
+  - `last_verdict` — The verdict of the most recent evaluation, or ``None``.
+  - `passed` — True iff the last evaluation passed transfer and retention without an alarm.
+- **class `StoreError`** — The store's files are missing, unsafe, corrupted, or do not fit the model.
+- **class `Version`** — An immutable version record (one JSON file ``versions/<id>.json``).
+  - `build(cls, **fields_: 'Any') -> 'Version'` — Construct a version and compute its id from the other fields.
+  - `compute_id(record: 'Mapping[str, Any]') -> 'str'` — SHA-256 hex of the canonical JSON of ``record`` (a JSON-shaped dict without ``id``).
+  - `evaluation_pin(self) -> 'tuple[int, float, str] | None'` — ``(evaluation_index, alpha, alpha_schedule)`` of the recorded evaluation, or ``None`` without a verdict. :class:`EditError` if the context is malformed or its index differs from the verdict's ``decision_index``.
+  - `from_dict(cls, data: 'Any') -> 'Version'` — Strict inverse of :meth:`to_dict`: the id must equal the hash of the stored content and the content must already be in normal form (``from_dict(d).to_dict() == d``).
+  - `passed` — Whether the recorded verdict passed (transfer and retention, no alarm).
+  - `record(self) -> 'dict[str, Any]'` — JSON-shaped dict of every field except ``id`` (the hashed content).
+  - `to_dict(self) -> 'dict[str, Any]'` — The JSON record as stored in ``versions/<id>.json``.
+- **class `VersionStore`** — Immutable version graph of a model's FFN channel state, persisted under ``root``.
+  - `add_delta(self, delta: 'ChannelState') -> 'str'` — Store a delta (per layer: ``channels`` and floating ``gate``/``up``/``down`` (+ biases) increments, shaped like :class:`LayerChannels`); returns its content id. ``module_path`` ``None`` is taken as the model's path. Idempotent for identical content.
+  - `commit(self, staged: 'StagedEdit', *, override: 'str | None' = None, note: 'str' = '') -> 'Version'` — Record the staged edit as a new version (child of its parent) and make it the head.
+  - `delta_between(self, a: 'str', b: 'str', selection: 'Mapping[int, Sequence[int]] | None' = None) -> 'str'` — Store ``state(b) - state(a)`` on ``selection`` (default: :meth:`diff` of ``a``, ``b``), computed in float32 (float64 for float64 parameters); returns the delta id.
+  - `deltas(self) -> 'list[str]'` — Ids of every stored delta, sorted.
+  - `diff(self, a: 'str', b: 'str') -> 'dict[int, list[int]]'` — Per layer, the channels whose stored slices differ between versions ``a`` and ``b`` (any element ``!=``; ``-0.0 == 0.0``, and a NaN at the same place in both counts as changed). Layers without a changed channel are omitted.
+  - `discard(self, staged: 'StagedEdit') -> 'None'` — Undo a staged edit: the affected parameters are restored bitwise to the parent's.
+  - `evaluate(self, staged: 'StagedEdit', gate_config: 'GateConfig', probe: 'CapabilityProbe') -> 'GateVerdict'` — Gate verdict of the staged weights (candidate) against the parent's (incumbent).
+  - `evaluation_count` — Evaluations run by this store so far (the next evaluation's ``decision_index``).
+  - `get(self, version_id: 'str') -> 'Version'` — A copy of version ``version_id`` (:class:`EditError` for a malformed id, ``KeyError`` if unknown). Mutating the copy's dicts never changes the store.
+  - `head` — Id of the version the live model was last put at by this store (``None`` before init).
+  - `history(self, version_id: 'str | None' = None) -> 'list[Version]'` — Copies of the lineage root -> ``version_id`` (default: the head; ``[]`` for an empty store).
+  - `init_from_model(self, note: 'str' = '') -> 'Version'` — Record the live model as the root version and make it the head. Only on an empty store.
+  - `ledger` — A copy of the store's own alpha ledger (``None`` before the first evaluation).
+  - `load_delta(self, delta_id: 'str') -> 'ChannelState'` — A stored delta (validated against the model).
+  - `load_state(self, version_id: 'str') -> 'ChannelState'` — The stored channel state of a version (validated against the model).
+  - `restore(self, version_id: 'str') -> 'Version'` — Put the live model at ``version_id`` bitwise and make it the head.
+  - `stage(self, edit: 'EditRecord | Sequence[EditRecord]') -> 'StagedEdit'` — Apply one edit (or several, in order) to the live model on top of the head version.
+  - `staged` — The active staged edit, if any.
+  - `versions(self) -> 'list[Version]'` — Copies of every version, ordered by ``(created, id)``.
+- constants: `STORE_FORMAT`
+
+## `research_rl.capability.es`
+
+Forward-only evolution-strategies update operator (``CAPABILITY.md`` section 1.7).
+
+- **class `ESConfig`** — Hyper-parameters of :class:`ESOperator` (JSON-able via :meth:`to_dict`).
+  - `from_dict(cls, d: 'Mapping[str, Any]') -> 'ESConfig'`
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `ESError`** — Invalid ES configuration, fitness result or state.
+- **class `ESOperator`** — Evolution-strategies :class:`~research_rl.capability.types.UpdateOperator` over a space.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Load counters after checking that the config and ``dim`` match exactly (a different seed, population, etc. would silently change the perturbation stream), then re-base the space from the model's current weights (load the model weights before calling this).
+  - `noise(self, update_index: 'int', noise_index: 'int') -> 'torch.Tensor'` — Unsigned standard-normal draw ``eps`` (CPU float32, length ``dim``) for ``(t, j)``.
+  - `noise_index(self, member_index: 'int') -> 'tuple[int, float]'` — ``(noise index j, sign)`` of member ``member_index``.
+  - `on_decision(self, decision: 'GateDecision') -> 'None'` — Re-base the space from the model's current weights (every decision; never by subtracting regenerated noise). The caller has already restored / shrunk / reverted.
+  - `parameter_names(self) -> 'list[str]'`
+  - `perturbation(self, update_index: 'int', member_index: 'int') -> 'torch.Tensor'` — Signed unit-scale perturbation of member ``i`` (the space receives ``sigma`` times it).
+  - `state_dict(self) -> 'dict[str, Any]'` — JSON-able counters and config. Weights (and the space's base) are not included: they are part of the model / the gate's snapshots. Perturbations depend only on ``(seed, update_index, member_index)``, so no RNG state is needed.
+  - `step(self, model: 'nn.Module', update_index: 'int') -> 'OperatorReport'` — One ES update in place on ``model`` (see the module docstring).
+- **class `FitnessResult`** — Outcome of evaluating one ES member on the update's training items.
+  - `forward_passes` — Generation calls of this evaluation: ``1 + extra.get("extra_forward_passes", 0)``.
+- `shape_fitness(fitness: 'Sequence[float]', method: 'FitnessShaping') -> 'list[float]'` — Shaped fitness values (see the module docstring for the exact formulas).
+- constants: `FitnessFn`, `FitnessShaping`
+
+## `research_rl.capability.gate`
+
+The pure gate verdict: paired statistics on one :class:`GateEvidence`, no weight changes.
+
+- **class `CapabilityGate`** — Evaluates :class:`GateEvidence` into a :class:`GateVerdict` (statistics only).
+  - `accepts(self, verdict: 'GateVerdict') -> 'bool'` — Whether ``verdict`` licenses promoting the candidate under this config's statistics.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore ledger position and verdict count; atomic (nothing changes on any error).
+  - `state_dict(self) -> 'dict[str, Any]'`
+  - `verdict(self, evidence: 'GateEvidence') -> 'GateVerdict'` — Test one decision's evidence; consumes exactly one alpha from the ledger.
+  - `verdict_count` — Number of verdicts computed so far (each consumed one alpha).
+- **class `GateConfig`** — Configuration of the capability gate and of the gated loop around it (JSON-able).
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'GateConfig'` — Inverse of :meth:`to_dict`. Unknown keys raise ``ValueError``; missing keys take defaults.
+  - `make_ledger(self) -> 'AlphaLedger'` — A fresh :class:`AlphaLedger` with this config's ``alpha`` and ``alpha_schedule``.
+  - `margin_for(self, slice_name: 'str') -> 'float'` — Retention margin of ``slice_name`` (override if present, else the default margin).
+  - `retention_horizon(self, slice_name: 'str | None' = None, *, n: 'int | None' = None, n10: 'int' = 0, n01: 'int' = 0) -> 'int | None'` — How many verdicts a binary retention slice with this evidence can keep passing.
+  - `to_dict(self) -> 'dict[str, Any]'` — Plain JSON-able dict (enum as its value, tuples as lists).
+
+## `research_rl.capability.loop`
+
+The gated training loop (``docs/research_rl/CAPABILITY.md`` 1.9 with the pinned semantics of 1.16).
+
+- **class `GateController`** — One gate procedure per :meth:`run` (see the module docstring for the exact semantics).
+  - `check_group_scope(self, model: 'nn.Module', incumbent: 'StateSnapshot') -> 'None'` — Raise :class:`~research_rl.capability.weights.SnapshotError` (a ``ValueError``) unless every channel group can be ranked and reverted against ``incumbent`` on ``model``.
+  - `config`
+  - `group_stage_enabled`
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore a :meth:`state_dict`; ``ValueError`` on any mismatch (nothing changes then).
+  - `max_verdicts_per_decision` — Worst-case verdicts of one decision: 1 when disabled, else ``1 + len(shrink_lambdas)`` plus ``min(max_group_rollbacks, len(channel_groups))`` when the group stage is enabled.
+  - `run(self, model: 'nn.Module', operator: 'UpdateOperator', incumbent: 'StateSnapshot', decision_index: 'int', update_index: 'int', alarm: 'bool | AlarmState', reward_v1: 'float | None', reward_v2: 'float | None' = None) -> 'tuple[DecisionRecord, StateSnapshot]'` — Run one gate procedure on ``model``'s current weights; returns the record and the new incumbent (the same object unless the decision promoted the weights).
+  - `state_dict(self) -> 'dict[str, Any]'` — JSON-able: hold streak, the verdict gate's state (ledger position, verdict count), ``enabled``, the rollback unit and the group names (checked on load).
+  - `verdict_gate` — The gate that computes (and spends alpha for) every verdict: ``gate`` itself when enabled, a private copy with its own ledger when disabled.
+- **class `GatedLoop`** — Operator updates, alarm, gate decisions, decision log and resume state.
+  - `check_horizon(self, num_updates: 'int') -> 'None'` — Start-of-run check: ``verdict_gate.ledger.count + required_verdicts(num_updates)`` must not exceed :meth:`horizon`. Otherwise ``ValueError`` (``UserWarning`` with ``allow_short_horizon=True``). Run by :meth:`run` before the first update.
+  - `horizon(self) -> 'int | None'` — Last verdict index (1-based, ledger count) at which every retention slice of the probe can still pass with ``n10 = round(0.005 n)`` incumbent-only wins and no candidate-only win (``GateConfig.retention_horizon`` per slice, ``n = probe.items_per_retention_slice``, the size the probe actually tests, falling back to ``config.items_per_retention_slice``); ``None`` = no practical limit.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Continue from a :meth:`state_dict` (build every object exactly as the saved run did).
+  - `required_verdicts(self, num_updates: 'int') -> 'int'` — :func:`worst_case_verdicts` of ``num_updates`` more updates from the current position.
+  - `run(self, num_updates: 'int') -> 'list[DecisionRecord]'` — Run ``num_updates`` more operator updates (with their decisions); returns the decision records of this call (also appended to :attr:`records`). The horizon check runs first.
+  - `state_dict(self) -> 'dict[str, Any]'` — Everything needed to continue the run exactly; loadable with ``torch.save`` / ``torch.load(weights_only=True)`` (tensors, numbers, strings, lists, dicts).
+  - `updates_since_decision`
+- **class `MetricsRecorder`** — Anything with ``log_metrics(step, logs)``, e.g. :class:`~research_rl.core.experiment.ExperimentRecorder`.
+  - `log_metrics(self, step: 'int', logs: 'Mapping[str, Any]') -> 'None'`
+- `classify_verdict(verdict: 'GateVerdict', *, require_transfer_gain: 'bool') -> 'str'` — The first-verdict reason of the module docstring's table (one of :data:`WOULD_REASONS`).
+- `retention_unpassable(verdict: 'GateVerdict') -> 'bool'` — True iff some **failing** retention slice of ``verdict`` could not have passed at the verdict's alpha even with zero discordant pairs.
+- `snapshot_from_state(state: 'Mapping[str, Any]') -> 'StateSnapshot'` — Inverse of :func:`snapshot_to_state`; the fingerprint is re-verified (:class:`~research_rl.capability.weights.SnapshotError` on mismatch).
+- `snapshot_to_state(snapshot: 'StateSnapshot') -> 'dict[str, Any]'` — A :class:`StateSnapshot` as a plain dict loadable with ``torch.load(weights_only=True)``.
+- `worst_case_verdicts(num_updates: 'int', *, block_updates: 'int', verdicts_per_decision: 'int', alarm_triggers_decision: 'bool', since: 'int' = 0) -> 'int'` — Upper bound on the verdicts of ``num_updates`` more updates of a :class:`GatedLoop`.
+- constants: `OVERRIDE_GATE_DISABLED`, `REASON_ACCEPT`, `REASON_ALARM_HOLD`, `REASON_CONFIRMED_ALARM`, `REASON_HOLD_LIMIT`, `REASON_HORIZON_EXHAUSTED`, `REASON_NO_TRANSFER_GAIN`, `REASON_RETENTION_FAILED`, `WOULD_PREFIX`, `WOULD_REASONS`
+
+## `research_rl.capability.operators`
+
+Backprop update operators for the gated loop (``docs/research_rl/CAPABILITY.md`` 1.9 / 1.16).
+
+- **class `Rollouts`** — The sampled and scored rollouts of one update (rows prompt-major).
+  - `lengths` — Completion tokens before the first EOS, per row (all action tokens without EOS).
+- **class `TorchGRPOOperator`** — Minimal on-policy GRPO :class:`~research_rl.capability.types.UpdateOperator` (module docstring for the exact semantics).
+  - `advantages(self, rollouts: 'Rollouts') -> 'tuple[list[float], list[bool]]'` — ``(advantages, keep)`` of the rollouts (step 5; ``keep`` all True when ``screen`` is off).
+  - `config(self) -> 'dict[str, Any]'` — The hyper-parameters as a JSON-able dict (checked by :meth:`load_state_dict`).
+  - `items(self, update_index: 'int') -> 'list[Item]'` — The update's prompts: ``sampler.draw(Split.TRAIN, prompts_per_update, purpose=TRAIN_PURPOSE, index=update_index)`` (truncation contract checked).
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore the counters after checking that the configuration matches exactly (``ValueError`` otherwise; nothing changes then).
+  - `on_decision(self, decision: 'GateDecision') -> 'None'` — No-op (GRPO keeps no weight copy of its own; the controller restores weights and optimizer state itself). Validates the type.
+  - `parameter_names(self) -> 'list[str]'` — Model names of the optimizer's parameters, in ``named_parameters`` order.
+  - `policy_loss(self, model: 'nn.Module', rollouts: 'Rollouts', advantages: 'Sequence[float]') -> 'torch.Tensor'` — The token-level policy-gradient loss of step 6 (a scalar with a graph). The forward runs under ``fork_rng`` seeded with :func:`loss_seed` ``(seed, rollouts.update_index)``.
+  - `rollouts(self, model: 'nn.Module', update_index: 'int') -> 'Rollouts'` — Sample and score the rollouts of update ``update_index`` (steps 1-4 of the module docstring) without changing any weight. Deterministic in ``(seed, update_index)`` and the current weights; the global RNG state is unchanged.
+  - `state_dict(self) -> 'dict[str, Any]'` — Configuration and counters (JSON-able). Optimizer state is not included (see the module docstring).
+  - `step(self, model: 'nn.Module', update_index: 'int') -> 'OperatorReport'` — One GRPO update in place (module docstring); returns its report.
+- `group_advantages(rewards: 'Sequence[float]', group_size: 'int', keep: 'Sequence[bool] | None' = None) -> 'list[float]'` — Group-normalised advantages (see the module docstring, step 5).
+- `loss_seed(seed: 'int', update_index: 'int') -> 'int'` — Seed of the training forward of update ``update_index`` (its dropout masks): the first 8 bytes (little endian, top bit cleared) of ``SHA-256("research_rl.capability.grpo.loss:{seed}: {update_index}")``; a different domain from :func:`sample_seed`, so the two streams differ.
+- `sample_seed(seed: 'int', update_index: 'int') -> 'int'` — Sampling seed of update ``update_index``: the first 8 bytes (little endian, top bit cleared) of ``SHA-256("research_rl.capability.grpo:{seed}:{update_index}")``.
+- constants: `ADVANTAGE_EPS`, `TRAIN_PURPOSE`
+
+## `research_rl.capability.pilot`
+
+P0 capability pilot on CPU (``docs/research_rl/CAPABILITY.md`` 1.14 and the kill criteria of section 3).
+
+- **class `ArmSpec`** — One arm: ``operator``, ``gate``, ``variant`` and ``seed``.
+  - `file_stem`
+  - `key`
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `PilotConfig`** — Every knob of the pilot (JSON-able via :meth:`to_dict` / :meth:`from_dict`).
+  - `base_gate_config(self, *, items_per_retention_slice: 'int | None' = None) -> 'GateConfig'` — ``GateConfig`` with the overrides, ``rollback_unit=parameters`` and (if given) the retention item count; ``enabled`` is left at its default (set per arm).
+  - `es_num_updates`
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'PilotConfig'` — Inverse of :meth:`to_dict`; unknown keys raise ``ValueError``.
+  - `to_dict(self) -> 'dict[str, Any]'`
+  - `updates_for(self, operator: 'str') -> 'int'` — Updates of an arm with ``operator``.
+- `arm_specs(config: 'PilotConfig') -> 'list[ArmSpec]'` — Every arm of ``config`` in canonical order (variant, seed, operator, gate).
+- `baseline_standard_error(p: 'float', n: 'int') -> 'float'` — Conservative standard error of a start-map mean ``p`` of ``n`` per-item values in ``[0, 1]``.
+- `choose_retention_items(config: 'PilotConfig', retention_slices: 'Sequence[str]') -> 'dict[str, Any]'` — Pick ``items_per_retention_slice`` so that :class:`~research_rl.capability.loop.GatedLoop`'s start-of-run horizon check passes for the longest arm.
+- `evaluate_criteria(results: 'Mapping[str, Any]') -> 'dict[str, Any]'` — Section-3 kill criteria on a results dict (pure; see :data:`CRITERIA_DEFINITIONS`).
+- `gate_exercise(arms: 'Sequence[Mapping[str, Any]]', min_improved_blocks: 'int') -> 'dict[str, Any]'` — Whether the run exercised the gate enough for its error rates to mean anything.
+- `interval_with_baseline_error(interval: 'Mapping[str, Any]', se_baseline: 'float', alpha: 'float' = 0.05, *, baseline_n: 'int | None' = None) -> 'dict[str, Any]'` — Widen a :func:`paired_interval` of ``value - baseline`` differences for a baseline that is one noisy measurement shared by every seed (so its error is common to all differences and the across-seed spread cannot see it).
+- `oracle_exclusion_steps(config: 'PilotConfig', num_updates: 'int | None' = None) -> 'int'` — Highest tracker step whose items the oracle excludes, the same for every arm of ``config``.
+- `oracle_items(sampler: 'ItemSampler', n: 'int', decision_index: 'int', exclude: 'set[str]') -> 'dict[str, list[Item]]'` — ``n`` oracle items per T_RULE slice for one decision: purpose :data:`ORACLE_PURPOSE`, index = ``decision_index``, from the tracker pool (so disjoint from every gate item by construction), without any uid in ``exclude`` (start-map and tracker items). Deterministic in the key.
+- `paired_interval(diffs: 'Sequence[float]', alpha: 'float' = 0.05) -> 'dict[str, Any]'` — Two-sided ``1 - alpha`` Student-t interval of the mean of paired differences.
+- `render_summary(results: 'Mapping[str, Any]') -> 'str'` — ``summary.md``: banner, warnings, start map, one table per arm, gate error rates, criteria.
+- `run_pilot(config: 'PilotConfig', output_dir: 'str | Path') -> 'dict[str, Any]'` — Run the P0 pilot (module docstring) and write its outputs to ``output_dir``; returns the results dict (also written as ``results.json``). Never downloads anything; CPU only.
+- `smoke_config(**overrides: 'Any') -> 'PilotConfig'` — The ``--smoke`` configuration: 1 seed, 2 arms (``grpo+gate_on``, ``es_informed+gate_off``) on the leak variant, 4 updates in blocks of 2, a 2-layer hidden-32 model, tiny item counts (16 retention items per slice with a 0.5 retention margin, so verdicts can pass at all) and ``allow_short_horizon=True`` (a short horizon only warns).
+- constants: `BANNER`, `GATES`, `OPERATORS`, `ORACLE_PURPOSE`, `VARIANTS`, `VERDICT_INCONCLUSIVE`, `VERDICT_KILL`, `VERDICT_SUCCESS`
+
+## `research_rl.capability.probe`
+
+Gate evidence and start-of-run capability maps (``docs/research_rl/CAPABILITY.md`` 1.8).
+
+- **class `CapabilityProbe`** — Builds :class:`GateEvidence` for one gate evaluation.
+  - `evidence(self, model: 'nn.Module', incumbent: 'StateSnapshot', decision_index: 'int', *, attempt: 'int' = 0, alarm: 'bool' = False) -> 'GateEvidence'` — Paired evidence of the candidate (current weights) against ``incumbent``.
+  - `from_config(cls, sampler: 'ItemSampler', score_fn: 'ScoreFn', config: 'GateConfig', *, transfer_slices: 'Sequence[str] | None' = None, retention_slices: 'Sequence[str] | None' = None) -> 'CapabilityProbe'` — Probe with ``config.items_per_transfer_slice`` / ``config.items_per_retention_slice``.
+  - `gate_items(self, decision_index: 'int', attempt: 'int' = 0) -> 'dict[str, list[Item]]'` — The items of evaluation ``(decision_index, attempt)``, per slice (transfer slices first, then retention, in construction order): :func:`draw_slice` with ``purpose=gate_purpose(attempt)``, ``index=decision_index`` and ``pool=GATE_POOL`` (so they never coincide with tracker or start-map items).
+  - `items_per(self, slice_name: 'str') -> 'int'` — Items per evaluation of one of this probe's slices (``KeyError`` for other slices).
+  - `score_slice(self, model: 'nn.Module', slice: 'str', n: 'int', *, purpose: 'str', index: 'int', pool: 'str | None' = None) -> 'SliceScores'` — :func:`score_slice` with this probe's sampler and score function. ``slice`` may be any non-AUDIT slice of the sampler (TRAIN included), not only this probe's slices.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able configuration (slices, item counts, sampler identity).
+- **class `SliceScores`** — Scores of one model state on the items of one slice drawn for ``(purpose, index)`` (from ``pool``, ``None`` = unpartitioned; see :func:`draw_slice`).
+  - `mean` — Mean score (pass rate for binary scores); ``nan`` for no items.
+  - `n`
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able: slice, split value, purpose, index, pool, n, mean, uids, scores (items by uid only).
+  - `uids`
+- **class `SliceStart`** — Start-checkpoint measurement of one slice.
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'SliceStart'` — Inverse of :meth:`to_dict` (derived fields are recomputed, not read).
+  - `n`
+  - `pass1`
+  - `pass_k`
+  - `sampled_mean`
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `StartMap`** — pass@1 (greedy) and pass@k (sampled) of the start checkpoint, per slice (JSON-able).
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'StartMap'`
+  - `measure(cls, model: 'nn.Module', sampler: 'ItemSampler', score_fn: 'Any', *, items_per_slice: 'int', slices: 'Sequence[str] | None' = None, k: 'int' = 16, num_samples: 'int | None' = None, temperature: 'float' = 1.0, seed: 'int' = 0, sample_batch_size: 'int' = 16) -> 'StartMap'` — Measure the start map of ``model`` (its current weights).
+  - `pass1(self, slice_name: 'str') -> 'float'` — Greedy pass rate of ``slice_name`` (``KeyError`` if not measured).
+  - `pass_k(self, slice_name: 'str') -> 'float'` — Unbiased pass@k of ``slice_name`` (``KeyError`` if not measured).
+  - `split_mean_pass1(self, split: 'Split') -> 'float'` — Unweighted mean over the measured slices of ``split`` of their greedy pass rates (``ValueError`` if no slice of that split was measured).
+  - `summary(self) -> 'dict[str, dict[str, float]]'` — ``{slice: {"pass1": ..., "pass_k": ..., "sampled_mean": ...}}``.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able (``json.dumps`` works); :meth:`from_dict` inverts it.
+- `check_truncation_budget(sampler: 'ItemSampler', score_fn: 'Any') -> 'None'` — Raise ``ValueError`` if ``score_fn`` exposes an integer ``max_new_tokens`` smaller than ``sampler.splits.operators.max_len + 1`` (the longest possible answer plus the EOS token); no-op for score functions without ``max_new_tokens``.
+- `draw_slice(sampler: 'ItemSampler', slice_name: 'str', n: 'int', *, purpose: 'str', index: 'int', pool: 'str | None' = None) -> 'list[Item]'` — ``n`` >= 1 distinct items of a non-AUDIT slice for the key ``(purpose, index)``.
+- `gate_purpose(attempt: 'int') -> 'str'` — Sampler purpose of gate evaluation ``attempt`` (0 = the raw candidate, then one per shrink factor / group revert of the same decision): ``f"gate/{attempt}"``.
+- `item_pool(sampler: 'ItemSampler', uid: 'str') -> 'str'` — The pool of item ``uid`` for ``sampler``: :data:`TRACK_POOL` iff ``_derive_seed("item_pool", sampler.root_seed, uid) % TRACK_POOL_DENOMINATOR == 0``, else :data:`GATE_POOL`. A fixed function of ``(root_seed, uid)``; every uid is in exactly one pool.
+- `sample_completions(model: 'nn.Module', tokenizer: 'Any', prompt: 'str', *, num_samples: 'int', max_new_tokens: 'int', temperature: 'float' = 1.0, seed: 'int', batch_size: 'int' = 16) -> 'list[str]'` — ``num_samples`` sampled continuations of one ``prompt`` (decoded, EOS and after removed).
+- `sample_completions_with_truncation(model: 'nn.Module', tokenizer: 'Any', prompt: 'str', *, num_samples: 'int', max_new_tokens: 'int', temperature: 'float' = 1.0, seed: 'int', batch_size: 'int' = 16) -> 'tuple[list[str], list[bool]]'` — :func:`sample_completions` plus one exact truncation flag per sample.
+- `score_items(score_fn: 'ScoreFn', model: 'nn.Module', items: 'Sequence[Item]') -> 'list[float]'` — ``score_fn(model, items)`` with validation: one finite score in [0, 1] per item, every item within the truncation budget (``len(answer) + 1 <= score_fn.max_new_tokens`` when the score function exposes it), training mode restored afterwards. ``[]`` for no items (no call).
+- `score_slice(sampler: 'ItemSampler', score_fn: 'ScoreFn', model: 'nn.Module', slice_name: 'str', n: 'int', *, purpose: 'str', index: 'int', pool: 'str | None' = None) -> 'SliceScores'` — Draw ``n`` items of ``slice_name`` for ``(purpose, index)`` from ``pool`` (:func:`draw_slice`; ``None`` = unpartitioned, may coincide with gate and tracker items) and score the model's **current** weights on them (:func:`score_items`).
+- constants: `GATE_POOL`, `ITEM_POOLS`, `START_PURPOSE`, `TRACK_POOL`, `TRACK_POOL_DENOMINATOR`
+
+## `research_rl.capability.scores`
+
+Forward-only channel scoring and grouping (``docs/research_rl/CAPABILITY.md`` section 1.6).
+
+- **class `ChannelStats`** — Per-layer, per-channel statistics of the SwiGLU ``down_proj`` input over real tokens.
+  - `from_dict(cls, d: 'Mapping[str, Any]') -> 'ChannelStats'` — Inverse of :meth:`to_dict` (float64 values round-trip exactly through JSON).
+  - `intermediate_size(self, layer: 'int') -> 'int'`
+  - `layers(self) -> 'list[int]'` — Layer indices, ascending.
+  - `merge(self, other: 'ChannelStats') -> 'ChannelStats'` — Statistics of the union of both text sets: means weighted by token counts (float64).
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able dict (string layer keys, Python ints / float lists); see :meth:`from_dict`.
+- `collect_channel_stats(model: 'nn.Module', tokenizer: 'Any', texts: 'Sequence[str]', *, layers: 'Iterable[int] | None' = None, batch_size: 'int' = 8, threshold: 'float' = 0.0) -> 'ChannelStats'` — Run ``texts`` through ``model`` and collect :class:`ChannelStats` of every ``down_proj`` input.
+- `contrast_scores(stats_correct: 'ChannelStats', stats_incorrect: 'ChannelStats') -> 'dict[int, torch.Tensor]'` — ``mean|h|`` on V2-correct rollouts minus ``mean|h|`` on V2-incorrect rollouts, per channel.
+- `density_matched_random(selection: 'ChannelSelection', model: 'nn.Module', seed: 'int') -> 'ChannelSelection'` — A uniformly random selection with exactly ``selection``'s per-layer channel counts.
+- `group_channels(scores: 'Mapping[int, torch.Tensor]', *, bands: 'int' = 4, layers: 'Iterable[int] | None' = None) -> 'list[ChannelGroup]'` — Partition every channel of the scored layers into ``layer x score-quantile band`` groups.
+- `layer_prior(scores: 'Mapping[int, torch.Tensor]', weights: 'Mapping[int, float]') -> 'dict[int, torch.Tensor]'` — ``scores[layer] * weights[layer]`` (float64); layers absent from ``weights`` keep weight 1.0.
+- `random_scores(model: 'nn.Module', seed: 'int', *, layers: 'Iterable[int] | None' = None) -> 'dict[int, torch.Tensor]'` — Uniform ``[0, 1)`` float64 scores per channel from ``torch.Generator().manual_seed(seed)``.
+- `usage_ratio_scores(stats_train: 'ChannelStats', stats_retention: 'ChannelStats', eps: 'float' = 0.001) -> 'dict[int, torch.Tensor]'` — Activation-rate ratio ``active_rate_train / (active_rate_retention + eps)`` per channel.
+- `wanda_scores(model: 'nn.Module', stats: 'ChannelStats') -> 'dict[int, torch.Tensor]'` — Wanda-style channel importance ``||W_down[:, c]||_2 * sqrt(mean h_c^2)`` per layer of ``stats``.
+
+## `research_rl.capability.search`
+
+Subset search with capability as the objective (``docs/research_rl/CAPABILITY.md`` 1.11).
+
+- **class `BurstRecord`** — One training burst from the start weights.
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `FinalResult`** — A finalist or control over the final item sets: per-repeat objectives and their means.
+  - `mean_gain`
+  - `mean_objective`
+  - `mean_worst_drop`
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `SearchEvaluation`** — One scoring of trained weights on one item set ``(purpose, index)``.
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `SearchReport`** — Everything one :meth:`SubsetSearch.run` did (JSON-able via :meth:`to_dict`; no timestamps, so equal runs give equal reports).
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `SliceResult`** — Start and trained-candidate mean scores of one slice in one evaluation.
+  - `difference` — ``candidate_mean - start_mean`` (positive = the burst helped).
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `SubsetSearch`** — Successive-halving search over channel subsets (module docstring for exact semantics).
+  - `config(self) -> 'dict[str, Any]'` — JSON-able settings (the probe's slices and sampler identity included).
+  - `run(self, model: 'nn.Module', *, update_offset: 'int' = 0) -> 'SearchReport'` — Run the search on ``model`` and return the :class:`SearchReport`.
+  - `survivors_after(self, n: 'int') -> 'int'` — Candidates kept from a round of ``n``: ``max(1, ceil(survivors_fraction * n))``.
+- `burst_seed(seed: 'int') -> 'int'` — Seed of the global torch RNG inside every burst of a search with ``seed`` (a 63-bit int from SHA-256 of ``("research_rl.capability.search", "burst", seed)``).
+- `combine_groups(groups: 'Sequence[ChannelGroup]', *, name: 'str | None' = None) -> 'ChannelGroup'` — One candidate made of the union of ``groups`` (``ValueError`` for no groups). The default name joins the group names with ``"+"``.
+- `control_seed(seed: 'int') -> 'int'` — Seed passed to :func:`~research_rl.capability.scores.density_matched_random` for the ``"random"`` control of a search with ``seed``.
+- `final_purpose(repeat: 'int') -> 'str'` — Sampler purpose of final repeat ``repeat`` (shared by finalists and controls): ``f"search/final/{repeat}"``.
+- `objective(gain: 'float', worst_drop: 'float', *, penalty: 'float', margin: 'float') -> 'float'` — ``gain - penalty * max(0, worst_drop - margin)``.
+- `score_seed(seed: 'int', purpose: 'str', index: 'int', slice_name: 'str') -> 'int'` — Seed of the global torch RNG inside every ``score_fn`` call on slice ``slice_name`` of the item set ``(purpose, index)`` of a search with ``seed`` (a 63-bit int from SHA-256 of ``("research_rl.capability.search", "score", seed, purpose, index, slice_name)``).
+- `search_purpose(round_index: 'int', candidate_index: 'int') -> 'str'` — Sampler purpose of candidate ``candidate_index`` in round ``round_index``: ``f"search/{round_index}/{candidate_index}"``.
+- `whole_layer_selection(selection: 'ChannelSelection', model: 'nn.Module') -> 'ChannelSelection'` — ``selection.count()`` channels as whole layers plus at most one contiguous partial block.
+- constants: `CONTROL_KINDS`, `DEFAULT_MARGIN`, `DEFAULT_PENALTY`, `MakeOperator`, `SEARCH_PURPOSE`, `STATEMENT`
+
+## `research_rl.capability.spaces`
+
+Flat coordinate systems over model parameters for forward-only operators (``CAPABILITY.md`` 1.7).
+
+- **class `ChannelGainSpace`** — P1: one multiplicative gain per selected channel (``dim == selection.count()``).
+- **class `ChannelWeightSpace`** — P2: every element owned by the selected channels, ``W = base + v``.
+- **class `FullParameterSpace`** — Every element of the named parameters, ``W = base + v``.
+- **class `SpaceError`** — Invalid space construction or an invalid vector passed to ``write``.
+
+## `research_rl.capability.stats`
+
+Paired statistics for the capability gate (pure functions; standard library only).
+
+- **class `AlphaLedger`** — Hands out the significance level of each gate decision.
+  - `alpha_at(self, k: 'int') -> 'float'` — Alpha of the k-th decision (1-based) without consuming it.
+  - `count` — Number of alphas handed out so far.
+  - `expected_spent(self, count: 'int') -> 'float'` — ``sum_{k=1}^{count} alpha_at(k)``, accumulated in the same order as :meth:`next_alpha` (so it reproduces ``spent`` of a ledger that handed out ``count`` alphas bit for bit).
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore the position; atomic (nothing changes unless every check passes).
+  - `next_alpha(self) -> 'float'` — Consume and return the next decision's alpha.
+  - `spent` — Sum of all alphas handed out so far.
+  - `state_dict(self) -> 'dict[str, Any]'`
+- `binomial_upper_tail(x: 'int', m: 'int', p: 'float') -> 'float'` — ``P[X >= x]`` for ``X ~ Bin(m, p)``.
+- `clopper_pearson_lower(x: 'int', m: 'int', alpha: 'float') -> 'float'` — One-sided ``(1 - alpha)`` Clopper-Pearson lower confidence limit of a binomial proportion.
+- `discordant_mass(paired: 'PairedScores') -> 'tuple[float, float]'` — ``(gain_mass, loss_mass)`` = ``(sum max(cand - inc, 0), sum max(inc - cand, 0))``.
+- `fractional_sign_test_p_value(gain_mass: 'float', loss_mass: 'float') -> 'float'` — Sign-test p-value extended to fractional discordant mass.
+- `noninferiority_upper_bound(paired: 'PairedScores | Sequence[PairedScores]', margin: 'float', alpha: 'float') -> 'SliceTest'` — Non-inferiority test of H0 "drop >= margin" with an upper confidence bound on the drop.
+- `normal_cdf(x: 'float') -> 'float'` — Standard normal CDF ``Phi(x) = erfc(-x / sqrt(2)) / 2`` (accurate in both tails).
+- `normal_quantile(p: 'float') -> 'float'` — Inverse standard normal CDF ``Phi^{-1}(p)`` for ``p`` in ``(0, 1)``.
+- `paired_gain_lower_bound(paired: 'PairedScores | Sequence[PairedScores]', alpha: 'float') -> 'SliceTest'` — One-sided test of H0 "candidate not better" with a lower confidence bound on the gain.
+- `pool_paired(paired: 'PairedScores | Sequence[PairedScores]') -> 'PairedScores'` — Concatenate the items of several slices into one :class:`PairedScores`.
+- `regularized_incomplete_beta(a: 'float', b: 'float', x: 'float') -> 'float'` — ``I_x(a, b)`` for ``a, b > 0`` and ``x`` in ``[0, 1]`` (relative accuracy ~1e-14).
+- `required_paired_n(delta: 'float', discordant_rate: 'float', alpha: 'float' = 0.05, power: 'float' = 0.8) -> 'int'` — Pairs needed to detect a paired gain ``delta`` (Connor 1987, one-sided).
+- `retention_power_floor_n(margin: 'float', alpha: 'float') -> 'int'` — Smallest slice size at which a binary retention slice can pass at all.
+- `sign_test_p_value(n01: 'int', n10: 'int') -> 'float'` — Exact one-sided sign-test p-value of H0 "candidate not better".
+- `student_t_sf(t: 'float', df: 'float') -> 'float'` — Upper tail ``P[T >= t]`` of Student's t with ``df > 0`` degrees of freedom.
+- `tango_restricted_mle(n10: 'float', n01: 'float', n: 'int', delta: 'float') -> 'float'` — Restricted MLE of the discordant probability ``q = P(incumbent=0, candidate=1)`` under the constraint ``drop = P(inc=1, cand=0) - P(inc=0, cand=1) = delta`` (``delta`` in [0, 1]).
+- `tango_z(n10: 'float', n01: 'float', n: 'int', delta: 'float') -> 'float'` — Tango's score statistic for H0 ``drop = delta`` (``drop = p10 - p01``, ``delta`` in [-1, 1]).
+- constants: `student_t_quantile`
+
+## `research_rl.capability.tasks`
+
+Operator-composition task generators, rule-level splits, item sampling and verifiers.
+
+- **class `AuditAccessError`** — Raised when the AUDIT split is requested from a sampler built without ``allow_audit=True``.
+- **class `CompositionSplits`** — Rule-level splits of one :class:`OperatorSet`.
+  - `build(cls, operators: 'OperatorSet', *, seed: 'int', train_fraction: 'float' = 0.5, audit_fraction: 'float' = 0.2, depth3_count: 'int' = 16, audit_depth3_count: 'int | None' = None, task_families: 'Sequence[str]' = ('argmax', 'countbig'), max_agreement: 'float' = 0.25) -> 'CompositionSplits'` — Partition every ordered pair ``(f, g)``, ``f != g``, into TRAIN / T_RULE / AUDIT pairs.
+  - `check_disjoint(self) -> 'None'` — Raise :class:`SplitIntegrityError` listing every violated invariant.
+  - `fingerprint(self) -> 'str'` — sha256 of :meth:`to_dict` (canonical JSON).
+  - `rules(self, split: 'Split') -> 'tuple[Rule, ...]'` — All operator rules of ``split`` (the union of its rule slices; family slices have none).
+  - `slice_rules_of(self, slice_name: 'str') -> 'tuple[Rule, ...]'` — Rules of a rule slice; ``()`` for family slices; ``KeyError`` for an unknown slice.
+  - `slices(self) -> 'dict[str, Split]'` — ``{slice name: split}`` for every slice (rule slices and family slices).
+  - `slices_of(self, split: 'Split') -> 'tuple[str, ...]'` — Slice names belonging to ``split`` (in :meth:`slices` order).
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able description (operators, seed, every slice's rules).
+- **class `ExactAnswerVerifier`** — Strict verifier V2: the completion, stripped of surrounding whitespace and of at most one trailing terminator (one of ``terminators``, then whitespace stripped again), must equal the reference (also whitespace-stripped).
+- **class `ItemSampler`** — Deterministic item source over :class:`CompositionSplits`.
+  - `draw(self, split: 'Split', n: 'int', *, purpose: 'str', index: 'int', slice: 'str | None' = None) -> 'list[Item]'`
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Check that ``state`` came from an identical sampler (``ValueError`` otherwise).
+  - `state_dict(self) -> 'dict[str, Any]'` — Identity of the sampler (it has no position: items are keyed by ``(purpose, index)``).
+- **class `OperatorSet`** — The first ``num_operators`` entries of :data:`OPERATOR_CATALOG` under invented names.
+  - `agreement(self, a: 'Sequence[str]', b: 'Sequence[str]') -> 'float'` — Fraction of :attr:`probe_inputs` on which rules ``a`` and ``b`` give the same output (each length has the same number of probe inputs, so lengths are weighted equally).
+  - `apply(self, rule: 'Sequence[str]', x: 'str') -> 'str'` — Apply ``rule`` (outermost first) to the digit string ``x``; ``()`` is the identity.
+  - `describe(self) -> 'dict[str, str]'` — ``{invented name: catalog key}`` (for reports; never shown to the model).
+  - `is_degenerate(self, rule: 'Sequence[str]', *, max_agreement: 'float' = 0.25) -> 'bool'` — True iff ``rule`` is :meth:`similar` to the identity or to an atomic operator (equal to one of them on the probe inputs of some length, or agreeing with one of them on at least ``max_agreement`` of the probe inputs); ``()`` and single operators are degenerate.
+  - `operator_key(self, name: 'str') -> 'str'` — Catalog key (e.g. ``"reverse"``) of the operator called ``name``.
+  - `signature(self, rule: 'Sequence[str]') -> 'tuple[str, ...]'` — Outputs of ``rule`` on :attr:`probe_inputs` (cached); equal functions have equal signatures, different signatures prove different functions.
+  - `similar(self, a: 'Sequence[str]', b: 'Sequence[str]', *, max_agreement: 'float' = 0.25) -> 'bool'` — ``similarity([a], [b], max_agreement=...)`` as a bool.
+  - `similarity(self, rows: 'Sequence[Sequence[str]]', cols: 'Sequence[Sequence[str]]', *, max_agreement: 'float' = 0.25) -> 'torch.Tensor'` — Boolean ``(len(rows), len(cols))`` matrix: entry ``[i, j]`` is True iff rules ``rows[i]`` and ``cols[j]`` are equal on all probe inputs of at least one length, or agree on at least ``max_agreement`` of all probe inputs (see :meth:`agreement`).
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `SplitIntegrityError`** — Raised by :meth:`CompositionSplits.check_disjoint`; ``violations`` lists every problem found.
+- **class `SuffixLeakVerifier`** — Planted leaky verifier V1: passes iff ``text[-k:] == reference[-k:]`` where ``text`` is the completion normalised as in :class:`ExactAnswerVerifier` (whitespace, one trailing terminator).
+- **class `VerifierScoreFn`** — :class:`~research_rl.capability.types.ScoreFn`: greedy completions of the item prompts, scored 1.0 when ``verifier`` marks them correct against ``item.answer``, else 0.0.
+  - `generate(self, model: 'nn.Module', items: 'Sequence[Item]') -> 'list[str]'` — Greedy completions of ``items``' prompts (same order).
+  - `score_completions(self, completions: 'Sequence[str | None]', items: 'Sequence[Item]', truncated: 'Sequence[bool] | None' = None) -> 'list[float]'` — 1.0 / 0.0 per completion under the verifier; ``truncated`` (default: all False) is passed through as the verifier's ``truncated`` flag.
+  - `truncated(self, completions: 'Sequence[str]') -> 'list[bool]'` — Per completion: True iff it re-encodes to at least ``max_new_tokens`` tokens (see the class docstring for the limits of this test).
+- `compose_prompt(rule: 'Rule', x: 'str') -> 'str'` — Prompt of a composition item: ``compose_prompt(("zib", "mok"), "4721") == "zib(mok(4721))="``.
+- `invent_names(count: 'int', seed: 'int', *, forbidden: 'frozenset[str] | set[str]' = COMMON_WORDS) -> 'tuple[str, ...]'` — ``count`` distinct invented names of exactly 3 lowercase ASCII letters.
+- `make_score_fn(tokenizer: 'Any', verifier: 'Verifier', *, max_new_tokens: 'int', batch_size: 'int') -> 'ScoreFn'` — A :class:`VerifierScoreFn` (see there); scores are in ``{0.0, 1.0}``, one per item.
+- `sft_examples(splits: 'CompositionSplits', n: 'int', *, seed: 'int', demo_pairs: 'int' = 0) -> 'list[Item]'` — Supervised items for a low-start pilot model: ``n`` atomic-skill items plus ``demo_pairs`` composed demonstrations (``n + demo_pairs`` items in total, shuffled, distinct uids).
+- constants: `COMMON_WORDS`, `DEFAULT_MAX_AGREEMENT`, `OPERATOR_CATALOG`, `PREREQUISITE_FAMILIES`, `SLICE_NAMES`, `TASK_FAMILIES`
+
+## `research_rl.capability.tracker`
+
+Capability curves over training (``docs/research_rl/CAPABILITY.md`` 1.8).
+
+- **class `CapabilityPoint`** — One capability measurement (see the module docstring for the definitions).
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'CapabilityPoint'` — Inverse of :meth:`to_dict`.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able with the paper's names: ``A``, ``R``, ``T_task``, ``T_rule``, ``D``.
+- **class `CapabilityTracker`** — Measures :class:`CapabilityPoint` s of a training run.
+  - `items(self, step: 'int') -> 'dict[str, list[Item]]'` — The items of the measurement at ``step`` (``purpose="track"``, ``index=step``, ``pool=TRACK_POOL``), per slice.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore ``reward0`` and the history; atomic. ``ValueError`` if the state came from a tracker with another sampler, start map or ``items_per_slice``.
+  - `measure(self, model: 'nn.Module', step: 'int', reward_v1: 'float | None') -> 'CapabilityPoint'` — Measure the current weights at training ``step`` (int >= 0) and append the point to :attr:`history`.
+  - `score(self, model: 'nn.Module', step: 'int') -> 'dict[str, SliceScores]'` — Per-slice :class:`SliceScores` of the model's current weights at ``step`` (one ``score_fn`` call over all items; no baseline or history update).
+  - `state_dict(self) -> 'dict[str, Any]'` — Resume state: ``reward0``, the history, and identity fields checked on load.
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able: configuration, start map, baselines and every measured point.
+- constants: `TRACK_PURPOSE`
+- re-exported: `SliceStart`, `StartMap`
+
+## `research_rl.capability.trl_gate`
+
+The capability gate inside the existing TRL GRPO path (``docs/research_rl/CAPABILITY.md`` 1.10).
+
+- **class `CapabilityGateCallback`** — Run the capability gate on a TRL trainer (see the module docstring for the exact schedule, what a decision writes and how state travels with checkpoints).
+  - `bind(self, trainer: 'Any', *, name: 'str' = 'capability_gate') -> 'CapabilityGateCallback'` — Attach to ``trainer``: keep a reference (for ``_step`` / ``_buffered_inputs`` / ``trajectory_buffer`` / ``advantage_shapers``), register ``self`` as ``trainer.research_components[name]`` (``ValueError`` if another object holds that key) and add ``self`` to the trainer's callbacks unless it is already there.
+  - `config`
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Validate ``state`` and stash it; it is applied in the next ``on_train_begin`` (after HF loaded the checkpoint's weights and optimizer state).
+  - `on_step_end(self, args: 'Any', state: 'Any', control: 'Any', **kwargs: 'Any') -> 'None'` — Collect the block's rewards and alarm, then decide at block boundaries / on alarms.
+  - `on_train_begin(self, args: 'Any', state: 'Any', control: 'Any', **kwargs: 'Any') -> 'None'` — Check the setup, then start the gate: apply the state of a resumed checkpoint (after :meth:`load_state_dict`); else, on a further ``train()`` of the same callback, continue the gate as it is (see the module docstring, "Repeated train()"); else capture the incumbent.
+  - `state_dict(self) -> 'dict[str, Any]'` — Checkpoint state (loadable with ``torch.load(weights_only=True)``): ``version``, ``config`` (``GateConfig.to_dict``), ``block_updates``, ``rollback_unit``, ``decision_index`` (next decision), ``incumbent`` (:func:`~research_rl.capability.loop.snapshot_to_state` or None before training), ``controller`` (hold streak, verdict gate, ledger), ``block`` (TRL batch rewards / screen V2 rates of the running block and the latched alarm), ``alarm_count`` / ``batches_seen`` / ``screen_seen`` (counters consumed so far), ``buffer_invalidations`` and ``sampler`` (the probe sampler's identity, or None).
+- **class `DisagreementScreen`** — Screen V1-pass / V2-fail rollouts out of the GRPO advantage and feed the tier-1 alarm.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'` — Restore a :meth:`state_dict` (``ValueError`` on a version / alarm presence mismatch or invalid counters; the alarm's own ``load_state_dict`` checks its config).
+  - `recent(self, n: 'int') -> 'list[tuple[float, float]]'` — The ``(reward_v1, reward_v2)`` means of the last ``n`` training batches (at most :attr:`RECENT`), oldest first.
+  - `state_dict(self) -> 'dict[str, Any]'` — ``version``, ``alarm`` (its ``state_dict`` or None), ``train_batches``, ``rows``, ``screened`` and ``recent`` (list of ``[reward_v1, reward_v2]``).
+- `base_optimizer(optimizer: 'Any') -> 'torch.optim.Optimizer | None'` — The optimizer the gate snapshots and restores: the ``HookedOptimizer`` inside any wrapper (:func:`~research_rl.optim.optimizer_wrapper.unwrap_hooked`), else the innermost ``torch.optim.Optimizer`` reachable through ``.optimizer`` attributes (accelerate's ``AcceleratedOptimizer`` wraps the real one), else ``None`` for ``None``.
+- `generate_every(args: 'Any', trainer: 'Any') -> 'int'` — TRL's generation period in micro-batches: ``steps_per_generation * num_iterations`` (``steps_per_generation`` defaults to ``gradient_accumulation_steps`` as in ``GRPOConfig``; ``num_iterations`` to 1).
+- constants: `GATE_COMPONENT`
+
+## `research_rl.capability.types`
+
+Shared contracts of the capability-gated training package.
+
+- **class `ChannelGroup`** — A named set of FFN channels: the unit of subset search and of group rollback.
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `DecisionRecord`** — Audit record of one full gate procedure (accept / hold / shrink / group rollback / rollback).
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `GateDecision`** — Outcome of one gate decision (the loop and operators only ever see this value).
+  - members: `ACCEPT`, `HOLD`, `SHRINK`, `GROUP_ROLLBACK`, `ROLLBACK`
+- **class `GateEvidence`** — Everything the gate decides on for one decision.
+- **class `GateVerdict`** — Result of evaluating one :class:`GateEvidence` (pure statistics, no weight changes).
+  - `retention_ok`
+  - `to_dict(self) -> 'dict[str, Any]'`
+  - `transfer_ok`
+- **class `Item`** — One verifiable task instance.
+- **class `OperatorReport`** — What one operator update did. ``v1_pass`` / ``v2_pass`` are per-rollout verifier outcomes on the training rollouts of this update (same order, same length), used by the tier-1 alarm. ``screened`` counts rollouts excluded from the update because V1 and V2 disagreed.
+- **class `PairedScores`** — Scores of the incumbent and the candidate on the *same* items of one slice.
+  - `discordant(self) -> 'tuple[int, int]'` — ``(n01, n10)`` for binary scores: candidate-only wins, incumbent-only wins.
+  - `is_binary`
+  - `mean_difference(self) -> 'float'` — Mean of candidate - incumbent (positive = candidate better).
+  - `n`
+- **class `ParameterSpace`** — A flat, ``dim``-dimensional coordinate system over some model parameters.
+  - `parameter_names(self) -> 'list[str]'`
+  - `rebase(self) -> 'None'`
+  - `write(self, vector: 'torch.Tensor | None') -> 'None'`
+- **class `RollbackUnit`** — Finest unit a failed retention test may revert.
+  - members: `CHANNELS`, `PARAMETERS`
+- **class `ScoreFn`** — Base class for protocol classes.
+- **class `SliceTest`** — One statistical test inside a verdict.
+  - `to_dict(self) -> 'dict[str, Any]'`
+- **class `Split`** — Where an item may be used. Rule-level disjointness between splits is enforced by the task generators (:mod:`research_rl.capability.tasks`), not by this enum.
+  - members: `TRAIN`, `T_RULE`, `T_TASK`, `RETENTION`, `AUDIT`
+- **class `UpdateOperator`** — Produces one parameter update per :meth:`step`, in place on ``model``.
+  - `load_state_dict(self, state: 'Mapping[str, Any]') -> 'None'`
+  - `on_decision(self, decision: 'GateDecision') -> 'None'`
+  - `parameter_names(self) -> 'list[str]'`
+  - `state_dict(self) -> 'dict[str, Any]'`
+  - `step(self, model: 'nn.Module', update_index: 'int') -> 'OperatorReport'`
+
+## `research_rl.capability.weights`
+
+Exact weight snapshots, temporary swaps, interpolation and channel-group rollback.
+
+- **class `SnapshotError`** — A snapshot does not fit the model / optimizer it is applied to (raised before any write).
+- **class `StateSnapshot`** — An exact copy of (part of) a model's training state. Treat it as immutable.
+  - `names(self) -> 'list[str]'` — Captured parameter names, in ``named_parameters`` order.
+  - `verify(self) -> 'None'` — Raise :class:`SnapshotError` if ``params`` no longer match ``fingerprint`` (mutated).
+- `capture(model: 'nn.Module', names: 'Iterable[str] | None', *, optimizer: 'torch.optim.Optimizer | None' = None, channel_layers: 'Iterable[int] | None' = None) -> 'StateSnapshot'` — Snapshot the parameters ``names`` (``None`` = every parameter), the optimizer and masters.
+- `channel_groups_by_damage(incumbent: 'StateSnapshot', candidate_model: 'nn.Module', activation_scores: 'Mapping[int, torch.Tensor]', groups: 'Sequence[ChannelGroup]') -> 'list[ChannelGroup]'` — ``groups`` ordered by :func:`group_damage`, largest first.
+- `group_damage(incumbent: 'StateSnapshot', candidate_model: 'nn.Module', activation_scores: 'Mapping[int, torch.Tensor]', groups: 'Sequence[ChannelGroup]') -> 'dict[str, float]'` — Damage of each group: ``sum_{(layer, c) in group} displacement[layer, c] * activation[layer][c]``.
+- `interpolate(model: 'nn.Module', incumbent: 'StateSnapshot', candidate: 'StateSnapshot', lam: 'float', *, optimizer: 'torch.optim.Optimizer | None' = None) -> 'None'` — Write ``incumbent + lam * (candidate - incumbent)`` into the snapshots' parameters.
+- `restore(model: 'nn.Module', snapshot: 'StateSnapshot', *, optimizer: 'torch.optim.Optimizer | None' = None, restore_optimizer: 'bool' = True) -> 'None'` — Write the snapshot back: parameters, optimizer state and masters bit-identical to it.
+- `revert_groups(model: 'nn.Module', incumbent: 'StateSnapshot', groups: 'Sequence[ChannelGroup]', *, optimizer: 'torch.optim.Optimizer | None' = None) -> 'list[RollbackReport]'` — Revert the channels of ``groups`` to the incumbent; returns one ``RollbackReport`` per group.
+- `swapped(model: 'nn.Module', snapshot: 'StateSnapshot') -> 'Iterator[StateSnapshot]'` — Temporarily load the snapshot's parameters (e.g. to evaluate the incumbent).
+<!-- capability-api:end -->
+
 ## `research_rl.core.checkpoint`
 
 Checkpoint contents and ResearchRL-specific resume state.

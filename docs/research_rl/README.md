@@ -44,6 +44,7 @@ trl 1.18.0, accelerate 1.15.0, peft 0.21.3, datasets 5.2.0, safetensors 0.8.0.
 | `rewards/` | deterministic `MathVerifier`, TRL reward adapter, **disabled-by-default** code sandbox interface | implemented / interface |
 | `state/` | recurrent-state contract (`FastSlowMemory`, `StateStore`), compute controllers and ledger | contract + reference impls |
 | `evaluation/` | metrics (pass@k, bootstrap CI, NLL), capability-retention suite and report | implemented |
+| `capability/` | capability-gated training: synthetic operator-composition tasks with rule-level held-out splits, paired gate statistics with an alpha ledger, exact snapshots / rollback, forward-only ES operator, gated loop, TRL GRPO gate callback, subset search, declarative channel edits with a version store, the P0 pilot; local edit UI in `ui/` | implemented, CPU-verified only (GPU: NOT_TESTED) |
 | `utils/` | logging, profiling (GPU numbers only when measured on CUDA) | implemented |
 
 ## Quick start
@@ -205,6 +206,34 @@ See `research_rl/optim/precision.py` and the `HookedOptimizer` docstring.
   support-restricted reverse KL inside a policy-gradient surrogate) is **not** implemented in V1.0;
   `trainers/multi_teacher.py` provides routed aggregation / masked-KL helpers (tested offline) and a
   static-weight `TeacherEnsemble` for TRL's full-vocabulary JSD `DistillationTrainer`.
+
+## Capability-gated training (`research_rl.capability`)
+
+Training reward is not treated as the measure of learning. A block of updates (GRPO, or the
+forward-only `ESOperator`) is a *candidate*; it replaces the *incumbent* only when a paired test on
+freshly drawn held-out items shows that transfer rose and no retention slice fell by more than a
+margin. Otherwise the loop holds, shrinks the step, reverts channel groups or rolls back
+(parameters and optimizer state restored bit-exactly). A tier-1 alarm watches the gap between a
+lenient training verifier (V1) and the strict gate verifier (V2).
+
+```python
+from research_rl.capability import CapabilityGate, CapabilityProbe, GateConfig, GateController, GatedLoop
+```
+
+```bash
+python examples/capability_pilot_tiny.py --smoke --output-dir runs/capability_pilot_smoke
+```
+
+```bash
+python -m research_rl.ui --tiny-demo        # local channel search + edit tool on 127.0.0.1
+```
+
+Design, as-built module map, a tested quickstart and the limits are in
+[CAPABILITY.md](CAPABILITY.md). In short: verified on CPU with tiny models only (GPU paths and
+`scripts/gpu/capability_p1.py` are NOT_TESTED); the run-level false-accept guarantee needs
+`alpha_schedule="spending"` (with `"per_decision"` it holds per verdict only) and covers the
+synthetic probe slices only, within a finite retention horizon; subset search returns noisy point
+estimates with no optimality claim; ES is not claimed to be stronger than backprop.
 
 ## Experiment records
 
