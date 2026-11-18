@@ -164,10 +164,13 @@ def test_dry_run_pipeline_semantics(dry_run: tuple[Path, dict[str, Any], _NoNetw
     for arm in results["arms"]:
         assert len(arm["blocks"]) == 1
         assert arm["counts"]["rollouts"] > 0
-        # the arms really train: some update had signal and the operator's weights moved (bf16
-        # served weights; GRPO through fp32 masters + MaskRule, ES through ChannelGainSpace)
-        assert arm["updates_with_signal"] > 0, arm["key"]
-        assert arm["weights_changed"] is True, arm["key"]
+        # an update with signal moves the operator's weights and an arm without any does not (bf16
+        # served weights; GRPO through fp32 masters + MaskRule, ES through ChannelGainSpace). Whether
+        # the 2-update ES arm of this tiny dry-run start gets any signal is chance (members' greedy
+        # outputs must differ on some item): measured 0 of 2 updates in 1 of 4 seeds, and on one CI
+        # runner at seed 0. GRPO had signal in every measured seed and is required to.
+        assert arm["weights_changed"] is (arm["updates_with_signal"] > 0), arm["key"]
+    assert by_op["grpo"]["updates_with_signal"] > 0
     assert by_op["grpo"]["counts"]["backward_calls"] == block
     assert by_op["es_informed"]["counts"]["backward_calls"] == 0
     # memory plan: computed, labelled, with the phases of the arms present

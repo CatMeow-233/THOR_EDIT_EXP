@@ -1074,9 +1074,10 @@ def build_dry_run_model(config: PilotConfig) -> tuple[nn.Module, Any]:
 def dry_run_config(**overrides: Any) -> PilotConfig:
     """``--dry-run`` configuration: :func:`~research_rl.capability.pilot.smoke_config` with ES over
     ChannelGainSpace, one gate block per arm (``updates = block_updates``) and 400 SFT steps (bf16
-    on CPU is slow; the dry run checks plumbing and its start is not meant to be good, but with 400
-    steps both default arms get updates with signal - some V1 passes - and move their weights,
-    measured: about 15 s on 2 CPU threads)."""
+    on CPU is slow; the dry run checks plumbing and its start is not meant to be good). With 400 steps
+    the GRPO arm got updates with signal (some V1 passes) and moved its weights in every measured
+    seed; whether the 2-update ES arm gets any signal is chance (0 of 2 updates in 1 of 4 seeds
+    measured, then its weights correctly stay put). About 15-20 s on 2 CPU threads."""
     base = smoke_config()
     block = base.base_gate_config().block_updates
     values: dict[str, Any] = {
