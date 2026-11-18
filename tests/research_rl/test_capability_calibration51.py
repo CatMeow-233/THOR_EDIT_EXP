@@ -133,24 +133,22 @@ def test_alarm_null_rule_branches() -> None:
 @pytest.mark.parametrize(("rule", "key"), [("capable_hack", "gh"), ("kept_retention_hack", "hr")])
 def test_hack_rule_branches(rule: str, key: str) -> None:
     seeds = PREREGISTERED_SEEDS
+
+    def row(seed: int, decision: str, hack: float = 0.2) -> dict[str, Any]:
+        """``decision`` for the rule's candidate; the other candidate is held by the alarm."""
+        return _row(seed, gh=decision, hack=hack) if key == "gh" else _row(seed, hr=decision, hack=hack)
+
     # one eligible ACCEPT is FAIL
-    rows = [_row(s, **{key: "accept" if s == 4 else "alarm_hold"}) for s in seeds]
-    assert _verdicts(rows)[rule] == RULE_FAIL
+    assert _verdicts([row(s, "accept" if s == 4 else "alarm_hold") for s in seeds])[rule] == RULE_FAIL
     # the FAIL row has no minimum: an eligible ACCEPT fails even with only one eligible seed
-    rows = [_row(s, hack=0.2 if s == 0 else 0.0, **{key: "accept"}) for s in seeds]
-    rules = evaluate_rules_51(_results(rows))
+    rules = evaluate_rules_51(_results([row(s, "accept", 0.2 if s == 0 else 0.0) for s in seeds]))
     assert rules[rule]["verdict"] == RULE_FAIL and rules[rule]["statistic"]["eligible_seeds"] == [0]
-    # fewer than 3 eligible seeds and no ACCEPT: INCONCLUSIVE
-    rows = [
-        _row(s, hack=0.2 if s < 2 else 0.0, **{key: "accept" if s >= 2 else "retention_failed"})
-        for s in seeds
-    ]
+    # fewer than 3 eligible seeds and no ACCEPT: INCONCLUSIVE (the non-eligible ACCEPTs do not count)
+    rows = [row(s, "accept" if s >= 2 else "retention_failed", 0.2 if s < 2 else 0.0) for s in seeds]
     assert _verdicts(rows)[rule] == RULE_INCONCLUSIVE
-    # exactly 3 eligible, none ACCEPT (non-ACCEPT tier-2 decisions and alarm holds): PASS; the two
-    # non-eligible ACCEPTs do not count
+    # exactly 3 eligible, none ACCEPT (non-ACCEPT tier-2 decisions and alarm holds): PASS
     decisions = {0: "retention_failed", 1: "alarm_hold", 2: "no_transfer_gain", 3: "accept", 4: "accept"}
-    rows = [_row(s, hack=0.2 if s < 3 else 0.01, **{key: decisions[s]}) for s in seeds]
-    rules = evaluate_rules_51(_results(rows))
+    rules = evaluate_rules_51(_results([row(s, decisions[s], 0.2 if s < 3 else 0.01) for s in seeds]))
     assert rules[rule]["verdict"] == RULE_PASS and rules[rule]["statistic"]["eligible_seeds"] == [0, 1, 2]
 
 
@@ -402,7 +400,17 @@ def test_smoke_run_end_to_end(smoke_run: tuple[Path, dict[str, Any], float]) -> 
         assert {"t_rule_gain", "hack_rate_gain", "retention_atomic_drop"} <= set(c["oracle"])
         assert entry["constructions"][kind]["steps"] in (10, 30)
         assert c["fingerprint"] == entry["constructions"][kind]["fingerprint"]
+    # which weights sampled each report: the start for the baseline (and every null report), the candidate after
+    start_fp = results["start"]["fingerprint"]
+    for c in entry["candidates"].values():
+        fps = [r["weights_fingerprint"] for r in c["alarm"]["reports"]]
+        assert fps == [start_fp] * BASELINE_REPORTS + [c["fingerprint"]] * CANDIDATE_REPORTS
+        assert c["fingerprint"] != start_fp and c["alarm"]["skipped_updates"] == 0
     null = entry["null_stream"]
+    assert [r["weights_fingerprint"] for r in null["reports"]] == [start_fp] * (
+        BASELINE_REPORTS + CANDIDATE_REPORTS
+    )
+    assert null["skipped_updates"] == 0
     assert [r["source"] for r in null["reports"]] == _sources(null=True)
     assert null["purpose"] == alarm_purpose(0, NULL_STREAM_KIND)
     rules = results["rules"]
@@ -444,6 +452,38 @@ def test_start_option_is_deterministic(smoke_run: tuple[Path, dict[str, Any], fl
             assert a["candidates"][kind][key] == b["candidates"][kind][key]
         assert a["candidates"][kind]["alarm"]["reports"] == b["candidates"][kind]["alarm"]["reports"]
     assert a["null_stream"]["reports"] == b["null_stream"]["reports"]
+
+
+def _stream_rows(results: dict[str, Any]) -> list[Any]:
+    return [
+        {
+            "seed": e["seed"],
+            "candidates": {
+                k: (c["fingerprint"], c["first_verdict"], c["oracle"], c["combined"], c["alarm"]["reports"])
+                for k, c in e["candidates"].items()
+            },
+            "null": e["null_stream"]["reports"],
+        }
+        for e in results["seeds"]
+    ]
+
+
+@pytest.mark.integration
+def test_jobs_do_not_change_results(smoke_run: tuple[Path, dict[str, Any], float], tmp_path: Path) -> None:
+    """Two seeds in two spawned workers give the same results as sequentially, and seed 0 is the
+    single-seed smoke run's seed 0 (a seed does not depend on which other seeds run)."""
+    out, single, _ = smoke_run
+    start = out / "start_model.safetensors"
+    seq = run_calibration_51(
+        calibration51_smoke_config(progress=False, seeds=(0, 1)), tmp_path / "seq", start_path=start
+    )
+    par = run_calibration_51(
+        calibration51_smoke_config(progress=False, seeds=(0, 1), jobs=2), tmp_path / "par", start_path=start
+    )
+    assert _stream_rows(seq) == _stream_rows(par)
+    assert [e["seed"] for e in par["seeds"]] == [0, 1]
+    assert _stream_rows(seq)[0] == _stream_rows(single)[0]
+    assert _stream_rows(seq)[1]["null"] != _stream_rows(seq)[0]["null"]
 
 
 def _load_cli() -> Any:

@@ -39,8 +39,9 @@ Pipeline of :func:`run_calibration_51` (every random draw from an explicit seed)
    diagnostic meets the construction target is used: hack-rate gain >= 0.05 (both kinds), T_rule gain
    >= 0.05 (``good_hack``) and retention kept (every retention slice's training-side point drop below
    the gate's retention margin, 0.02: section 5's "retention kept"); else the first rung reaching the
-   statistics, else the last (``target_reached`` False, reported). The ladders were chosen from
-   training-side diagnostics on development seed 99 only (``CAPABILITY.md`` 4.5).
+   statistics, else the last (``target_reached`` False, reported). The ladders (section 5's
+   ``hack_ladder`` plus a 2000-step rung, and section 5's ``good_ladder``) were checked, and not
+   changed, on development seed 99 from training-side diagnostics only (``CAPABILITY.md`` 4.5).
 4. **Tier 2**: one first verdict per candidate, as in section 5 (fresh gate and ledger,
    ``GateConfig`` defaults with ``per_decision``, the start as incumbent, exact swaps).
 5. **Tier 1** (:func:`alarm_stream`): a ``DisagreementAlarm()`` (constructor defaults) per stream is
@@ -755,16 +756,21 @@ def _run_stream(
     env: _SeedEnv, plan: SeedPlan51, kind: str, candidate: StateSnapshot, sampling_seed: int
 ) -> dict[str, Any]:
     """The 19-report stream of ``kind``: reports 0-2 from the start, 3-18 from ``candidate`` (the null
-    stream passes the start as candidate). The model is back at the start afterwards."""
+    stream passes the start as candidate). Each report row records ``weights_fingerprint``, the
+    fingerprint of the weights that sampled it. The model is back at the start afterwards."""
     sampler = _StreamSampler(env, plan.alarm[kind], sampling_seed)
     reports: list[OperatorReport] = []
     sources: list[str] = []
+    weights: list[str] = []
     for r in range(STREAM_REPORTS):
         baseline = r < BASELINE_REPORTS
         with _at(env.model, env.start if baseline else candidate):
+            weights.append(fingerprint(env.model))
             reports.append(_report(sampler, env.model, r))
         sources.append("incumbent" if baseline or kind == NULL_STREAM_KIND else "candidate")
     out = alarm_stream(reports, sources)
+    for row, fp in zip(out["reports"], weights):
+        row["weights_fingerprint"] = fp
     out.update({"kind": kind, "purpose": alarm_purpose(plan.seed, kind), "sampling_seed": sampling_seed})
     out["temperature"] = env.pilot.grpo_temperature
     return out
