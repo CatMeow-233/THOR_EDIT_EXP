@@ -66,6 +66,7 @@ EAGER_MODULES = (
     "pilot",
     "calibration",
     "calibration_alarm",
+    "calibration_specificity",
 )
 LAZY_MODULE = "trl_gate"
 ALL_MODULES = (*EAGER_MODULES, LAZY_MODULE)

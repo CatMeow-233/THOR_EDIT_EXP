@@ -9,7 +9,7 @@ See [README.md](README.md) for concepts and [DEPLOY_GPU.md](DEPLOY_GPU.md) for G
 <!-- capability-api:begin -->
 ## `research_rl.capability`
 
-Capability-gated training (see [CAPABILITY.md](CAPABILITY.md)). The package re-exports every public name listed below (each module's `__all__`, and the shared types of `types`), 232 names in all: `from research_rl.capability import GatedLoop, ESOperator`. The `trl_gate` names are resolved lazily on first access, so `import research_rl.capability` does not import `trl_gate`, `research_rl.trainers` or TRL. CPU-verified with tiny models only; every GPU statement is NOT_TESTED.
+Capability-gated training (see [CAPABILITY.md](CAPABILITY.md)). The package re-exports every public name listed below (each module's `__all__`, and the shared types of `types`), 250 names in all: `from research_rl.capability import GatedLoop, ESOperator`. The `trl_gate` names are resolved lazily on first access, so `import research_rl.capability` does not import `trl_gate`, `research_rl.trainers` or TRL. CPU-verified with tiny models only; every GPU statement is NOT_TESTED.
 
 ## `research_rl.capability.alarm`
 
@@ -99,6 +99,32 @@ Follow-up 5.1 of the gate positive control: the tier-1 alarm (``CAPABILITY.md`` 
 - `render_calibration51_summary(results: 'Mapping[str, Any]') -> 'str'` — ``summary.md``: banner, setup, the per-seed table, constructions, the 5.1 rules and the descriptive tier-2-only counts.
 - `run_calibration_51(config: 'CalibrationAlarmConfig', output_dir: 'str | Path', *, start_path: 'str | Path | None' = None) -> 'dict[str, Any]'` — Run the 5.1 follow-up (module docstring) and write ``results.json`` / ``summary.md`` / ``calibration51_config.json`` (and ``start_model.safetensors`` when the start is rebuilt) to ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint; ``None`` rebuilds it. CPU only; nothing is downloaded.
 - constants: `ALARM_ITEMS_PER_REPORT`, `BASELINE_REPORTS`, `CALIB51_ORACLE_PURPOSE`, `CALIBRATION51_BANNER`, `CANDIDATE_REPORTS`, `KINDS_51`, `NULL_STREAM_KIND`, `RULES_51`
+
+## `research_rl.capability.calibration_specificity`
+
+Follow-up 5.2 of the gate positive control: alarm specificity on honest improvements.
+
+- **class `CalibrationSpecificityConfig`** — Every knob of the 5.2 follow-up (JSON-able via :meth:`to_dict` / :meth:`from_dict`).
+  - `from_dict(cls, data: 'Mapping[str, Any]') -> 'CalibrationSpecificityConfig'` — Inverse of :meth:`to_dict`; unknown keys raise ``ValueError``.
+  - `gate_config(self) -> 'Any'` — ``GateConfig(alpha_schedule="per_decision", **gate)`` (the section-5 gate).
+  - `pilot_config(self) -> 'PilotConfig'` — The ``PilotConfig`` of the start checkpoint (default + ``pilot`` overrides).
+  - `preregistration_deviations(self) -> 'list[str]'` — Every setting that differs from the pre-registered 5.2 run (empty for it): start, seeds, gate, oracle size and the ``good`` construction knobs (section 5's as-built defaults, ``CAPABILITY.md`` 4.4: 5.2 builds ``good`` "exactly as in section 5"). Execution settings are not deviations.
+  - `section5(self) -> 'CalibrationConfig'` — The section-5 config carrying this config's start, seeds, gate, oracle size and ``good`` construction knobs (validation, the ``pilot_config`` / ``gate_config`` builders, the ladder and the deviation check are section 5's).
+  - `to_dict(self) -> 'dict[str, Any]'` — JSON-able dict (tuples as lists); :meth:`from_dict` inverts it.
+- **class `SeedPlan52`** — The item plan of one seed under the 5.2 purposes: the section-5 :class:`~research_rl.capability.calibration.SeedPlan` fields (``gate`` per 5.2 kind, ``oracle``, ``training`` / ``diagnostic`` of the one construction ``good``: compositions followed by the 1:1 replay) and 5.1's ``alarm`` (``{kind: [report 0 items, ..., report 18 items]}``, one stream per candidate, no null stream).
+  - `check_disjoint(self) -> 'None'` — Section 5's checks (:meth:`SeedPlan.check_disjoint`) plus 5.1's alarm checks for the two candidate streams: 19 reports of 64 distinct ``train/pairs`` items each, and no alarm uid is a training uid (replay included), an SFT uid of the start, a diagnostic, gate, oracle or start-map uid.
+  - `summary(self) -> 'dict[str, Any]'` — JSON-able counts, purposes and the disjointness result.
+- `alarm_purpose_52(seed: 'int', kind: 'str') -> 'str'` — Alarm-item purpose of the stream of ``kind``: ``calib52/alarm/<seed>/<kind token>``; the index is the report number (0-18).
+- `build_seed_plan_52(config: 'CalibrationSpecificityConfig', sampler: 'ItemSampler', probe: 'CapabilityProbe', seed: 'int', *, replay: 'Sequence[Item]', start_uids: 'frozenset[str]') -> 'SeedPlan52'` — The 5.2 item plan of ``seed`` (module docstring, step 2), checked by :meth:`SeedPlan52.check_disjoint` before it is returned. ``replay`` is the start's SFT data, ``start_uids`` the start-map uids.
+- `calibration52_smoke_config(**overrides: 'Any') -> 'CalibrationSpecificityConfig'` — The ``--smoke`` configuration: seed 0, the section-5 smoke start, gate, item counts and ``good`` ladder (:func:`~research_rl.capability.calibration.calibration_smoke_config`). The stream keeps its 5.1 shape (3 + 16 reports of 64 items). A plumbing check: every rule is INCONCLUSIVE and its numbers are not results. ``pilot`` / ``gate`` overrides are merged key by key.
+- `construction_purpose_52(seed: 'int') -> 'str'` — ``calib52/good/<seed>`` (index 0 = training items, 1 = training-side diagnostic items).
+- `descriptive_52(rows: 'Mapping[int, Mapping[str, Any]]') -> 'dict[str, Any]'` — The 5.2 descriptive quantities (no rule depends on them; pure): per kind the eligible seeds, the seeds whose stream fired, the per-report V1-V2 gaps and their ranges, the first firing report per seed, the tier-2 accepts and the **false holds** (tier-2 accepts the alarm turned into ``alarm_hold``: every one is a false hold of an honest candidate, eligible or not, listed both ways) and whether the ``good`` construction reached its training-side target.
+- `evaluate_rules_52(results: 'Mapping[str, Any]') -> 'dict[str, Any]'` — The 5.2 table on a results dict (pure; synthetic dicts work).
+- `gate_namespace_52(seed: 'int', kind: 'str') -> 'str'` — Probe namespace of candidate ``kind``: ``calib52/<seed>/<kind token>`` (``good@1.0`` -> ``good_1.0``; sampler purpose + ``/gate/0``).
+- `hack_stream_gaps_51(results_51: 'Mapping[str, Any]') -> 'dict[str, Any]'` — The 5.1 hack streams' per-report V1-V2 gaps from a 5.1 ``results.json`` dict (pure; for comparison only): per kind (``hack_replay``, ``good_hack``) and seed the 19 gaps, the first firing report and the incumbent / candidate gap ranges over all seeds, and the null streams' gap range.
+- `render_calibration52_summary(results: 'Mapping[str, Any]') -> 'str'` — ``summary.md``: banner, setup, the per-seed table (with the per-report gaps), the construction rungs, the 5.2 rules and the descriptive quantities (false holds, first firing reports, the 5.1 hack streams' gaps for comparison).
+- `run_calibration_52(config: 'CalibrationSpecificityConfig', output_dir: 'str | Path', *, start_path: 'str | Path | None' = None, comparison_path: 'str | Path | None' = None) -> 'dict[str, Any]'` — Run the 5.2 follow-up (module docstring) and write ``results.json`` / ``summary.md`` / ``calibration52_config.json`` (and ``start_model.safetensors`` when the start is rebuilt) to ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint; ``None`` rebuilds it. ``comparison_path``: the 5.1 ``results.json`` whose hack-stream gaps are reported for comparison (``None``: :data:`CALIBRATION51_RESULTS` in this repository; a missing file is reported, not an error). CPU only; nothing is downloaded.
+- constants: `CALIB52_ORACLE_PURPOSE`, `CALIBRATION51_RESULTS`, `CALIBRATION52_BANNER`, `KINDS_52`, `LAMBDAS_52`, `RULES_52`
 
 ## `research_rl.capability.edits`
 

@@ -1039,6 +1039,8 @@ def _construct(
     v1_fn: VerifierScoreFn,
     v2_fn: VerifierScoreFn,
     rule_slices: Sequence[str],
+    *,
+    seed_tag: str = "calib_sft",
 ) -> tuple[StateSnapshot, dict[str, Any]]:
     """The construction ladder (module docstring, step 3), every rung trained afresh from the start.
 
@@ -1046,7 +1048,9 @@ def _construct(
     else the last rung (``target_reached`` False). ``good``: the first rung that reaches the T_rule
     gain target **and** keeps retention (every retention slice's training-side point drop below the
     gate's ``retention_margin``, 0.02 at the section-5 gate); if no rung does both, the first rung that
-    reaches the gain (``retention_kept`` False), else the last rung. Every rung is recorded."""
+    reaches the gain (``retention_kept`` False), else the last rung. Every rung is recorded.
+    ``seed_tag`` names the SFT batch-stream seed (``_seed(seed_tag, pilot seed, plan seed,
+    construction, rung)``; section 5: ``"calib_sft"``, the follow-up 5.2 passes its own tag)."""
     pilot = config.pilot_config()
     statistic, target = _DIAG_STATISTIC[construction]
     margin = config.gate_config().retention_margin
@@ -1072,7 +1076,7 @@ def _construct(
         pilot,
         config.ladder(construction),
         batch_size=config.sft_batch_size or pilot.sft_batch_size,
-        seed_key=lambda i: _seed("calib_sft", pilot.seed, plan.seed, construction, i) % (2**31),
+        seed_key=lambda i: _seed(seed_tag, pilot.seed, plan.seed, construction, i) % (2**31),
         diag=diag,
         v1_fn=v1_fn,
         v2_fn=v2_fn,
@@ -1148,7 +1152,8 @@ def _log(config: CalibrationConfig, message: str) -> None:
 
 @dataclass
 class _SeedEnv:
-    """The per-seed objects shared by section 5 and its follow-up 5.1 (:mod:`calibration_alarm`):
+    """The per-seed objects shared by section 5 and its follow-ups 5.1 (:mod:`calibration_alarm`) and
+    5.2 (:mod:`calibration_specificity`):
     splits, the model at the start weights, the item sampler, the probe and score functions."""
 
     pilot: PilotConfig

@@ -396,7 +396,12 @@ class SeedPlan51(SeedPlan):
         distinct ``train/pairs`` items, and no alarm uid is a training uid (the candidates' training
         items, replay included), an SFT uid of the start, a diagnostic, gate, oracle or start-map uid."""
         super().check_disjoint()
-        if set(self.alarm) != set(STREAM_KINDS):
+        self._check_alarm(STREAM_KINDS)
+
+    def _check_alarm(self, kinds: Sequence[str]) -> None:
+        """The alarm-item checks of :meth:`check_disjoint` for the streams ``kinds`` (shared with the
+        follow-up 5.2, whose streams are its two candidates)."""
+        if set(self.alarm) != set(kinds):
             raise CalibrationIntegrityError(f"seed {self.seed}: alarm streams {sorted(self.alarm)}")
         for kind, reports in self.alarm.items():
             if len(reports) != STREAM_REPORTS:
@@ -521,23 +526,9 @@ def build_seed_plan_51(
         rng = random.Random(_seed("calib51_replay", pilot.seed, seed, kind))
         training[kind] = good + hack + rng.sample(kept_replay, n)
     forbidden_alarm = forbidden_train | core.sft_uids | {it.uid for g in training.values() for it in g}
-    alarm: dict[str, list[list[Item]]] = {}
-    for kind in STREAM_KINDS:
-        used: set[str] = set()
-        reports: list[list[Item]] = []
-        for r in range(STREAM_REPORTS):
-            items = oracle_items(
-                sampler,
-                ALARM_ITEMS_PER_REPORT,
-                r,
-                forbidden_alarm | used,
-                purpose=alarm_purpose(seed, kind),
-                slices=(HACK_SLICE,),
-                pool=None,
-            )[HACK_SLICE]
-            used |= {it.uid for it in items}
-            reports.append(items)
-        alarm[kind] = reports
+    alarm = {
+        kind: _alarm_reports(sampler, alarm_purpose(seed, kind), forbidden_alarm) for kind in STREAM_KINDS
+    }
     plan = SeedPlan51(
         seed=int(seed),
         gate=core.gate,
@@ -553,6 +544,27 @@ def build_seed_plan_51(
     )
     plan.check_disjoint()
     return plan
+
+
+def _alarm_reports(sampler: ItemSampler, purpose: str, forbidden: set[str]) -> list[list[Item]]:
+    """The 19 alarm reports of one stream: report ``r`` is :data:`ALARM_ITEMS_PER_REPORT` ``train/pairs``
+    items at ``purpose``, index ``r``, unpartitioned, minus ``forbidden`` and the stream's earlier
+    reports (shared with the follow-up 5.2)."""
+    used: set[str] = set()
+    reports: list[list[Item]] = []
+    for r in range(STREAM_REPORTS):
+        items = oracle_items(
+            sampler,
+            ALARM_ITEMS_PER_REPORT,
+            r,
+            forbidden | used,
+            purpose=purpose,
+            slices=(HACK_SLICE,),
+            pool=None,
+        )[HACK_SLICE]
+        used |= {it.uid for it in items}
+        reports.append(items)
+    return reports
 
 
 # ============================================================================== constructions
@@ -626,7 +638,14 @@ class _StreamSampler(TorchGRPOOperator):
     prompts of update ``r`` are the plan's report-``r`` items instead of ``sampler.draw(...)``. Only
     :meth:`rollouts` is used (never :meth:`step`): no weight changes."""
 
-    def __init__(self, env: _SeedEnv, reports: Sequence[Sequence[Item]], seed: int) -> None:
+    def __init__(
+        self,
+        env: _SeedEnv,
+        reports: Sequence[Sequence[Item]],
+        seed: int,
+        *,
+        name: str = "calib51_alarm_sampler",
+    ) -> None:
         v1, v2 = _verifiers(env.pilot, "leak")
         super().__init__(
             env.model,
@@ -641,7 +660,7 @@ class _StreamSampler(TorchGRPOOperator):
             temperature=env.pilot.grpo_temperature,
             screen=False,
             seed=seed,
-            name="calib51_alarm_sampler",
+            name=name,
         )
         self._reports = [list(r) for r in reports]
 
@@ -715,12 +734,21 @@ def alarm_stream(reports: Sequence[OperatorReport], sources: Sequence[str]) -> d
 
 
 def _run_stream(
-    env: _SeedEnv, plan: SeedPlan51, kind: str, candidate: StateSnapshot, sampling_seed: int
+    env: _SeedEnv,
+    plan: SeedPlan51,
+    kind: str,
+    candidate: StateSnapshot,
+    sampling_seed: int,
+    *,
+    purpose: str | None = None,
+    sampler_name: str = "calib51_alarm_sampler",
 ) -> dict[str, Any]:
     """The 19-report stream of ``kind``: reports 0-2 from the start, 3-18 from ``candidate`` (the null
     stream passes the start as candidate). Each report row records ``weights_fingerprint``, the
-    fingerprint of the weights that sampled it. The model is back at the start afterwards."""
-    sampler = _StreamSampler(env, plan.alarm[kind], sampling_seed)
+    fingerprint of the weights that sampled it. The model is back at the start afterwards.
+    ``purpose`` (recorded; default :func:`alarm_purpose`) and ``sampler_name`` (a label only) let the
+    follow-up 5.2 run the same stream on its own items."""
+    sampler = _StreamSampler(env, plan.alarm[kind], sampling_seed, name=sampler_name)
     reports: list[OperatorReport] = []
     sources: list[str] = []
     weights: list[str] = []
@@ -733,7 +761,13 @@ def _run_stream(
     out = alarm_stream(reports, sources)
     for row, fp in zip(out["reports"], weights):
         row["weights_fingerprint"] = fp
-    out.update({"kind": kind, "purpose": alarm_purpose(plan.seed, kind), "sampling_seed": sampling_seed})
+    out.update(
+        {
+            "kind": kind,
+            "purpose": alarm_purpose(plan.seed, kind) if purpose is None else purpose,
+            "sampling_seed": sampling_seed,
+        }
+    )
     out["temperature"] = env.pilot.grpo_temperature
     return out
 
