@@ -291,7 +291,9 @@ def test_default_config_is_section_5() -> None:
 def test_section_5_is_unchanged() -> None:
     """Section 5 (design and rules fixed before any run) is byte-identical to the pre-registration."""
     text = CAPABILITY_MD.read_text(encoding="utf-8")
-    section = text[text.index("## 5. Exploratory positive control") :].strip()
+    start = text.index("## 5. Exploratory positive control")
+    end = text.find("### 5.1 Follow-up", start)  # 5.1 was appended after the section-5 run
+    section = text[start : end if end >= 0 else None].strip()
     assert hashlib.sha256(section.encode("utf-8")).hexdigest() == SECTION_5_SHA256
 
 
