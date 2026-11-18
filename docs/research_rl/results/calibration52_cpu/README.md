@@ -179,3 +179,29 @@ Does not show:
 - The smoke configuration (seeds 0 and 1, smoke start: a different model) in the test suite, including the
   test run just before this launch; its numbers are not results.
 - No registered seed had been run at any other 5.2 setting before this run.
+
+## Post-run provenance and reading notes (added after commit `63df64a`)
+
+- The run's working tree was committed as `63df64a`. At that commit `calibration_specificity.py`, `calibration.py`
+  and `calibration_alarm.py` have the run-time sha256 values listed above (`e1cf27ab...`, `46f2329d...`,
+  `2824f146...`), and `examples/capability_calibration52_tiny.py` has the post-run docstring-only value
+  `ca67ae47...`. ResearchRL CI passed on `63df64a`.
+- Development seed 99 (not a registered seed) was first run before the review-fix stage, which moved section 5's
+  `good` draws into the shared helpers `_good_diagnostic` / `_good_training`. It was rerun once at `63df64a`
+  with the same `--start`: the `seeds` payload (timings, hashes and paths aside) is identical. The fix did not
+  change behaviour on that seed.
+- Why tier 2 rejected every good@1.0 (read from `results.json`). Each row gives the retention slices that failed
+  (gate drop point / upper bound against the 0.02 margin), and the oracle drop on the same slices (512 items, so
+  one standard error is about 0.01):
+
+  | seed | failed slices: gate point / bound | oracle drop on those slices |
+  |---|---|---|
+  | 0 | atomic 0.0122 / 0.0230 | atomic 0.0059 |
+  | 1 | atomic 0.0137 / 0.0250; prereq 0.0146 / 0.0339 | atomic 0.0117; prereq 0.0312 |
+  | 2 | copy 0.0195 / 0.0253 | copy 0.0312 |
+  | 3 | atomic 0.0215 / 0.0321; prereq 0.0117 / 0.0303 | atomic 0.0234; prereq -0.0020 |
+  | 4 | atomic 0.0132 / 0.0236 | atomic 0.0195 |
+
+  In seeds 1, 2 and 3 the oracle also shows a drop above 0.02 on a failed slice. In seeds 0 and 4 it does not,
+  so those two rejections look like limited retention-test power at 2048 items, not real forgetting. The
+  oracle is noisy at this size, so this is descriptive, not a verdict. The margin was not changed.
