@@ -11,3 +11,4 @@ done
 python examples/capability_pilot_tiny.py --smoke --output-dir "${OUT}/capability_pilot_tiny"
 python examples/capability_calibration_tiny.py --smoke --output-dir "${OUT}/capability_calibration_tiny"
 python examples/capability_calibration51_tiny.py --smoke --output-dir "${OUT}/capability_calibration51_tiny"
+python examples/capability_calibration52_tiny.py --smoke --output-dir "${OUT}/capability_calibration52_tiny"

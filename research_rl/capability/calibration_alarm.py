@@ -70,9 +70,7 @@ start weights)``, with ``threads_per_seed`` torch threads whether seeds run sequ
 from __future__ import annotations
 
 import dataclasses
-import json
 import math
-import platform
 import random
 import time
 from collections.abc import Mapping, Sequence
@@ -80,7 +78,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import torch
 from torch import nn
 
 from research_rl.capability.alarm import REASON_GAP, UNITS_KEY, DisagreementAlarm
@@ -91,7 +88,6 @@ from research_rl.capability.calibration import (
     HACK_THRESHOLD,
     MIN_ELIGIBLE_SEEDS,
     ORACLE_ITEMS,
-    P0_START_FINGERPRINT,
     PREREGISTERED_SEEDS,
     RULE_FAIL,
     RULE_INCONCLUSIVE,
@@ -100,20 +96,25 @@ from research_rl.capability.calibration import (
     CalibrationIntegrityError,
     SeedPlan,
     _at,
+    _begin_run,
     _compare,
+    _config_from_dict,
+    _config_to_dict,
     _Context,
     _filter_replay,
+    _finish_run,
     _hacked_items,
     _judge,
     _ladder,
     _measure,
+    _merge_overrides,
     _oracle_value,
     _plan_core,
-    _prepare_start,
+    _results_head,
     _retention_kept,
     _rule,
+    _run_all_seeds,
     _run_ladder,
-    _run_seeds,
     _scoped,
     _seed_env,
     _SeedEnv,
@@ -125,7 +126,6 @@ from research_rl.capability.operators import TorchGRPOOperator
 from research_rl.capability.pilot import (
     NOT_TESTED,
     PilotConfig,
-    _finite,
     _fmt,
     _seed,
     _torch_threads,
@@ -136,7 +136,7 @@ from research_rl.capability.probe import CapabilityProbe
 from research_rl.capability.tasks import ItemSampler
 from research_rl.capability.types import Item, OperatorReport, Split
 from research_rl.capability.weights import StateSnapshot
-from research_rl.models.model_interface import count_parameters, fingerprint
+from research_rl.models.model_interface import fingerprint
 
 __all__ = [
     "ALARM_ITEMS_PER_REPORT",
@@ -308,23 +308,12 @@ class CalibrationAlarmConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-able dict (tuples as lists); :meth:`from_dict` inverts it."""
-        out = dataclasses.asdict(self)
-        for key, value in out.items():
-            if isinstance(value, tuple):
-                out[key] = [list(v) if isinstance(v, tuple) else v for v in value]
-        return out
+        return _config_to_dict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> CalibrationAlarmConfig:
         """Inverse of :meth:`to_dict`; unknown keys raise ``ValueError``."""
-        known = {f.name for f in dataclasses.fields(cls)}
-        unknown = sorted(set(data) - known)
-        if unknown:
-            raise ValueError(f"unknown CalibrationAlarmConfig keys: {unknown}")
-        kwargs: dict[str, Any] = dict(data)
-        if isinstance(kwargs.get("seeds"), list):
-            kwargs["seeds"] = tuple(kwargs["seeds"])
-        return cls(**kwargs)
+        return _config_from_dict(cls, data)
 
 
 def calibration51_smoke_config(**overrides: Any) -> CalibrationAlarmConfig:
@@ -348,12 +337,7 @@ def calibration51_smoke_config(**overrides: Any) -> CalibrationAlarmConfig:
         "threads_per_seed": 2,
         "smoke": True,
     }
-    overrides = dict(overrides)
-    for key in ("pilot", "gate"):
-        if key in overrides:
-            base[key] = {**base[key], **dict(overrides.pop(key) or {})}
-    base.update(overrides)
-    return CalibrationAlarmConfig(**base)
+    return CalibrationAlarmConfig(**_merge_overrides(base, overrides))
 
 
 # ============================================================================== item plan
@@ -1070,70 +1054,116 @@ def _gaps(stream: Mapping[str, Any]) -> str:
     return " ".join(f"{row['gap']:+.2f}" for row in stream.get("reports", []))
 
 
-def render_calibration51_summary(results: Mapping[str, Any]) -> str:
-    """``summary.md``: banner, setup, the per-seed table, constructions, the 5.1 rules and the
-    descriptive tier-2-only counts."""
-    lines = [
-        "# Tier-1 alarm follow-up (CAPABILITY.md section 5.1) summary",
-        "",
-        f"**{CALIBRATION51_BANNER}**",
-        "",
-    ]
-    lines.append(
-        "Post hoc and exploratory: reported separately from the P0 section-3 verdicts and the section-5 run, which "
-        f"it does not change. Every number comes from a tiny Llama on synthetic digit-string tasks on CPU. GPU metrics: {NOT_TESTED}."
-    )
-    lines.append("")
+def _summary_head(results: Mapping[str, Any], *, title: str, banner: str, posthoc: str) -> list[str]:
+    """The opening of a 5.1 / 5.2 ``summary.md``: title, banner, the post-hoc paragraph, the smoke note
+    and the warnings."""
+    lines = [title, "", f"**{banner}**", "", posthoc, ""]
     if results.get("config", {}).get("smoke"):
         lines += ["> SMOKE RUN: tiny item counts and one seed; the verdicts below are not meaningful.", ""]
     for warning in results.get("warnings", []):
         lines.append(f"> WARNING: {warning}")
     if results.get("warnings"):
         lines.append("")
+    return lines
+
+
+def _setup_lines(
+    results: Mapping[str, Any],
+    *,
+    section: str,
+    kind_label: str,
+    candidates: Sequence[str] = (),
+    oracle_note: str = "",
+) -> list[str]:
+    """The ``## Setup`` block of a 5.1 / 5.2 ``summary.md`` (``section`` = ``calib51`` / ``calib52``,
+    ``kind_label`` = how the gate namespace and alarm purpose name the kind; ``candidates``: lines
+    after the start line; ``oracle_note``: appended to the oracle line), ending with the deviations."""
     start = results.get("start", {})
     gate = results.get("gate_config", {})
     stream = results.get("stream", {})
-    lines += [
+    lines = [
         "## Setup",
         "",
         f"- start: {start.get('source')} (fingerprint `{str(start.get('fingerprint'))[:16]}`, P0 start: "
         f"{_fmt(start.get('matches_p0'))}; {start.get('parameters')} parameters)",
+        *candidates,
         f"- tier 2: one first verdict per candidate, a fresh ledger each, alpha {gate.get('alpha')} "
         f"({gate.get('alpha_schedule')}), {gate.get('items_per_transfer_slice')} transfer / "
         f"{gate.get('items_per_retention_slice')} retention items per slice, retention margin {gate.get('retention_margin')}; "
-        "gate namespace `calib51/<seed>/<kind>`",
+        f"gate namespace `{section}/<seed>/<{kind_label}>`",
         f"- tier 1: `DisagreementAlarm()` defaults {results.get('alarm_config')}; {stream.get('baseline_reports')} "
         f"incumbent + {stream.get('candidate_reports')} candidate reports of {stream.get('items_per_report')} fresh "
         f"train-pair items, one sampled completion each at temperature {stream.get('temperature')}; items at "
-        "`calib51/alarm/<seed>/<kind>`, index = report number; fires = a gap alarm on a candidate report",
+        f"`{section}/alarm/<seed>/<{kind_label}>`, index = report number; fires = a gap alarm on a candidate report",
         "- combined decision: tier-2 accept and no firing -> accept; tier-2 accept and a firing -> alarm_hold; "
         "otherwise the tier-2 decision",
-        f"- oracle: `calib51/oracle`, index = seed, {results.get('config', {}).get('oracle_items_per_slice')} items per "
-        "slice; hack rate = greedy V1 pass and V2 fail on train pairs",
+        f"- oracle: `{section}/oracle`, index = seed, {results.get('config', {}).get('oracle_items_per_slice')} items per "
+        f"slice; hack rate = greedy V1 pass and V2 fail on train pairs{oracle_note}",
     ]
     devs = results.get("preregistration", {}).get("deviations", [])
     lines.append(f"- pre-registration deviations: {'; '.join(devs) if devs else 'none'}")
-    lines += [
-        "",
-        "## Per seed",
-        "",
-        "| seed | candidate | tier-2 decision | alarm fired (first firing report) | combined decision | oracle T_rule gain "
-        "| hack-rate gain | retention/atomic drop | eligible | construction target | per-report V1-V2 gap |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
+    return lines
+
+
+def _candidate_row(seed: Any, kind: str, c: Mapping[str, Any]) -> str:
+    """One candidate's row of the 5.1 / 5.2 per-seed table (:data:`_SEED_TABLE_HEADER`)."""
+    o, a = c["oracle"], c["alarm"]
+    return (
+        f"| {seed} | {kind} | {c['first_verdict']['reason']} | {_fmt(a['fired'])} ({_fmt(a['first_firing_report'])}) | "
+        f"{c['combined']['decision']} | {_fmt(o.get('t_rule_gain'), 4)} | {_fmt(o.get('hack_rate_gain'), 4)} | "
+        f"{_fmt(o.get('retention_atomic_drop'), 4)} | {_fmt(c['eligibility']['eligible'])} | "
+        f"{'reached' if c['construction_target_reached'] else 'NOT reached'} | {_gaps(a)} |"
+    )
+
+
+_SEED_TABLE_HEADER: tuple[str, ...] = (
+    "",
+    "## Per seed",
+    "",
+    "| seed | candidate | tier-2 decision | alarm fired (first firing report) | combined decision | oracle T_rule gain "
+    "| hack-rate gain | retention/atomic drop | eligible | construction target | per-report V1-V2 gap |",
+    "|---|---|---|---|---|---|---|---|---|---|---|",
+)
+
+
+def _stream_blocks(pilot: PilotConfig, *, purpose: str, pool: str) -> dict[str, Any]:
+    """The ``alarm_config`` and ``stream`` blocks of a 5.1 / 5.2 ``results.json`` (``purpose`` and
+    ``pool`` describe that section's alarm-item draw)."""
+    return {
+        "alarm_config": DisagreementAlarm().config(),
+        "stream": {
+            "baseline_reports": BASELINE_REPORTS,
+            "candidate_reports": CANDIDATE_REPORTS,
+            "items_per_report": ALARM_ITEMS_PER_REPORT,
+            "completions_per_item": 1,
+            "temperature": pilot.grpo_temperature,
+            "slice": HACK_SLICE,
+            "purpose": purpose,
+            "pool": pool,
+        },
+    }
+
+
+def render_calibration51_summary(results: Mapping[str, Any]) -> str:
+    """``summary.md``: banner, setup, the per-seed table, constructions, the 5.1 rules and the
+    descriptive tier-2-only counts."""
+    lines = _summary_head(
+        results,
+        title="# Tier-1 alarm follow-up (CAPABILITY.md section 5.1) summary",
+        banner=CALIBRATION51_BANNER,
+        posthoc="Post hoc and exploratory: reported separately from the P0 section-3 verdicts and the section-5 run, "
+        "which it does not change. Every number comes from a tiny Llama on synthetic digit-string tasks on CPU. GPU "
+        f"metrics: {NOT_TESTED}.",
+    )
+    lines += _setup_lines(results, section="calib51", kind_label="kind")
+    lines += _SEED_TABLE_HEADER
     for entry in results.get("seeds", []):
         seed = entry["seed"]
         for kind in KINDS_51:
             c = entry.get("candidates", {}).get(kind)
             if c is None:
                 continue
-            o, a = c["oracle"], c["alarm"]
-            lines.append(
-                f"| {seed} | {kind} | {c['first_verdict']['reason']} | {_fmt(a['fired'])} ({_fmt(a['first_firing_report'])}) | "
-                f"{c['combined']['decision']} | {_fmt(o.get('t_rule_gain'), 4)} | {_fmt(o.get('hack_rate_gain'), 4)} | "
-                f"{_fmt(o.get('retention_atomic_drop'), 4)} | {_fmt(c['eligibility']['eligible'])} | "
-                f"{'reached' if c['construction_target_reached'] else 'NOT reached'} | {_gaps(a)} |"
-            )
+            lines.append(_candidate_row(seed, kind, c))
         null = entry.get("null_stream")
         if null is not None:
             lines.append(
@@ -1198,32 +1228,9 @@ def run_calibration_51(
     ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint;
     ``None`` rebuilds it. CPU only; nothing is downloaded."""
     out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    t0 = time.perf_counter()
-    (out / "calibration51_config.json").write_text(json.dumps(config.to_dict(), indent=2), encoding="utf-8")
-    pilot = config.pilot_config()
-    warnings: list[str] = []
-    timing: dict[str, Any] = {}
-    t = time.perf_counter()
-    model, path, source = _prepare_start(pilot, out, start_path, lambda m: _log(config, m))
-    timing["start_s"] = time.perf_counter() - t
-    start_fp = fingerprint(model)
-    matches = start_fp == P0_START_FINGERPRINT
-    deviations = config.preregistration_deviations()
-    if not matches:
-        deviations.append(
-            f"start fingerprint {start_fp[:16]} is not the P0 start {P0_START_FINGERPRINT[:16]}"
-        )
-        if not config.pilot:
-            warnings.append("the default-config start does not reproduce the P0 start fingerprint")
-    _log(
-        config,
-        f"start {start_fp[:16]} (P0 start: {matches}); seeds {list(config.seeds)} with {config.jobs} job(s)",
-    )
-    ctx = _Context(config=config.to_dict(), start_path=str(path))
-    t = time.perf_counter()
-    seeds = _run_seeds(ctx, sorted(config.seeds), config.jobs, _seed_worker_51)
-    timing["seeds_s"] = time.perf_counter() - t
+    rs = _begin_run(config, out, "calibration51_config.json", start_path, lambda m: _log(config, m))
+    warnings = rs.warnings
+    seeds = _run_all_seeds(config, rs, _seed_worker_51)
     for entry in seeds:
         for kind, info in entry["constructions"].items():
             if not info["target_reached"]:
@@ -1238,45 +1245,17 @@ def run_calibration_51(
                     "excluded only as the rules say"
                 )
     rows = {int(e["seed"]): e for e in seeds}
-    gate_cfg = config.gate_config()
     results: dict[str, Any] = {
-        "version": _RESULTS_VERSION,
-        "banner": CALIBRATION51_BANNER,
-        "status": "complete",
-        "preregistration": {
-            "section": "docs/research_rl/CAPABILITY.md section 5.1 (exploratory, post hoc; rules fixed before any run)",
-            "deviations": deviations,
-        },
-        "config": config.to_dict(),
-        "environment": {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "device": "cpu",
-            "threads_per_seed": config.threads_per_seed,
-            "jobs": config.jobs,
-            "gpu": NOT_TESTED,
-        },
-        "start": {
-            "source": source,
-            "fingerprint": start_fp,
-            "p0_fingerprint": P0_START_FINGERPRINT,
-            "matches_p0": matches,
-            "parameters": count_parameters(model),
-        },
-        "gate_config": json.loads(json.dumps(dataclasses.asdict(gate_cfg), default=str)),
-        "alarm_config": DisagreementAlarm().config(),
-        "stream": {
-            "baseline_reports": BASELINE_REPORTS,
-            "candidate_reports": CANDIDATE_REPORTS,
-            "items_per_report": ALARM_ITEMS_PER_REPORT,
-            "completions_per_item": 1,
-            "temperature": pilot.grpo_temperature,
-            "slice": HACK_SLICE,
-            "purpose": "calib51/alarm/<seed>/<kind>, index = report number; kind in "
+        **_results_head(
+            config, rs, version=_RESULTS_VERSION, banner=CALIBRATION51_BANNER, section="section 5.1"
+        ),
+        **_stream_blocks(
+            config.pilot_config(),
+            purpose="calib51/alarm/<seed>/<kind>, index = report number; kind in "
             f"{list(STREAM_KINDS)} ('{NULL_STREAM_KIND}' = the null stream)",
-            "pool": "unpartitioned, minus every training (candidates' and the start's SFT data), diagnostic, gate, "
+            pool="unpartitioned, minus every training (candidates' and the start's SFT data), diagnostic, gate, "
             "oracle and start-map uid of the seed and the stream's earlier reports",
-        },
+        ),
         "definitions": {
             "fires": "a gap alarm ('gap_cusum' in the AlarmState reasons) on any of the 16 candidate reports "
             "(report numbers 3-18); length-collapse flags are recorded, not counted",
@@ -1295,10 +1274,4 @@ def run_calibration_51(
     }
     results["rules"] = evaluate_rules_51(results)
     results["descriptive"] = descriptive_51(rows)
-    timing["total_s"] = time.perf_counter() - t0
-    results["timing"] = timing
-    results = _finite(results)
-    (out / "results.json").write_text(json.dumps(results, indent=2, allow_nan=False), encoding="utf-8")
-    (out / "summary.md").write_text(render_calibration51_summary(results), encoding="utf-8")
-    _log(config, f"done in {timing['total_s']:.1f}s; wrote {out / 'results.json'} and {out / 'summary.md'}")
-    return results
+    return _finish_run(out, results, rs, render_calibration51_summary, lambda m: _log(config, m))

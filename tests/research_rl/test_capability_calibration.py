@@ -372,6 +372,63 @@ def test_plan_is_disjoint_and_uses_the_section_5_purposes(
     assert summary["gate"]["good@0.5"]["namespace"] == "calib/0/good_0.5"
 
 
+# sha256 of the smoke plan's ordered training / diagnostic uids and replay filter counts (seed 0),
+# recorded before the good draws were factored into _good_diagnostic / _good_training
+SMOKE_PLAN_DRAWS_SHA256 = "5689026ad4587a63bf325c859387cd045229917ede43428018803283eb33e856"
+
+
+def _plan_draws_digest(plan: SeedPlan) -> str:
+    blob = {
+        "training": {k: [it.uid for it in v] for k, v in plan.training.items()},
+        "diagnostic": {
+            k: {s: [it.uid for it in g] for s, g in per.items()} for k, per in plan.diagnostic.items()
+        },
+        "replay_removed": plan.replay_removed,
+    }
+    return hashlib.sha256(json.dumps(blob).encode("utf-8")).hexdigest()
+
+
+def test_good_draws_are_the_shared_helpers_and_unchanged(
+    smoke_plan: tuple[CalibrationConfig, ItemSampler, SeedPlan],
+) -> None:
+    """Section 5's good draws come from _good_diagnostic / _good_training (shared with 5.2), and the
+    refactor left the plan's draws (order, replay sample and replay filter) unchanged."""
+    config, sampler, plan = smoke_plan
+    assert _plan_draws_digest(plan) == SMOKE_PLAN_DRAWS_SHA256
+    assert list(plan.diagnostic) == ["good", "bad_hack", "bad_retention"]
+    purpose = cal.construction_purpose("good", 0)
+    forbidden = plan.gate_uids() | plan.oracle_uids() | set(plan.start_uids)
+    assert cal._good_diagnostic(sampler, config, forbidden, purpose=purpose) == plan.diagnostic["good"]
+    pilot = config.pilot_config()
+    replay = sft_examples(
+        sampler.splits, pilot.sft_examples, seed=pilot.seed, demo_pairs=pilot.sft_demo_pairs
+    )
+    train, removed, count = cal._good_training(
+        sampler,
+        config,
+        0,
+        forbidden | plan.diagnostic_uids(),
+        purpose=purpose,
+        replay=replay,
+        replay_tag="calib_replay",
+    )
+    assert train == plan.training["good"] and removed == plan.replay_removed and count == plan.replay_count
+    other, _, _ = cal._good_training(
+        sampler,
+        config,
+        0,
+        forbidden | plan.diagnostic_uids(),
+        purpose=purpose,
+        replay=replay,
+        replay_tag="other_tag",
+    )
+    assert other[:count] == train[:count] and other[count:] != train[count:]
+    with pytest.raises(ValueError, match="replay items left"):
+        cal._good_training(
+            sampler, config, 0, forbidden, purpose=purpose, replay=replay[:3], replay_tag="calib_replay"
+        )
+
+
 def test_check_disjoint_raises_on_a_leaked_item(
     smoke_plan: tuple[CalibrationConfig, ItemSampler, SeedPlan],
 ) -> None:

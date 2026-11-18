@@ -19,7 +19,8 @@ Examples::
 
 ``--smoke`` (one seed, the section-5 smoke start, item counts and ladder, the 5.1 stream shape) is a
 plumbing check: every rule is INCONCLUSIVE and its numbers are not results. The registered run (seeds
-0-4, ``--start`` the P0 start) has not been run (see ``CAPABILITY.md`` 4.6).
+0-4, ``--start`` the P0 start) was run once; its results are in ``docs/research_rl/results/calibration52_cpu/``
+(see ``CAPABILITY.md`` 4.6).
 """
 
 from __future__ import annotations

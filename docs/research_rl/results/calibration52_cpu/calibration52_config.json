@@ -1,0 +1,42 @@
+{
+  "pilot": {},
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "gate": {},
+  "oracle_items_per_slice": 512,
+  "diagnostic_items_per_slice": 256,
+  "diagnostic_retention_items_per_slice": 1024,
+  "good_examples": 4000,
+  "good_ladder": [
+    [
+      500,
+      0.001
+    ],
+    [
+      1000,
+      0.001
+    ],
+    [
+      2000,
+      0.001
+    ],
+    [
+      1000,
+      0.0003
+    ],
+    [
+      2000,
+      0.0003
+    ]
+  ],
+  "sft_batch_size": null,
+  "threads_per_seed": 2,
+  "jobs": 4,
+  "progress": true,
+  "smoke": false
+}

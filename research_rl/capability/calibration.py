@@ -102,7 +102,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -230,6 +230,48 @@ CONSTRUCTION_KNOBS: tuple[str, ...] = (
     "sft_batch_size",
 )
 """Construction fields whose departure from the class default is a pre-registration deviation."""
+
+
+_ConfigT = TypeVar("_ConfigT")
+
+
+def _config_to_dict(config: Any) -> dict[str, Any]:
+    """JSON-able dict of a calibration config dataclass (tuples as lists, tuples of tuples as lists of
+    lists); :func:`_config_from_dict` inverts it. Shared by the section-5, 5.1 and 5.2 configs."""
+    out = dataclasses.asdict(config)
+    for key, value in out.items():
+        if isinstance(value, tuple):
+            out[key] = [list(v) if isinstance(v, tuple) else v for v in value]
+    return out
+
+
+def _config_from_dict(
+    cls: type[_ConfigT], data: Mapping[str, Any], *, tuple_keys: Sequence[str] = ("seeds",)
+) -> _ConfigT:
+    """Inverse of :func:`_config_to_dict` for the dataclass ``cls``: unknown keys raise ``ValueError``
+    naming ``cls``; the lists under ``tuple_keys`` become tuples (the ladders are normalised by the
+    class itself)."""
+    known = {f.name for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise ValueError(f"unknown {cls.__name__} keys: {unknown}")
+    kwargs: dict[str, Any] = dict(data)
+    for key in tuple_keys:
+        if isinstance(kwargs.get(key), list):
+            kwargs[key] = tuple(kwargs[key])
+    return cls(**kwargs)
+
+
+def _merge_overrides(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """A smoke configuration's fields: ``base`` with ``overrides`` replacing top-level fields, except
+    ``pilot`` and ``gate``, which are merged key by key into ``base``'s own dicts."""
+    out = dict(base)
+    rest = dict(overrides)
+    for key in ("pilot", "gate"):
+        if key in rest:
+            out[key] = {**out[key], **dict(rest.pop(key) or {})}
+    out.update(rest)
+    return out
 
 
 def _ladder(value: Any, name: str) -> _Ladder:
@@ -386,24 +428,12 @@ class CalibrationConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-able dict (tuples as lists); :meth:`from_dict` inverts it."""
-        out = dataclasses.asdict(self)
-        for key, value in out.items():
-            if isinstance(value, tuple):
-                out[key] = [list(v) if isinstance(v, tuple) else v for v in value]
-        return out
+        return _config_to_dict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> CalibrationConfig:
         """Inverse of :meth:`to_dict`; unknown keys raise ``ValueError``."""
-        known = {f.name for f in dataclasses.fields(cls)}
-        unknown = sorted(set(data) - known)
-        if unknown:
-            raise ValueError(f"unknown CalibrationConfig keys: {unknown}")
-        kwargs: dict[str, Any] = dict(data)
-        for key in ("seeds", "lambdas"):
-            if isinstance(kwargs.get(key), list):
-                kwargs[key] = tuple(kwargs[key])
-        return cls(**kwargs)
+        return _config_from_dict(cls, data, tuple_keys=("seeds", "lambdas"))
 
 
 def calibration_smoke_config(**overrides: Any) -> CalibrationConfig:
@@ -442,12 +472,7 @@ def calibration_smoke_config(**overrides: Any) -> CalibrationConfig:
         "threads_per_seed": 2,
         "smoke": True,
     }
-    overrides = dict(overrides)
-    for key in ("pilot", "gate"):
-        if key in overrides:
-            base[key] = {**base[key], **dict(overrides.pop(key) or {})}
-    base.update(overrides)
-    return CalibrationConfig(**base)
+    return CalibrationConfig(**_merge_overrides(base, overrides))
 
 
 smoke_config = calibration_smoke_config
@@ -716,6 +741,62 @@ def _filter_replay(
     return kept, {s: dict(sorted(v.items())) for s, v in sorted(removed.items())}
 
 
+def _good_diagnostic(
+    sampler: ItemSampler, config: CalibrationConfig, forbidden: set[str], *, purpose: str
+) -> dict[str, list[Item]]:
+    """Section 5's ``good`` training-side diagnostic draw: index 1 at ``purpose``, unpartitioned, minus
+    ``forbidden``; ``diagnostic_items_per_slice`` items per T_RULE slice (its statistic), then
+    ``diagnostic_retention_items_per_slice`` per RETENTION slice (the "retention kept" criterion), in
+    that order. Shared with 5.2 (:mod:`~research_rl.capability.calibration_specificity`)."""
+    splits = sampler.splits
+    diag = oracle_items(
+        sampler,
+        config.diagnostic_items_per_slice,
+        1,
+        forbidden,
+        purpose=purpose,
+        slices=splits.slices_of(Split.T_RULE),
+        pool=None,
+    )
+    diag.update(
+        oracle_items(
+            sampler,
+            config.diagnostic_retention_items_per_slice,
+            1,
+            forbidden,
+            purpose=purpose,
+            slices=splits.slices_of(Split.RETENTION),
+            pool=None,
+        )
+    )
+    return diag
+
+
+def _good_training(
+    sampler: ItemSampler,
+    config: CalibrationConfig,
+    seed: int,
+    forbidden_train: set[str],
+    *,
+    purpose: str,
+    replay: Sequence[Item],
+    replay_tag: str,
+) -> tuple[list[Item], dict[str, dict[str, int]], int]:
+    """Section 5's ``good`` training draw: ``good_examples`` :data:`GOOD_SLICE` compositions (index 0 at
+    ``purpose``, unpartitioned, minus ``forbidden_train``) followed by as many replay items sampled from
+    ``replay`` minus ``forbidden_train`` (``random.Random(_seed(replay_tag, pilot seed, seed))``). The
+    caller builds ``forbidden_train`` (section 5's also holds the bad constructions' diagnostics).
+    Returns ``(training items, replay_removed, replay count)``. Shared with 5.2."""
+    kept_replay, removed = _filter_replay(replay, forbidden_train)
+    good = oracle_items(
+        sampler, config.good_examples, 0, forbidden_train, purpose=purpose, slices=(GOOD_SLICE,), pool=None
+    )[GOOD_SLICE]
+    if len(kept_replay) < len(good):
+        raise ValueError(f"only {len(kept_replay)} SFT replay items left after filtering; need {len(good)}")
+    rng = random.Random(_seed(replay_tag, config.pilot_config().seed, seed))
+    return good + rng.sample(kept_replay, len(good)), removed, len(good)
+
+
 def _hacked_items(items: Sequence[Item], pilot: PilotConfig, *, label: str) -> list[Item]:
     """``items`` with their answers replaced by :func:`hack_answer`, each checked V1 pass / V2 fail
     (else :class:`CalibrationIntegrityError` naming ``label``)."""
@@ -744,9 +825,6 @@ def build_seed_plan(
     before it is returned. ``replay`` is the original SFT data (the start's training items: the oracle
     avoids them as well as the start map); ``start_uids`` the start-map uids."""
     pilot = config.pilot_config()
-    splits = sampler.splits
-    rule_slices = splits.slices_of(Split.T_RULE)
-    retention_slices = splits.slices_of(Split.RETENTION)
     core = _plan_core(
         sampler,
         probe,
@@ -760,28 +838,19 @@ def build_seed_plan(
     )
     forbidden = core.forbidden
     # good: the T_RULE slices (its statistic) and the retention slices ("retention kept" criterion)
-    diag_slices: dict[str, tuple[tuple[str, ...], int]] = {
-        "good": (tuple(rule_slices), config.diagnostic_items_per_slice),
-        "bad_hack": ((HACK_SLICE,), config.diagnostic_items_per_slice),
-        "bad_retention": ((RETENTION_SLICE,), config.diagnostic_items_per_slice),
+    diagnostic: dict[str, dict[str, list[Item]]] = {
+        "good": _good_diagnostic(sampler, config, forbidden, purpose=construction_purpose("good", seed))
     }
-    diagnostic: dict[str, dict[str, list[Item]]] = {}
-    for c in CONSTRUCTIONS:
-        names, size = diag_slices[c]
+    for c, slice_name in (("bad_hack", HACK_SLICE), ("bad_retention", RETENTION_SLICE)):
         diagnostic[c] = oracle_items(
-            sampler, size, 1, forbidden, purpose=construction_purpose(c, seed), slices=names, pool=None
-        )
-    diagnostic["good"].update(
-        oracle_items(
             sampler,
-            config.diagnostic_retention_items_per_slice,
+            config.diagnostic_items_per_slice,
             1,
             forbidden,
-            purpose=construction_purpose("good", seed),
-            slices=retention_slices,
+            purpose=construction_purpose(c, seed),
+            slices=(slice_name,),
             pool=None,
         )
-    )
     forbidden_train = forbidden | {it.uid for per in diagnostic.values() for g in per.values() for it in g}
 
     def train_draw(construction: str, slice_name: str) -> list[Item]:
@@ -795,12 +864,15 @@ def build_seed_plan(
             pool=None,
         )[slice_name]
 
-    kept_replay, removed = _filter_replay(replay, forbidden_train)
-    good = train_draw("good", GOOD_SLICE)
-    if len(kept_replay) < len(good):
-        raise ValueError(f"only {len(kept_replay)} SFT replay items left after filtering; need {len(good)}")
-    rng = random.Random(_seed("calib_replay", pilot.seed, seed))
-    good_train = good + rng.sample(kept_replay, len(good))
+    good_train, removed, replay_count = _good_training(
+        sampler,
+        config,
+        seed,
+        forbidden_train,
+        purpose=construction_purpose("good", seed),
+        replay=replay,
+        replay_tag="calib_replay",
+    )
     hacked = _hacked_items(train_draw("bad_hack", HACK_SLICE), pilot, label="bad_hack")
     plan = SeedPlan(
         seed=int(seed),
@@ -814,7 +886,7 @@ def build_seed_plan(
         },
         diagnostic=diagnostic,
         replay_removed=removed,
-        replay_count=len(good),
+        replay_count=replay_count,
         sft_uids=core.sft_uids,
         oracle_sft_removed=core.oracle_sft_removed,
     )
@@ -1695,23 +1767,57 @@ def _prepare_start(
     return model, path, f"loaded from {path}"
 
 
-def run_calibration(
-    config: CalibrationConfig, output_dir: str | Path, *, start_path: str | Path | None = None
-) -> dict[str, Any]:
-    """Run the positive control (module docstring) and write ``results.json`` / ``summary.md`` /
-    ``calibration_config.json`` (and ``start_model.safetensors`` when the start is rebuilt) to
-    ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint
-    (e.g. the P0 run's ``start_model.safetensors``); ``None`` rebuilds it. CPU only; nothing is
-    downloaded."""
-    out = Path(output_dir)
+class _RunConfig(Protocol):
+    """What the shared run scaffolding reads from a section-5 / 5.1 / 5.2 config."""
+
+    pilot: dict[str, Any]
+    seeds: tuple[int, ...]
+    threads_per_seed: int
+    jobs: int
+
+    def to_dict(self) -> dict[str, Any]: ...
+
+    def pilot_config(self) -> PilotConfig: ...
+
+    def gate_config(self) -> Any: ...
+
+    def preregistration_deviations(self) -> list[str]: ...
+
+
+@dataclass
+class _RunStart:
+    """The start of a section-5 / 5.1 / 5.2 run (:func:`_begin_run`): the start model and where it came
+    from, its fingerprint check, the pre-registration deviations and warnings so far, and the timings."""
+
+    t0: float
+    model: nn.Module
+    path: Path
+    source: str
+    fingerprint: str
+    matches_p0: bool
+    deviations: list[str]
+    warnings: list[str]
+    timing: dict[str, Any]
+
+
+def _begin_run(
+    config: _RunConfig,
+    out: Path,
+    config_file: str,
+    start_path: str | Path | None,
+    log: Callable[[str], None],
+) -> _RunStart:
+    """Shared opening of every calibration run: create ``out``, write ``config_file``, prepare the start
+    (:func:`_prepare_start`), compare its fingerprint with :data:`P0_START_FINGERPRINT` (a mismatch is
+    a pre-registration deviation, and a warning when the pilot is the default one) and log it."""
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    (out / "calibration_config.json").write_text(json.dumps(config.to_dict(), indent=2), encoding="utf-8")
+    (out / config_file).write_text(json.dumps(config.to_dict(), indent=2), encoding="utf-8")
     pilot = config.pilot_config()
     warnings: list[str] = []
     timing: dict[str, Any] = {}
     t = time.perf_counter()
-    model, path, source = _prepare_start(pilot, out, start_path, lambda m: _log(config, m))
+    model, path, source = _prepare_start(pilot, out, start_path, log)
     timing["start_s"] = time.perf_counter() - t
     start_fp = fingerprint(model)
     matches = start_fp == P0_START_FINGERPRINT
@@ -1722,14 +1828,85 @@ def run_calibration(
         )
         if not config.pilot:
             warnings.append("the default-config start does not reproduce the P0 start fingerprint")
-    _log(
-        config,
-        f"start {start_fp[:16]} (P0 start: {matches}); seeds {list(config.seeds)} with {config.jobs} job(s)",
-    )
-    ctx = _Context(config=config.to_dict(), start_path=str(path))
+    log(f"start {start_fp[:16]} (P0 start: {matches}); seeds {list(config.seeds)} with {config.jobs} job(s)")
+    return _RunStart(t0, model, path, source, start_fp, matches, deviations, warnings, timing)
+
+
+def _run_all_seeds(
+    config: _RunConfig, rs: _RunStart, worker: Callable[[tuple[dict[str, Any], int]], dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Every seed of ``config`` (sorted) through ``worker`` (:func:`_run_seeds`), timed as ``seeds_s``."""
+    ctx = _Context(config=config.to_dict(), start_path=str(rs.path))
     t = time.perf_counter()
-    seeds = _run_seeds(ctx, sorted(config.seeds), config.jobs)
-    timing["seeds_s"] = time.perf_counter() - t
+    seeds = _run_seeds(ctx, sorted(config.seeds), config.jobs, worker)
+    rs.timing["seeds_s"] = time.perf_counter() - t
+    return seeds
+
+
+def _results_head(
+    config: _RunConfig, rs: _RunStart, *, version: int, banner: str, section: str
+) -> dict[str, Any]:
+    """The shared leading blocks of a run's ``results.json`` (in this order): ``version``, ``banner``,
+    ``status``, ``preregistration`` (``section`` and the deviations), ``config``, ``environment``,
+    ``start`` and ``gate_config``."""
+    return {
+        "version": version,
+        "banner": banner,
+        "status": "complete",
+        "preregistration": {
+            "section": f"docs/research_rl/CAPABILITY.md {section} (exploratory, post hoc; rules fixed before any run)",
+            "deviations": rs.deviations,
+        },
+        "config": config.to_dict(),
+        "environment": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "device": "cpu",
+            "threads_per_seed": config.threads_per_seed,
+            "jobs": config.jobs,
+            "gpu": NOT_TESTED,
+        },
+        "start": {
+            "source": rs.source,
+            "fingerprint": rs.fingerprint,
+            "p0_fingerprint": P0_START_FINGERPRINT,
+            "matches_p0": rs.matches_p0,
+            "parameters": count_parameters(rs.model),
+        },
+        "gate_config": json.loads(json.dumps(dataclasses.asdict(config.gate_config()), default=str)),
+    }
+
+
+def _finish_run(
+    out: Path,
+    results: dict[str, Any],
+    rs: _RunStart,
+    render: Callable[[Mapping[str, Any]], str],
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    """Shared tail of every calibration run: add ``timing`` (with ``total_s``), make the results finite
+    JSON, write ``results.json`` and ``summary.md`` (``render``), log and return them."""
+    rs.timing["total_s"] = time.perf_counter() - rs.t0
+    results["timing"] = rs.timing
+    results = _finite(results)
+    (out / "results.json").write_text(json.dumps(results, indent=2, allow_nan=False), encoding="utf-8")
+    (out / "summary.md").write_text(render(results), encoding="utf-8")
+    log(f"done in {rs.timing['total_s']:.1f}s; wrote {out / 'results.json'} and {out / 'summary.md'}")
+    return results
+
+
+def run_calibration(
+    config: CalibrationConfig, output_dir: str | Path, *, start_path: str | Path | None = None
+) -> dict[str, Any]:
+    """Run the positive control (module docstring) and write ``results.json`` / ``summary.md`` /
+    ``calibration_config.json`` (and ``start_model.safetensors`` when the start is rebuilt) to
+    ``output_dir``; returns the results dict. ``start_path``: a ``.safetensors`` start checkpoint
+    (e.g. the P0 run's ``start_model.safetensors``); ``None`` rebuilds it. CPU only; nothing is
+    downloaded."""
+    out = Path(output_dir)
+    rs = _begin_run(config, out, "calibration_config.json", start_path, lambda m: _log(config, m))
+    warnings = rs.warnings
+    seeds = _run_all_seeds(config, rs, _seed_worker)
     for entry in seeds:
         for name, info in entry["constructions"].items():
             if not info["statistic_reached"]:
@@ -1750,32 +1927,8 @@ def run_calibration(
                     f"({ot['candidate']} {ot['statistic']} = {_fmt(ot['value'], 4)} < {ot['target']}); "
                     "excluded only as the rules say"
                 )
-    gate_cfg = config.gate_config()
     results: dict[str, Any] = {
-        "version": _RESULTS_VERSION,
-        "banner": CALIBRATION_BANNER,
-        "status": "complete",
-        "preregistration": {
-            "section": "docs/research_rl/CAPABILITY.md section 5 (exploratory, post hoc; rules fixed before any run)",
-            "deviations": deviations,
-        },
-        "config": config.to_dict(),
-        "environment": {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "device": "cpu",
-            "threads_per_seed": config.threads_per_seed,
-            "jobs": config.jobs,
-            "gpu": NOT_TESTED,
-        },
-        "start": {
-            "source": source,
-            "fingerprint": start_fp,
-            "p0_fingerprint": P0_START_FINGERPRINT,
-            "matches_p0": matches,
-            "parameters": count_parameters(model),
-        },
-        "gate_config": json.loads(json.dumps(dataclasses.asdict(gate_cfg), default=str)),
+        **_results_head(config, rs, version=_RESULTS_VERSION, banner=CALIBRATION_BANNER, section="section 5"),
         "definitions": {
             "accepted": "the candidate's first verdict classifies as 'accept' (loop.classify_verdict)",
             "t_rule": "unweighted mean over the T_RULE slices of the exact-verifier greedy pass rate on the oracle items",
@@ -1787,10 +1940,4 @@ def run_calibration(
         "warnings": warnings,
     }
     results["rules"] = evaluate_rules(results)
-    timing["total_s"] = time.perf_counter() - t0
-    results["timing"] = timing
-    results = _finite(results)
-    (out / "results.json").write_text(json.dumps(results, indent=2, allow_nan=False), encoding="utf-8")
-    (out / "summary.md").write_text(render_calibration_summary(results), encoding="utf-8")
-    _log(config, f"done in {timing['total_s']:.1f}s; wrote {out / 'results.json'} and {out / 'summary.md'}")
-    return results
+    return _finish_run(out, results, rs, render_calibration_summary, lambda m: _log(config, m))
