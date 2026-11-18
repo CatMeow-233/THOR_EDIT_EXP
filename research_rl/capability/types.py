@@ -21,6 +21,8 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
+from research_rl.models.ffn_channels import ChannelSelection
+
 
 # ============================================================================== splits and items
 class Split(str, Enum):
@@ -301,6 +303,17 @@ class RollbackUnit(str, Enum):
 
     CHANNELS = "channels"
     PARAMETERS = "parameters"
+
+
+@dataclass(frozen=True)
+class ChannelGroup:
+    """A named set of FFN channels: the unit of subset search and of group rollback."""
+
+    name: str
+    selection: ChannelSelection
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "selection": self.selection.to_dict()}
 
 
 # ============================================================================== forward-only spaces

@@ -142,7 +142,7 @@ and signatures are binding. Every module has a test file `tests/research_rl/test
 - `revert_groups(model, incumbent, groups, *, optimizer=None)`: reverts the channels of the
   groups to the incumbent with `research_rl.models.ffn_channels.rollback_channels`, then fixes
   masters; returns the `RollbackReport`s.
-- `ChannelGroup(name: str, selection: ChannelSelection)` is defined in `scores.py` and imported here.
+- `ChannelGroup(name: str, selection: ChannelSelection)` is defined in `types.py`.
 
 ### 1.6 `scores.py` — forward-only channel scoring and grouping
 
