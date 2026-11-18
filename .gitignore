@@ -8,3 +8,4 @@ __pycache__/
 /outputs/
 build/
 dist/
+/start_model.safetensors
