@@ -65,9 +65,12 @@ SECTION_5_1_SHA256 = "399deedaa0c10f1dcbe5795ab25f1905a68a93125a50d790ba9c9ae005
 
 def test_section_5_1_is_unchanged() -> None:
     """Section 5.1 (design, stream and rules fixed before any run) is byte-identical to the
-    pre-registration: from its heading to the end of CAPABILITY.md, stripped."""
+    pre-registration: from its heading to the next follow-up heading (5.2, appended after the 5.1
+    run) or the end of CAPABILITY.md, stripped."""
     text = CAPABILITY_MD.read_text(encoding="utf-8")
-    section = text[text.index("### 5.1 Follow-up") :].strip()
+    start = text.index("### 5.1 Follow-up")
+    end = text.find("### 5.2 Follow-up", start)
+    section = text[start : end if end >= 0 else None].strip()
     assert hashlib.sha256(section.encode("utf-8")).hexdigest() == SECTION_5_1_SHA256
 
 
