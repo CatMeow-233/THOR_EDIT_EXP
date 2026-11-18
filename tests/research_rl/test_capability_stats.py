@@ -6,8 +6,11 @@ pairs (no models), so the file runs in seconds on CPU.
 
 from __future__ import annotations
 
+import itertools
 import math
 import random
+import time
+from collections.abc import Callable
 from fractions import Fraction
 
 import pytest
@@ -16,6 +19,8 @@ from research_rl.capability.stats import (
     AlphaLedger,
     binomial_upper_tail,
     clopper_pearson_lower,
+    discordant_mass,
+    fractional_sign_test_p_value,
     noninferiority_upper_bound,
     normal_cdf,
     normal_quantile,
@@ -40,7 +45,14 @@ MC_TOL = 3.0 * math.sqrt(ALPHA * (1.0 - ALPHA) / REPS)  # ~0.0103
 
 # ============================================================================== helpers
 def make_binary(
-    n01: int, n10: int, n11: int, n00: int, *, name: str = "s", split: Split = Split.RETENTION, prefix: str = ""
+    n01: int,
+    n10: int,
+    n11: int,
+    n00: int,
+    *,
+    name: str = "s",
+    split: Split = Split.RETENTION,
+    prefix: str = "",
 ) -> PairedScores:
     """Binary paired scores with the given cell counts (incumbent, candidate)."""
     inc: list[float] = [0.0] * n01 + [1.0] * n10 + [1.0] * n11 + [0.0] * n00
@@ -50,7 +62,9 @@ def make_binary(
 
 
 def make_scores(inc: list[float], cand: list[float], name: str = "s") -> PairedScores:
-    return PairedScores(name, Split.T_RULE, tuple(f"{name}-{i}" for i in range(len(inc))), tuple(inc), tuple(cand))
+    return PairedScores(
+        name, Split.T_RULE, tuple(f"{name}-{i}" for i in range(len(inc))), tuple(inc), tuple(cand)
+    )
 
 
 def exact_binomial_tail(x: int, m: int, p: Fraction) -> Fraction:
@@ -97,6 +111,9 @@ def test_normal_quantile_known_values_and_round_trip() -> None:
     assert normal_quantile(0.05) == pytest.approx(-1.6448536269514722, abs=1e-12)
     for p in (1e-12, 1e-8, 0.001, 0.02, 0.0243, 0.3, 0.7, 0.9757, 0.999, 1 - 1e-10):
         assert normal_cdf(normal_quantile(p)) == pytest.approx(p, rel=1e-10, abs=1e-15)
+    for p in (1 - 1e-10, 1 - 1e-6, 0.999, 0.98, 0.9, 0.6):
+        assert normal_quantile(p) == -normal_quantile(1.0 - p)
+    assert normal_quantile(1e-10) == pytest.approx(-6.361340902404056, abs=1e-12)
     for bad in (0.0, 1.0, -0.1, math.nan):
         with pytest.raises(ValueError):
             normal_quantile(bad)
@@ -115,10 +132,16 @@ def test_incomplete_beta_matches_exact_binomial_sums() -> None:
     assert regularized_incomplete_beta(1.0, 1.0, 0.37) == pytest.approx(0.37, rel=1e-13)
 
 
-def test_student_t_against_known_quantiles() -> None:
-    assert student_t_quantile(0.95, 10.0) == pytest.approx(1.8124611228107335, abs=1e-9)
-    assert student_t_quantile(0.975, 5.0) == pytest.approx(2.5705818366147395, abs=1e-9)
-    assert student_t_quantile(0.05, 10.0) == pytest.approx(-1.8124611228107335, abs=1e-9)
+def test_student_t_against_closed_forms() -> None:
+    for p in (0.6, 0.9, 0.95, 0.975, 0.999):
+        # df = 1 (Cauchy) and df = 2 have closed-form quantiles.
+        assert student_t_quantile(p, 1.0) == pytest.approx(math.tan(math.pi * (p - 0.5)), rel=1e-12)
+        assert student_t_quantile(p, 2.0) == pytest.approx(
+            (2 * p - 1) / math.sqrt(2 * p * (1 - p)), rel=1e-12
+        )
+        assert student_t_quantile(1.0 - p, 2.0) == -student_t_quantile(p, 2.0)
+    # Table value t_{0.975, 5} = 2.5706 (4 decimals).
+    assert student_t_quantile(0.975, 5.0) == pytest.approx(2.5706, abs=5e-5)
     # Large df approaches the normal quantile.
     assert student_t_quantile(0.95, 1e6) == pytest.approx(normal_quantile(0.95), abs=1e-5)
     assert student_t_sf(0.0, 7.0) == pytest.approx(0.5, abs=1e-15)
@@ -145,13 +168,36 @@ def test_sign_test_matches_brute_force_exact() -> None:
 def test_sign_test_monotone_and_symmetric() -> None:
     for m in (1, 7, 40, 120):
         ps = [sign_test_p_value(k, m - k) for k in range(m + 1)]
-        assert all(a > b for a, b in zip(ps, ps[1:])), "more candidate wins must lower p"
+        if m <= 50:  # beyond that 1 - 2^-m rounds to 1.0 in double precision
+            assert all(a > b for a, b in itertools.pairwise(ps)), "more candidate wins must lower p"
+        else:
+            assert all(a >= b for a, b in itertools.pairwise(ps))
+            assert ps[-1] < ps[m // 2] < ps[1]
         for k in range(m + 1):
             # P[X >= k] + P[X >= m - k] = 1 + P[X = k] for X ~ Bin(m, 1/2)
             point = math.comb(m, k) / 2**m
-            assert sign_test_p_value(k, m - k) + sign_test_p_value(m - k, k) == pytest.approx(1 + point, abs=1e-12)
+            assert sign_test_p_value(k, m - k) + sign_test_p_value(m - k, k) == pytest.approx(
+                1 + point, abs=1e-12
+            )
     # More incumbent wins at fixed candidate wins also raises p.
     assert sign_test_p_value(10, 2) < sign_test_p_value(10, 5) < sign_test_p_value(10, 9)
+
+
+def test_sign_test_large_m_fast_and_accurate() -> None:
+    """Regression: the per-k math.comb sum took ~27 s at m = 20000 (plus ~26 s inside CP)."""
+    m = 20000
+    x = m // 2 + 283
+    start = time.perf_counter()
+    p = sign_test_p_value(x, m - x)
+    low = clopper_pearson_lower(x, m, 0.05)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 5.0, f"sign test + Clopper-Pearson took {elapsed:.2f} s"
+    assert p == pytest.approx(binomial_upper_tail(x, m, 0.5), rel=1e-9)
+    assert p < 0.05 and 0.5 < low < x / m
+    # Both tails of the shorter-tail summation agree with the complement identity.
+    for k in (0, 1, 9999, 10000, 10001, 19999, 20000):
+        both = sign_test_p_value(k, m - k) + sign_test_p_value(m - k, k)
+        assert both == pytest.approx(1.0 + math.comb(m, k) / 2**m, rel=1e-12)
 
 
 def test_clopper_pearson_matches_brute_force_and_sign_test() -> None:
@@ -219,12 +265,24 @@ def test_gain_passed_iff_bound_positive_grid() -> None:
 
 
 def test_gain_monotone_more_wins_lower_p_higher_bound() -> None:
+    # Turning an incumbent win into a candidate win (m fixed): p falls, bound rises strictly.
+    prev_p, prev_b = 2.0, -2.0
+    for n01 in range(0, 31):
+        t = paired_gain_lower_bound(make_binary(n01, 30 - n01, 0, 170), 0.05)
+        assert t.p_value is not None
+        assert t.p_value < prev_p
+        assert t.bound > prev_b
+        prev_p, prev_b = t.p_value, t.bound
+    # Turning a concordant pair into a candidate win: p always falls; the conditional bound rises
+    # once the test passes. (It is not monotone in the non-passing region because it scales with
+    # the number of discordant pairs m: e.g. n01=0 -> -0.025, n01=1 -> -0.0295 at n10=5, n=200.)
     prev_p, prev_b = 2.0, -2.0
     for n01 in range(0, 40):
         t = paired_gain_lower_bound(make_binary(n01, 5, 0, 200 - n01 - 5), 0.05)
         assert t.p_value is not None
         assert t.p_value < prev_p
-        assert t.bound >= prev_b
+        if t.passed:
+            assert t.bound > prev_b
         prev_p, prev_b = t.p_value, t.bound
 
 
@@ -255,24 +313,98 @@ def test_gain_swapped_roles_complementary_p() -> None:
     assert pg + ps == pytest.approx(1.0 + math.comb(13, 9) / 2**13, abs=1e-12)
 
 
-def test_gain_non_binary_t_bound_by_hand() -> None:
-    inc = [0.2, 0.5, 0.1, 0.4, 0.3]
-    cand = [0.5, 0.6, 0.3, 0.4, 0.7]
-    t = paired_gain_lower_bound(make_scores(inc, cand), 0.05)
-    diffs = [c - i for i, c in zip(inc, cand)]
-    mean = sum(diffs) / 5
-    sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / 4)
-    assert t.method == "paired_t"
-    assert t.point == pytest.approx(mean)
-    assert t.bound == pytest.approx(mean - 2.131846786326649 * sd / math.sqrt(5), abs=1e-9)
-    assert t.passed == (t.bound > 0)
-    # n < 2 and zero variance.
+def test_gain_non_binary_fractional_by_hand() -> None:
+    inc = [0.2, 0.5, 0.1, 0.4, 0.3, 0.9]
+    cand = [0.5, 0.6, 0.3, 0.4, 0.7, 0.8]
+    ps = make_scores(inc, cand)
+    gain, loss = discordant_mass(ps)
+    assert gain == pytest.approx(0.3 + 0.1 + 0.2 + 0.4) and loss == pytest.approx(0.1)
+    t = paired_gain_lower_bound(ps, 0.05)
+    assert t.method == "sign_test_fractional"
+    assert t.point == pytest.approx((gain - loss) / 6)
+    assert t.p_value == pytest.approx(regularized_incomplete_beta(gain, loss + 1.0, 0.5), rel=1e-12)
+    assert t.p_value == fractional_sign_test_p_value(gain, loss)
+    assert not t.passed and t.bound <= 0.0  # one pair's worth of gain mass cannot be significant
+    # Ten items each improved by +0.75: 7.5 pairs of gain mass, p = 2^-7.5 < 0.05.
+    strong = paired_gain_lower_bound(make_scores([0.25] * 10, [1.0] * 10), 0.05)
+    assert strong.passed and strong.p_value == pytest.approx(2**-7.5, rel=1e-12)
+    assert 0.0 < strong.bound < strong.point
+    assert strong.bound == pytest.approx((2 * _fractional_p_low(7.5, 0.0, 0.05) - 1) * 7.5 / 10, rel=1e-9)
+    # A single item is handled like the binary case (no separate "insufficient" path).
     one = paired_gain_lower_bound(make_scores([0.2], [0.7]), 0.05)
-    assert (one.passed, one.bound, one.method) == (False, -1.0, "insufficient")
-    const = paired_gain_lower_bound(make_scores([0.2, 0.3], [0.4, 0.5]), 0.05)
-    assert const.passed and const.bound == pytest.approx(0.2)
+    assert not one.passed and one.method == "sign_test_fractional"
     zero = paired_gain_lower_bound(make_scores([0.2, 0.3], [0.2, 0.3]), 0.05)
-    assert not zero.passed and zero.bound == 0.0
+    assert not zero.passed and zero.bound == 0.0 and zero.p_value == 1.0
+
+
+def _fractional_p_low(gain: float, loss: float, alpha: float) -> float:
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if regularized_incomplete_beta(gain, loss + 1.0, mid) > alpha:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def test_fractional_reduces_to_binary_on_integer_mass() -> None:
+    for n01, n10 in ((0, 0), (5, 0), (8, 2), (20, 2), (3, 9), (60, 41)):
+        p = make_binary(n01, n10, 7, 3)
+        assert discordant_mass(p) == (float(n01), float(n10))
+        assert fractional_sign_test_p_value(n01, n10) == pytest.approx(
+            sign_test_p_value(n01, n10), rel=1e-11, abs=1e-15
+        )
+        assert tango_z(float(n10), float(n01), p.n, 0.02) == tango_z(n10, n01, p.n, 0.02)
+    with pytest.raises(ValueError):
+        fractional_sign_test_p_value(-0.5, 1.0)
+    with pytest.raises(ValueError):
+        tango_restricted_mle(math.nan, 0.0, 10, 0.02)
+
+
+def test_non_binary_zero_variance_has_no_shortcut() -> None:
+    """Regression: all-tied or constant-difference non-binary slices used to pass with p = 0."""
+    tied = make_scores([0.5, 0.5], [0.5, 0.5])
+    t = noninferiority_upper_bound(tied, 0.02, 0.05)
+    assert not t.passed and t.p_value is not None and t.p_value > 0.05
+    # Ten tied items, one of them partial credit: same decision and p-value as ten binary ties.
+    t10 = noninferiority_upper_bound(make_scores([1.0] * 9 + [0.5], [1.0] * 9 + [0.5]), 0.02, 0.05)
+    b10 = noninferiority_upper_bound(make_binary(0, 0, 10, 0), 0.02, 0.05)
+    assert not t10.passed and t10.p_value == b10.p_value and t10.bound == b10.bound
+    const_gain = paired_gain_lower_bound(make_scores([0.0, 0.25], [0.25, 0.5]), 0.05)
+    assert not const_gain.passed and const_gain.p_value == pytest.approx(0.5**0.5, rel=1e-12)
+    # Large all-tied partial-credit slices pass exactly where binary ones do (the power floor).
+    floor = retention_power_floor_n(0.02, 0.05)
+    for n, expect in ((floor, True), (floor - 1, False)):
+        assert noninferiority_upper_bound(make_scores([0.5] * n, [0.5] * n), 0.02, 0.05).passed is expect
+
+
+def test_mixed_binary_and_partial_tie_matches_binary() -> None:
+    """Regression: one partial-credit tie used to move the whole slice to an anti-conservative t test."""
+    base = make_binary(3, 8, 400, 89)
+    with_half = make_scores([*base.incumbent, 0.5], [*base.candidate, 0.5])
+    with_tie = make_scores([*base.incumbent, 1.0], [*base.candidate, 1.0])
+    a = noninferiority_upper_bound(with_half, 0.02, 0.05)
+    b = noninferiority_upper_bound(with_tie, 0.02, 0.05)
+    assert a.method == "tango_score_fractional" and b.method == "tango_score"
+    assert (a.p_value, a.bound, a.passed, a.point) == (b.p_value, b.bound, b.passed, b.point)
+    ga = paired_gain_lower_bound(with_half, 0.05)
+    gb = paired_gain_lower_bound(with_tie, 0.05)
+    assert ga.passed == gb.passed and ga.p_value == pytest.approx(gb.p_value, rel=1e-11)
+
+
+def test_tango_z_monotone_in_delta_for_fractional_mass() -> None:
+    """The bound bisection needs Z(d) non-increasing in d, also for fractional counts."""
+    for n in (3, 17, 80):
+        for b in (0.0, 0.25, 1.5, n / 3):
+            for c in (0.0, 0.75, 2.25, n / 4):
+                if b + c > n:
+                    continue
+                prev = math.inf
+                for i in range(-200, 201):
+                    z = tango_z(b, c, n, i / 200)
+                    assert z <= prev + 1e-12, (n, b, c, i)
+                    prev = z
 
 
 # ============================================================================== Tango
@@ -372,21 +504,26 @@ def test_noninferiority_monotone_and_symmetric() -> None:
     # Swapping roles negates the drop: point flips sign.
     p = make_binary(7, 2, 50, 41)
     swapped = PairedScores("s", p.split, p.uids, p.candidate, p.incumbent)
-    assert noninferiority_upper_bound(p, 0.02, 0.05).point == -noninferiority_upper_bound(swapped, 0.02, 0.05).point
+    assert (
+        noninferiority_upper_bound(p, 0.02, 0.05).point
+        == -noninferiority_upper_bound(swapped, 0.02, 0.05).point
+    )
 
 
-def test_noninferiority_non_binary_t() -> None:
-    inc = [0.5, 0.6, 0.7, 0.4, 0.5, 0.6]
-    cand = [0.5, 0.55, 0.7, 0.45, 0.5, 0.6]
-    t = noninferiority_upper_bound(make_scores(inc, cand), 0.05, 0.05)
-    drops = [i - c for i, c in zip(inc, cand)]
-    mean = sum(drops) / 6
-    sd = math.sqrt(sum((d - mean) ** 2 for d in drops) / 5)
-    assert t.method == "paired_t"
-    assert t.bound == pytest.approx(mean + student_t_quantile(0.95, 5.0) * sd / math.sqrt(6))
-    assert t.passed == (t.bound < 0.05)
+def test_noninferiority_non_binary_fractional() -> None:
+    inc = [0.5, 0.6, 0.7, 0.4, 0.5, 0.6] * 50
+    cand = [0.5, 0.55, 0.7, 0.45, 0.5, 0.6] * 50
+    ps = make_scores(inc, cand)
+    t = noninferiority_upper_bound(ps, 0.05, 0.05)
+    gain, loss = discordant_mass(ps)
+    assert gain == pytest.approx(2.5) and loss == pytest.approx(2.5)
+    assert t.method == "tango_score_fractional"
+    assert t.point == pytest.approx(0.0, abs=1e-15)
+    assert t.p_value == pytest.approx(normal_cdf(tango_z(loss, gain, 300, 0.05)), rel=1e-12)
+    assert t.passed and t.bound < 0.05
+    assert tango_z(loss, gain, 300, t.bound) == pytest.approx(-normal_quantile(0.95), abs=1e-6)
     one = noninferiority_upper_bound(make_scores([0.5], [0.4]), 0.05, 0.05)
-    assert (one.passed, one.bound, one.method) == (False, 1.0, "insufficient")
+    assert not one.passed and one.method == "tango_score_fractional" and one.bound >= 0.05
 
 
 def test_retention_power_floor_n_is_tight() -> None:
@@ -394,7 +531,9 @@ def test_retention_power_floor_n_is_tight() -> None:
         n = retention_power_floor_n(margin, alpha)
         assert noninferiority_upper_bound(make_binary(0, 0, n, 0), margin, alpha).passed
         assert not noninferiority_upper_bound(make_binary(0, 0, n - 1, 0), margin, alpha).passed
-    assert retention_power_floor_n(0.02, 0.05 * 6 / math.pi**2) == 173
+    ledger = AlphaLedger(0.05, "spending")
+    floors = [retention_power_floor_n(0.02, ledger.alpha_at(k)) for k in (1, 7, 10)]
+    assert floors == [173, 512, 576]  # the numbers quoted in GateConfig's docstring
 
 
 # ============================================================================== calibration
@@ -441,7 +580,9 @@ def test_exact_size_by_enumeration() -> None:
     worst = 0.0
     for n in (50, 200):
         for q in (0.1, 0.3):
-            size = sum(pr for a, b, pr in trinomial_cells(n, q / 2, q / 2) if sign_test_p_value(a, b) <= ALPHA)
+            size = sum(
+                pr for a, b, pr in trinomial_cells(n, q / 2, q / 2) if sign_test_p_value(a, b) <= ALPHA
+            )
             assert size <= ALPHA
             for margin in (0.02, 0.05):
                 p10, p01 = (q + margin) / 2, (q - margin) / 2
@@ -455,28 +596,90 @@ def test_exact_size_by_enumeration() -> None:
     assert worst > ALPHA  # the documented small-sample excess is real, not an artefact
 
 
-def _draw_partial(rng: random.Random) -> float:
-    return rng.choice((0.0, 0.25, 0.5, 0.75, 1.0))
+PARTIAL = (0.0, 0.25, 0.5, 0.75, 1.0)
+Pair = tuple[float, float]
 
 
-@pytest.mark.parametrize("n", [50, 200])
-def test_calibration_non_binary_t_paths(n: int) -> None:
-    """Coverage check of the paired-t fallback on bounded, tied, non-binary scores."""
-    rng = random.Random(3000 + n)
-    gain_accepts = 0
-    retention_passes = 0
-    margin, r = 0.02, 0.3
-    alt_mean = 0.5 - margin / r  # mean drop = r * (0.5 - alt_mean) = margin
+# Gain scenarios: (incumbent, candidate) generators with true mean gain exactly 0.
+def _gain_partial_symmetric(rng: random.Random) -> Pair:
+    x = rng.choice(PARTIAL)
+    return (x, x if rng.random() < 0.6 else rng.choice(PARTIAL))
+
+
+def _gain_skewed(rng: random.Random) -> Pair:  # +0.25 w.p. 0.16, -0.5 w.p. 0.08 (reviewer case)
+    u = rng.random()
+    return (0.5, 0.75) if u < 0.16 else ((0.75, 0.25) if u < 0.24 else (0.5, 0.5))
+
+
+def _gain_small_wins_rare_full_losses(rng: random.Random) -> Pair:  # +0.1 w.p. 0.9, -1 w.p. 0.09
+    u = rng.random()
+    return (0.5, 0.6) if u < 0.9 else ((1.0, 0.0) if u < 0.99 else (0.5, 0.5))
+
+
+# Retention scenarios with true mean drop exactly 0.02 = margin.
+def _ret_rare_half_drops(rng: random.Random) -> Pair:  # 0.5 drop w.p. 0.04 (reviewer case)
+    x = rng.choice((0.5, 1.0))
+    return (x, x - 0.5 if (x == 1.0 and rng.random() < 0.08) else x)
+
+
+def _ret_binary_q03_with_partial_ties(rng: random.Random) -> Pair:  # binary q=0.03 + 1% 0.5 ties
+    u = rng.random()
+    if u < 0.005:
+        return (0.0, 1.0)
+    if u < 0.03:
+        return (1.0, 0.0)
+    return (0.5, 0.5) if u < 0.04 else (1.0, 1.0)
+
+
+def _ret_small_drops_rare_gains(rng: random.Random) -> Pair:  # -0.1 w.p. 0.4, +1 w.p. 0.02
+    u = rng.random()
+    return (0.8, 0.7) if u < 0.4 else ((0.0, 1.0) if u < 0.42 else (0.5, 0.5))
+
+
+Gen = Callable[[random.Random], Pair]
+
+
+def _simulate_pass_rate(gen: Gen, n: int, seed: int, test: Callable[[PairedScores], bool]) -> float:
+    rng = random.Random(seed)
+    hits = 0
     for _ in range(REPS):
-        inc = [_draw_partial(rng) for _ in range(n)]
-        # Gain 0: with prob 0.6 the candidate ties, else it is an independent draw.
-        cand = [x if rng.random() < 0.6 else _draw_partial(rng) for x in inc]
-        gain_accepts += paired_gain_lower_bound(make_scores(inc, cand), ALPHA).passed
-        inc2 = [rng.choice((0.0, 0.5, 1.0)) for _ in range(n)]
-        cand2 = [x if rng.random() >= r else rng.uniform(0.0, 2 * alt_mean) for x in inc2]
-        retention_passes += noninferiority_upper_bound(make_scores(inc2, cand2), margin, ALPHA).passed
-    assert gain_accepts / REPS <= ALPHA + MC_TOL
-    assert retention_passes / REPS <= ALPHA + MC_TOL
+        pairs = [gen(rng) for _ in range(n)]
+        ps = make_scores([a for a, _ in pairs], [b for _, b in pairs])
+        hits += test(ps)
+    return hits / REPS
+
+
+@pytest.mark.parametrize("n", [20, 50, 200])
+@pytest.mark.parametrize(
+    "gen",
+    [_gain_partial_symmetric, _gain_skewed, _gain_small_wins_rare_full_losses],
+    ids=lambda g: g.__name__,
+)
+def test_calibration_non_binary_gain_fractional(n: int, gen: Gen) -> None:
+    """False-accept of the fractional sign test at true gain 0 (no loosened tolerance).
+
+    Regression: the former paired-t fallback accepted 0.079 of the skewed scenario at n=50.
+    """
+    rate = _simulate_pass_rate(gen, n, 3000 + n, lambda ps: paired_gain_lower_bound(ps, ALPHA).passed)
+    assert rate <= ALPHA + MC_TOL, f"false-accept {rate:.4f}"
+
+
+@pytest.mark.parametrize("n", [50, 200, 512])
+@pytest.mark.parametrize(
+    "gen",
+    [_ret_rare_half_drops, _ret_binary_q03_with_partial_ties, _ret_small_drops_rare_gains],
+    ids=lambda g: g.__name__,
+)
+def test_calibration_non_binary_retention_fractional(n: int, gen: Gen) -> None:
+    """False-pass of the fractional Tango test at true drop = margin (no loosened tolerance).
+
+    Regression: the former paired-t fallback passed 0.1328 / 0.0993 / 0.0810 of the rare-drop
+    scenario at n = 50 / 200 / 512, and 0.0935 of binary q=0.03 data plus one 0.5 tie at n=200.
+    """
+    rate = _simulate_pass_rate(
+        gen, n, 4000 + n, lambda ps: noninferiority_upper_bound(ps, 0.02, ALPHA).passed
+    )
+    assert rate <= ALPHA + MC_TOL, f"false-pass {rate:.4f}"
 
 
 def test_power_sanity_clear_gain_detected() -> None:
@@ -545,3 +748,35 @@ def test_alpha_ledger_state_round_trip_and_validation() -> None:
         AlphaLedger(0.05, "bonferroni")
     with pytest.raises(ValueError):
         AlphaLedger(1.5, "spending")
+
+
+def test_alpha_ledger_load_is_atomic_and_consistent() -> None:
+    """Regression: a failed load used to leave count half-restored; inconsistent spent was accepted."""
+    base = {"total_alpha": 0.05, "schedule": "spending"}
+    for schedule in ("spending", "per_decision"):
+        ledger = AlphaLedger(0.05, schedule)
+        for _ in range(3):
+            ledger.next_alpha()
+        before = ledger.state_dict()
+        bad_states: list[dict[str, object]] = [
+            {**base, "schedule": schedule, "count": 9, "spent": "oops"},
+            {**base, "schedule": schedule, "count": 0, "spent": 3.0},  # spent > total_alpha
+            {**base, "schedule": schedule, "count": 9, "spent": ledger.spent},  # count/spent disagree
+            {**base, "schedule": schedule, "count": 2, "spent": math.inf},
+            {**base, "schedule": schedule, "count": True, "spent": 0.0},
+            {**base, "schedule": schedule, "count": 4},  # missing key
+            {**base, "schedule": schedule, "count": 4, "spent": True},
+        ]
+        for bad in bad_states:
+            with pytest.raises(ValueError):
+                ledger.load_state_dict(bad)
+            assert ledger.state_dict() == before
+        assert ledger.expected_spent(3) == ledger.spent
+    big = AlphaLedger(0.05, "spending")
+    for _ in range(5000):
+        big.next_alpha()
+    clone = AlphaLedger(0.05, "spending")
+    clone.load_state_dict(big.state_dict())
+    assert clone.spent == big.spent and clone.count == 5000
+    with pytest.raises(ValueError):
+        clone.expected_spent(-1)

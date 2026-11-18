@@ -20,17 +20,28 @@ The testbed of the capability-gated training package (``docs/research_rl/CAPABIL
   :func:`~research_rl.evaluation.capability_retention.greedy_generate`.
 
 Functional layer (beyond the rule-level contract). Different rule names can denote the same
-function: per-digit maps commute with permutations (``inc(rev(x)) == rev(inc(x))``),
-``inc(dec(x))`` is the identity, ``sort_asc`` after any permutation is ``sort_asc``. If such
-pairs were split between TRAIN and T_RULE, "unseen" items would be answerable by a trained or
-atomic function. :meth:`CompositionSplits.build` therefore groups pairs by their *signature*
-(outputs on a fixed probe set of inputs of every length) and assigns each equivalence class to a
-single split; classes whose function equals the identity or an atomic operator are always TRAIN.
-Depth-3 rules must have a signature that no rule of another split (and no atomic operator, and
-the identity) has. Signature equality is checked on the probe set only: two rules that agree on
-all probe inputs are treated as the same function (conservative merge); two rules with different
-signatures are provably different. Item-level coincidences (an item whose answer happens to
-equal its input) are not filtered.
+function, or the same function on part of the domain: per-digit maps commute with permutations
+(``inc(rev(x)) == rev(inc(x))``), ``inc(dec(x))`` is the identity, ``sort_asc`` after any
+permutation is ``sort_asc``; on length 3 the four permutations generate only six functions, so
+e.g. ``swp(rotr(x)) == rotr(rev(x))`` there (and on length 4); ``sort_asc(inc(x))`` and
+``inc(sort_asc(x))`` differ only when ``x`` holds a 9 (about 60% of sampled items agree). If such
+rules were split between TRAIN and a held-out split, "unseen" items would be answerable by a
+trained or atomic function. Two rules are therefore called *similar*
+(:meth:`OperatorSet.similar`) when they are equal on the probe inputs of **at least one input
+length**, or when their outputs agree on at least ``max_agreement`` (default
+:data:`DEFAULT_MAX_AGREEMENT` = 0.25) of the probe inputs (64 uniform random inputs per length
+plus constant and ascending strings; lengths weighted equally, as the sampler draws them).
+:meth:`CompositionSplits.build` takes the connected components of this relation over all ordered
+pairs and assigns each component to a single split; components containing a *degenerate* pair
+(similar to the identity or to an atomic operator) are always TRAIN. A depth-3 rule is kept only
+if it is not similar to any pair, to the identity, to an atomic operator or to another depth-3
+rule. :meth:`CompositionSplits.check_disjoint` re-checks that no two composed rules of different
+splits are similar and that no held-out rule is degenerate. Known limits: equality is tested on
+the probe set only (rules equal on all probe inputs of a length are treated as equal there - a
+conservative merge); a held-out rule may still agree with a TRAIN rule on up to
+``max_agreement`` of the items (typically below 15%: e.g. two permutations that differ by one
+transposition agree whenever the two swapped digits are equal); single items whose answer equals
+the input are not filtered.
 
 Limits: every statement here is about synthetic digit-string tasks for tiny CPU models; nothing
 says anything about real LLMs.
@@ -40,12 +51,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any
 
+import torch
 from torch import nn
 
 from research_rl.capability.types import Item, ScoreFn, Split
@@ -56,6 +69,7 @@ Rule = tuple[str, ...]
 
 __all__ = [
     "COMMON_WORDS",
+    "DEFAULT_MAX_AGREEMENT",
     "OPERATOR_CATALOG",
     "PREREQUISITE_FAMILIES",
     "SLICE_NAMES",
@@ -75,7 +89,7 @@ __all__ = [
 ]
 
 
-class AuditAccessError(PermissionError):
+class AuditAccessError(RuntimeError):
     """Raised when the AUDIT split is requested from a sampler built without ``allow_audit=True``."""
 
 
@@ -193,6 +207,10 @@ _COMMON_WORDS_TEXT = """
     woe wok won woo wow yak yam yap yaw yea yen yes yet yew you zap zed zen zip zoo
     abs alp amp app ave bbq ceo cpu diy dna etc faq gps inc ltd mph pdf sql tbd usb vip www
     cos exp min pow arg cnt idx len num pos rev neg
+    aha awl bah bro coo cox eon fab fib goo hex hmm huh jag lob lol loo lye moo oaf omg ooh ops
+    pox rad ref rho sax shh sic tux ugh vim wry yep yum yup zag zig zit
+    avg dec div inv mul xor srt mov rot oct abc xyz asc dsc sgn sqr cmp del ins tmp val var ptr
+    str int chr ord fun def err
 """
 COMMON_WORDS: frozenset[str] = frozenset(_COMMON_WORDS_TEXT.split())
 
@@ -221,6 +239,14 @@ def invent_names(
     return tuple(names)
 
 
+DEFAULT_MAX_AGREEMENT: float = 0.25
+"""Default agreement threshold of :meth:`OperatorSet.similarity`: two rules whose outputs agree on
+at least this fraction of the probe inputs are treated as one function class. Measured on the
+default 10 operators, cross-pair agreements (rules not equal on any whole length) are either
+<= 0.19 or >= 0.27 (``mirror``-after-rotation vs ``mirror``-after-sort), and ~0.6 for
+``sort``/``inc`` twins; 0.25 splits that gap."""
+
+
 def compose_prompt(rule: Rule, x: str) -> str:
     """Prompt of a composition item: ``compose_prompt(("zib", "mok"), "4721") == "zib(mok(4721))="``."""
     if not rule:
@@ -237,15 +263,19 @@ class OperatorSet:
     length, else on 512 fixed random inputs), that every operator is length-preserving, is not
     the identity and differs from every other operator; it raises ``ValueError`` otherwise.
 
-    ``probe_inputs`` (64 fixed random inputs per length plus constant and ascending strings)
-    define the :meth:`signature` used for functional comparisons of rules.
+    ``probe_inputs`` (64 fixed random inputs per length plus constant and ascending strings, the
+    same number per length) define the :meth:`signature` used for functional comparisons of
+    rules: :meth:`agreement`, :meth:`similar` / :meth:`similarity` (equal on the probe inputs of
+    some length, or agreement >= ``max_agreement``) and :meth:`is_degenerate` (similar to the
+    identity or to an atomic operator, e.g. two permutations whose product is a third one on
+    length-3 strings).
     """
 
     def __init__(self, seed: int = 0, num_operators: int = 10, *, min_len: int = 3, max_len: int = 7) -> None:
         if not 4 <= num_operators <= len(OPERATOR_CATALOG):
             raise ValueError(f"num_operators must be in [4, {len(OPERATOR_CATALOG)}], got {num_operators}")
-        if not 2 <= min_len <= max_len <= 9:
-            raise ValueError(f"need 2 <= min_len <= max_len <= 9, got {min_len}, {max_len}")
+        if not 3 <= min_len <= max_len <= 9:  # at length 2 reverse and both rotations coincide
+            raise ValueError(f"need 3 <= min_len <= max_len <= 9, got {min_len}, {max_len}")
         self.seed = int(seed)
         self.num_operators = int(num_operators)
         self.min_len = int(min_len)
@@ -257,12 +287,18 @@ class OperatorSet:
         self._check_distinct()
         rng = random.Random(_derive_seed("probe_inputs", self.min_len, self.max_len))
         probe: list[str] = []
+        self._length_spans: list[tuple[int, int]] = []
         for length in range(self.min_len, self.max_len + 1):
+            start = len(probe)
             probe.extend(_digits(rng, length) for _ in range(64))
             probe.extend(str(d) * length for d in (0, 5, 9))
             probe.append("".join(str(i % 10) for i in range(length)))
+            self._length_spans.append((start, len(probe)))
         self.probe_inputs: tuple[str, ...] = tuple(probe)
         self._signatures: dict[Rule, tuple[str, ...]] = {}
+        self._codes: dict[Rule, torch.Tensor] = {}
+        self.anchors: tuple[Rule, ...] = ((), *((n,) for n in self.names))
+        """The identity ``()`` and every atomic operator (the comparators of :meth:`is_degenerate`)."""
 
     def _check_distinct(self) -> None:
         rng = random.Random(_derive_seed("distinct_check", self.min_len, self.max_len))
@@ -329,6 +365,64 @@ class OperatorSet:
             sig = tuple(fn(y) for y in self.signature(key[1:]))
         self._signatures[key] = sig
         return sig
+
+    def _code(self, rule: Sequence[str]) -> torch.Tensor:
+        """:meth:`signature` as an int64 vector (outputs in one probe column share a length, so
+        ``int`` is injective per column)."""
+        key = tuple(rule)
+        cached = self._codes.get(key)
+        if cached is None:
+            cached = torch.tensor([int(s) for s in self.signature(key)], dtype=torch.int64)
+            self._codes[key] = cached
+        return cached
+
+    def similarity(
+        self,
+        rows: Sequence[Sequence[str]],
+        cols: Sequence[Sequence[str]],
+        *,
+        max_agreement: float = DEFAULT_MAX_AGREEMENT,
+    ) -> torch.Tensor:
+        """Boolean ``(len(rows), len(cols))`` matrix: entry ``[i, j]`` is True iff rules
+        ``rows[i]`` and ``cols[j]`` are equal on all probe inputs of at least one length, or
+        agree on at least ``max_agreement`` of all probe inputs (see :meth:`agreement`).
+
+        A rule is similar to itself. ``max_agreement`` must be in ``(0, 1]``. Computed in chunks
+        (memory ``O(256 * len(cols) * len(probe_inputs))``).
+        """
+        if not 0.0 < max_agreement <= 1.0:
+            raise ValueError(f"max_agreement must be in (0, 1], got {max_agreement}")
+        out = torch.zeros(len(rows), len(cols), dtype=torch.bool)
+        if not rows or not cols:
+            return out
+        n_lengths = len(self._length_spans)
+        width = len(self.probe_inputs) // n_lengths  # every length has the same number of probes
+        # an exact fraction counts as reached (``>=``) despite float rounding
+        need = math.ceil(max_agreement * len(self.probe_inputs) - 1e-9)
+        right = torch.stack([self._code(r) for r in cols])
+        for start in range(0, len(rows), 256):
+            left = torch.stack([self._code(r) for r in rows[start : start + 256]])
+            eq = left[:, None, :] == right[None, :, :]
+            per_length = eq.view(len(left), len(cols), n_lengths, width).all(-1).any(-1)
+            out[start : start + len(left)] = per_length | (eq.sum(-1) >= need)
+        return out
+
+    def agreement(self, a: Sequence[str], b: Sequence[str]) -> float:
+        """Fraction of :attr:`probe_inputs` on which rules ``a`` and ``b`` give the same output
+        (each length has the same number of probe inputs, so lengths are weighted equally)."""
+        return float((self._code(a) == self._code(b)).to(torch.float64).mean())
+
+    def similar(
+        self, a: Sequence[str], b: Sequence[str], *, max_agreement: float = DEFAULT_MAX_AGREEMENT
+    ) -> bool:
+        """``similarity([a], [b], max_agreement=...)`` as a bool."""
+        return bool(self.similarity([a], [b], max_agreement=max_agreement)[0, 0])
+
+    def is_degenerate(self, rule: Sequence[str], *, max_agreement: float = DEFAULT_MAX_AGREEMENT) -> bool:
+        """True iff ``rule`` is :meth:`similar` to the identity or to an atomic operator (equal to
+        one of them on the probe inputs of some length, or agreeing with one of them on at least
+        ``max_agreement`` of the probe inputs); ``()`` and single operators are degenerate."""
+        return bool(self.similarity([rule], self.anchors, max_agreement=max_agreement).any())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -469,22 +563,31 @@ class CompositionSplits:
         depth3_count: int = 16,
         audit_depth3_count: int | None = None,
         task_families: Sequence[str] = TASK_FAMILIES,
+        max_agreement: float = DEFAULT_MAX_AGREEMENT,
     ) -> CompositionSplits:
         """Partition every ordered pair ``(f, g)``, ``f != g``, into TRAIN / T_RULE / AUDIT pairs.
 
-        Pairs are grouped into functional equivalence classes (equal :meth:`OperatorSet.signature`);
-        each class goes to one split. Classes whose function equals the identity or an atomic
-        operator are TRAIN (never held out). The remaining classes are shuffled (``seed``) and
-        assigned greedily: AUDIT until it holds ``round(audit_fraction * P)`` pairs, then TRAIN
-        until ``round(train_fraction * P)``, the rest T_RULE (``P`` = number of ordered pairs;
-        class granularity can overshoot a target by one class).
+        Pairs are grouped into *function classes*: the connected components of
+        :meth:`OperatorSet.similarity` (with ``max_agreement``) over all ordered pairs - two pairs
+        are linked when they are equal on the probe inputs of some length or agree on at least
+        ``max_agreement`` of them. Each class goes to one split. A class containing a degenerate
+        pair (:meth:`OperatorSet.is_degenerate`) is TRAIN (never held out). The remaining classes
+        are shuffled (``seed``) and assigned in that order: a class goes to AUDIT if AUDIT holds
+        fewer than ``round(audit_fraction * P)`` pairs and stays at most one pair above that target
+        with it, else to TRAIN under the same rule with ``round(train_fraction * P)``, else to
+        T_RULE (``P`` = number of ordered pairs).
 
         ``depth3_count`` T_RULE rules ``f(g(h))`` with ``(f, g)`` and ``(g, h)`` TRAIN pairs and
         ``audit_depth3_count`` (default ``depth3_count``) AUDIT rules with at least one AUDIT
-        sub-pair are drawn; each depth-3 rule's signature differs from the identity, every atomic
-        operator, every pair, every rule of other splits and every other depth-3 rule of its
-        slice. Raises ``ValueError`` on invalid fractions, an empty split or when fewer valid
-        depth-3 rules exist than requested.
+        sub-pair are drawn; a depth-3 rule is kept only if it is similar to no pair (of any split),
+        to neither the identity nor any atomic operator, and to no depth-3 rule chosen before it
+        (of either slice). ``max_agreement`` is stored in :attr:`meta` and used again by
+        :meth:`check_disjoint`. Raises ``ValueError`` on invalid fractions or ``max_agreement``,
+        an empty split or when fewer valid depth-3 rules exist than requested. Measured over
+        seeds 0-199 with the defaults: 10, 11 and 12 operators never fail (at least 34, 31 and 54
+        valid T_RULE depth-3 rules, at least 58 AUDIT ones); 9 operators fail for 2 of 200 seeds
+        (minimum 14 valid T_RULE depth-3 rules); 8 operators fail for 9 of seeds 0-9 and 7
+        operators for all of them, so pass a smaller ``depth3_count`` there.
         """
         if not (
             0.0 < train_fraction < 1.0
@@ -506,66 +609,86 @@ class CompositionSplits:
         if unknown:
             raise ValueError(f"unknown task families {unknown}; known: {TASK_FAMILIES}")
 
+        if not 0.0 < max_agreement <= 1.0:
+            raise ValueError(f"max_agreement must be in (0, 1], got {max_agreement}")
+
         rng = random.Random(_derive_seed("composition_splits", seed, operators.seed, operators.num_operators))
         names = operators.names
         pairs: list[Rule] = [(f, g) for f in names for g in names if f != g]
-        degenerate = {operators.signature(())} | {operators.signature((o,)) for o in names}
-        classes: dict[tuple[str, ...], list[Rule]] = {}
-        for p in pairs:
-            classes.setdefault(operators.signature(p), []).append(p)
+        linked = operators.similarity(pairs, pairs, max_agreement=max_agreement)
+        degenerate = (
+            operators.similarity(pairs, operators.anchors, max_agreement=max_agreement).any(1).tolist()
+        )
+        parent = list(range(len(pairs)))
+
+        def root(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i, j in linked.nonzero().tolist():
+            ri, rj = root(i), root(j)
+            if ri != rj:
+                parent[max(ri, rj)] = min(ri, rj)
+        components: dict[int, list[int]] = {}
+        for i in range(len(pairs)):
+            components.setdefault(root(i), []).append(i)
         train: list[Rule] = []
         free: list[list[Rule]] = []
-        for sig, members in classes.items():
-            if sig in degenerate:
-                train.extend(members)
+        for members in components.values():  # ordered by smallest member index: deterministic
+            if any(degenerate[i] for i in members):
+                train.extend(pairs[i] for i in members)
             else:
-                free.append(members)
+                free.append([pairs[i] for i in members])
         _shuffle(rng, free)
         audit_target = round(audit_fraction * len(pairs))
         train_target = round(train_fraction * len(pairs))
         audit: list[Rule] = []
         unseen: list[Rule] = []
-        for members in free:
-            if len(audit) < audit_target:
-                audit.extend(members)
-            elif len(train) < train_target:
-                train.extend(members)
+        for cls_members in free:
+            size = len(cls_members)
+            if len(audit) < audit_target and len(audit) + size <= audit_target + 1:
+                audit.extend(cls_members)
+            elif len(train) < train_target and len(train) + size <= train_target + 1:
+                train.extend(cls_members)
             else:
-                unseen.extend(members)
+                unseen.extend(cls_members)
         for label, group in (("TRAIN", train), ("T_RULE", unseen), ("AUDIT", audit)):
             if not group:
                 raise ValueError(f"{label} pairs would be empty; adjust the fractions or num_operators")
 
         train_set, audit_set = set(train), set(audit)
-        pair_sigs = {operators.signature(p) for p in pairs}
-        forbidden = degenerate | pair_sigs
+        fixed_comparators: list[Rule] = [*pairs, *operators.anchors]
+        chosen_depth3: list[Rule] = []
 
-        def pick(candidates: list[Rule], count: int, forbid: set[tuple[str, ...]], label: str) -> list[Rule]:
+        def pick(candidates: list[Rule], count: int, label: str) -> list[Rule]:
             _shuffle(rng, candidates)
             chosen: list[Rule] = []
-            seen = set(forbid)
-            for rule in candidates:
-                sig = operators.signature(rule)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                chosen.append(rule)
-                if len(chosen) == count:
-                    return chosen
+            for start in range(0, len(candidates), 64):  # chunks: only scanned rules are evaluated
+                chunk = candidates[start : start + 64]
+                clash = operators.similarity(chunk, fixed_comparators, max_agreement=max_agreement).any(1)
+                for rule, bad in zip(chunk, clash.tolist()):
+                    if bad or (
+                        chosen_depth3
+                        and operators.similarity([rule], chosen_depth3, max_agreement=max_agreement).any()
+                    ):
+                        continue
+                    chosen_depth3.append(rule)
+                    chosen.append(rule)
+                    if len(chosen) == count:
+                        return chosen
             raise ValueError(f"only {len(chosen)} valid {label} rules exist, {count} requested")
 
         triples = [(f, g, h) for f in names for g in names for h in names if f != g and g != h]
         t_depth3 = pick(
             [t for t in triples if (t[0], t[1]) in train_set and (t[1], t[2]) in train_set],
             depth3_count,
-            forbidden,
             "T_RULE depth-3",
         )
-        t_depth3_sigs = {operators.signature(t) for t in t_depth3}
         a_depth3 = pick(
             [t for t in triples if (t[0], t[1]) in audit_set or (t[1], t[2]) in audit_set],
             n_audit3,
-            forbidden | t_depth3_sigs,
             "AUDIT depth-3",
         )
         splits = cls(
@@ -580,7 +703,11 @@ class CompositionSplits:
                 "retention/atomic": tuple((o,) for o in names),
             },
             task_families=families,
-            meta={"train_fraction": train_fraction, "audit_fraction": audit_fraction},
+            meta={
+                "train_fraction": train_fraction,
+                "audit_fraction": audit_fraction,
+                "max_agreement": max_agreement,
+            },
         )
         splits.check_disjoint()
         return splits
@@ -627,9 +754,11 @@ class CompositionSplits:
         partition all ordered pairs ``f != g``; no AUDIT pair is a contiguous sub-chain of any
         non-AUDIT rule; every T_RULE depth-3 rule has both sub-pairs in TRAIN (so it is never a
         TRAIN rule); every AUDIT depth-3 rule contains an AUDIT pair. Family level: the T_TASK
-        families are known and disjoint from the SFT prerequisite families. Functional level: no
-        composed rule outside TRAIN equals the identity or an atomic operator on the probe set,
-        and no two composed rules of different splits have the same signature.
+        families are known and disjoint from the SFT prerequisite families. Functional level, with
+        ``max_agreement = meta.get("max_agreement", DEFAULT_MAX_AGREEMENT)``: no composed rule
+        outside TRAIN is degenerate (:meth:`OperatorSet.is_degenerate`), and no two composed rules
+        of different splits are similar (:meth:`OperatorSet.similarity`: equal on the probe inputs
+        of some length, or agreeing on at least ``max_agreement`` of them).
         """
         v: list[str] = []
         names = set(self.operators.names)
@@ -681,20 +810,29 @@ class CompositionSplits:
             v.append(f"invalid task families {self.task_families}")
         if set(self.task_families) & set(PREREQUISITE_FAMILIES):
             v.append("a T_TASK family is also an SFT prerequisite family")
+        max_agreement = self.meta.get("max_agreement", DEFAULT_MAX_AGREEMENT)
+        if not (isinstance(max_agreement, (int, float)) and 0.0 < max_agreement <= 1.0):
+            v.append(f"meta max_agreement {max_agreement!r} is not in (0, 1]")
         if not v:  # signatures need known operators
             ops = self.operators
-            degenerate = {ops.signature(())} | {ops.signature((n,)) for n in names}
-            sig_split: dict[tuple[str, ...], tuple[Split, Rule]] = {}
-            for slice_name, split in _COMPOSED_SLICES.items():
-                for rule in get(slice_name, ()):
-                    sig = ops.signature(rule)
-                    if split is not Split.TRAIN and sig in degenerate:
-                        v.append(f"{slice_name} rule {rule} equals the identity or an atomic operator")
-                    prev = sig_split.setdefault(sig, (split, rule))
-                    if prev[0] is not split:
-                        v.append(
-                            f"{slice_name} rule {rule} computes the same function as {prev[0].value} rule {prev[1]}"
-                        )
+            entries = [(s, split, r) for s, split in _COMPOSED_SLICES.items() for r in get(s, ())]
+            rules_all = [r for _, _, r in entries]
+            similar = ops.similarity(rules_all, rules_all, max_agreement=max_agreement)
+            degenerate = ops.similarity(rules_all, ops.anchors, max_agreement=max_agreement).any(1)
+            for (slice_name, split, rule), deg in zip(entries, degenerate.tolist()):
+                if split is not Split.TRAIN and deg:
+                    v.append(
+                        f"{slice_name} rule {rule} is similar to the identity or an atomic operator "
+                        "(equal on some length or agreement >= max_agreement)"
+                    )
+            for i, j in similar.nonzero().tolist():
+                (sa, pa, ra), (sb, pb, rb) = entries[i], entries[j]
+                if i < j and pa is not pb:
+                    v.append(
+                        f"{sb} rule {rb} is similar to {pa.value} rule {ra} ({sa}; agreement "
+                        f"{ops.agreement(ra, rb):.2f}; similar = equal on some length or agreement >= "
+                        f"{max_agreement})"
+                    )
         if v:
             raise SplitIntegrityError(v)
 
@@ -1025,6 +1163,17 @@ class VerifierScoreFn:
 
     Generation uses :func:`greedy_generate` (argmax decoding, EOS or ``max_new_tokens`` stops;
     the model's training mode and generation configs are restored; no weights change).
+
+    Truncation: a completion is flagged ``truncated`` when re-encoding the decoded text with
+    ``tokenizer`` gives at least ``max_new_tokens`` tokens, i.e. generation stopped at the budget
+    without an EOS (:func:`greedy_generate` removes the EOS and everything after it). The flag is
+    passed to whichever verifier is used as ``verify(..., truncated=flag)``; both verifiers of this
+    module return ``"truncated"`` (score 0.0) for it, the planted leak included. Consequence: the
+    budget must exceed the longest answer (answer + EOS), e.g. ``max_new_tokens >= max_len + 1``
+    for composition items; an answer that exactly fills the budget scores 0.0. The detection is
+    exact for tokenizers whose decode/encode round-trips token for token (the char tokenizer of
+    :mod:`research_rl.models.tiny`); for subword tokenizers re-encoding may count differently,
+    and a completion containing special tokens other than EOS (dropped by decoding) may be missed.
     """
 
     def __init__(self, tokenizer: Any, verifier: Verifier, *, max_new_tokens: int, batch_size: int) -> None:
@@ -1047,16 +1196,35 @@ class VerifierScoreFn:
             batch_size=self.batch_size,
         )
 
-    def score_completions(self, completions: Sequence[str | None], items: Sequence[Item]) -> list[float]:
-        """1.0 / 0.0 per completion under the verifier."""
+    def truncated(self, completions: Sequence[str]) -> list[bool]:
+        """Per completion: True iff it re-encodes to at least ``max_new_tokens`` tokens (see the
+        class docstring for the limits of this test)."""
+        return [
+            len(self.tokenizer(c, add_special_tokens=False)["input_ids"]) >= self.max_new_tokens
+            for c in completions
+        ]
+
+    def score_completions(
+        self,
+        completions: Sequence[str | None],
+        items: Sequence[Item],
+        truncated: Sequence[bool] | None = None,
+    ) -> list[float]:
+        """1.0 / 0.0 per completion under the verifier; ``truncated`` (default: all False) is
+        passed through as the verifier's ``truncated`` flag."""
         if len(completions) != len(items):
             raise ValueError(f"{len(completions)} completions for {len(items)} items")
+        flags = [False] * len(items) if truncated is None else [bool(t) for t in truncated]
+        if len(flags) != len(items):
+            raise ValueError(f"{len(flags)} truncation flags for {len(items)} items")
         return [
-            1.0 if self.verifier.verify(c, it.answer).correct else 0.0 for c, it in zip(completions, items)
+            1.0 if self.verifier.verify(c, it.answer, truncated=t).correct else 0.0
+            for c, it, t in zip(completions, items, flags)
         ]
 
     def __call__(self, model: nn.Module, items: Sequence[Item]) -> list[float]:
-        return self.score_completions(self.generate(model, items), items)
+        completions = self.generate(model, items)
+        return self.score_completions(completions, items, self.truncated(completions))
 
 
 def make_score_fn(tokenizer: Any, verifier: Verifier, *, max_new_tokens: int, batch_size: int) -> ScoreFn:

@@ -11,6 +11,7 @@ import torch
 
 from research_rl.capability.tasks import (
     COMMON_WORDS,
+    DEFAULT_MAX_AGREEMENT,
     OPERATOR_CATALOG,
     PREREQUISITE_FAMILIES,
     SLICE_NAMES,
@@ -22,6 +23,7 @@ from research_rl.capability.tasks import (
     OperatorSet,
     SplitIntegrityError,
     SuffixLeakVerifier,
+    VerifierScoreFn,
     compose_prompt,
     invent_names,
     make_score_fn,
@@ -107,6 +109,11 @@ def test_invented_names_deterministic_unique_and_not_words() -> None:
     for word in ("the", "and", "max", "min", "add", "cat", "dog", "sum", "rev"):
         assert word in COMMON_WORDS
     # the stop list forces a resample: forbidding the first draws yields different names
+    # words a reviewer found among generated names (seeds 495: avg, 691/815: inv, ...)
+    for word in ("inv", "dec", "avg", "div", "mul", "xor", "lye", "oaf", "eon", "zag", "fib", "moo", "sax"):
+        assert word in COMMON_WORDS
+    for seed in (495, 691, 815):
+        assert not set(OperatorSet(seed=seed).names) & {"avg", "inv"}
     first = invent_names(5, seed=3)
     again = invent_names(5, seed=3, forbidden=COMMON_WORDS | set(first))
     assert not set(first) & set(again)
@@ -145,8 +152,9 @@ def test_splits_partition_pairs_and_are_rule_disjoint(ops: OperatorSet, splits: 
     for f, g, h in splits.slice_rules_of("audit/depth3"):
         assert (f, g) in audit or (g, h) in audit
     # fractions roughly respected (class granularity)
-    assert abs(len(train) - 0.5 * len(all_pairs)) <= 3
-    assert abs(len(audit) - 0.2 * len(all_pairs)) <= 3
+    assert abs(len(train) - 0.5 * len(all_pairs)) <= 1
+    assert abs(len(audit) - 0.2 * len(all_pairs)) <= 1
+    assert splits.meta["max_agreement"] == DEFAULT_MAX_AGREEMENT
 
 
 def test_functional_layer(ops: OperatorSet, splits: CompositionSplits) -> None:
@@ -190,8 +198,15 @@ def test_slices_and_build_determinism(ops: OperatorSet, splits: CompositionSplit
     other = CompositionSplits.build(ops, seed=1)
     assert other.slice_rules_of("train/pairs") != splits.slice_rules_of("train/pairs")
     for seed in range(6):
-        for k in (8, 11, 12):
+        for k in (9, 11, 12):
             CompositionSplits.build(OperatorSet(seed=seed, num_operators=k), seed=seed)
+        # with 8 operators the similarity filter leaves too few depth-3 rules for the default 16
+        # (it raises instead of weakening the filter); a smaller count works
+        CompositionSplits.build(OperatorSet(seed=seed, num_operators=8), seed=seed, depth3_count=4)
+    with pytest.raises(ValueError, match="depth-3"):
+        CompositionSplits.build(OperatorSet(seed=1, num_operators=8), seed=1)
+    with pytest.raises(ValueError, match="max_agreement"):
+        CompositionSplits.build(ops, seed=0, max_agreement=0.0)
     with pytest.raises(ValueError):
         CompositionSplits.build(ops, seed=0, train_fraction=0.9, audit_fraction=0.2)
     with pytest.raises(ValueError, match="depth-3"):
@@ -246,6 +261,146 @@ def test_check_disjoint_raises_on_corrupted_splits(splits: CompositionSplits) ->
     )
     with pytest.raises(SplitIntegrityError, match="identity or an atomic"):
         bad.check_disjoint()
+
+
+def _expect(bad: CompositionSplits, needle: str) -> None:
+    with pytest.raises(SplitIntegrityError) as info:
+        bad.check_disjoint()
+    assert any(needle in msg for msg in info.value.violations), info.value.violations
+
+
+def test_check_disjoint_every_branch_fires(splits: CompositionSplits) -> None:
+    names = splits.operators.names
+    by_key = {v: k for k, v in splits.operators.describe().items()}
+    train = splits.slice_rules_of("train/pairs")
+    unseen = splits.slice_rules_of("t_rule/unseen_pairs")
+    audit3 = splits.slice_rules_of("audit/depth3")
+    train_set = set(train)
+    # an AUDIT depth-3 rule without an AUDIT sub-pair (both sub-pairs TRAIN)
+    no_audit = next(
+        (a, b, c)
+        for a in names
+        for b in names
+        for c in names
+        if a != b
+        and b != c
+        and (a, b) in train_set
+        and (b, c) in train_set
+        and (a, b, c) not in splits.slice_rules_of("t_rule/depth3")
+    )
+    _expect(_corrupt(splits, **{"audit/depth3": (*audit3, no_audit)}), "contains no AUDIT pair")
+    # wrong depth, unknown operator, repeated adjacent operator
+    _expect(
+        _corrupt(splits, **{"t_rule/depth3": (*splits.slice_rules_of("t_rule/depth3"), unseen[0])}),
+        "has depth 2",
+    )
+    _expect(_corrupt(splits, **{"t_rule/unseen_pairs": (*unseen, ("zzz", names[0]))}), "unknown operator")
+    _expect(
+        _corrupt(splits, **{"t_rule/unseen_pairs": (*unseen, (names[0], names[0]))}), "repeats an adjacent"
+    )
+    # retention/atomic must list every operator exactly once
+    _expect(
+        _corrupt(splits, **{"retention/atomic": tuple((n,) for n in names[1:])}), "retention/atomic must hold"
+    )
+    # an invalid stored threshold
+    _expect(dataclasses.replace(splits, meta={**splits.meta, "max_agreement": 0.0}), "max_agreement")
+
+    # functional level: move one member of a similar pair of rules to another split
+    def move(rule: tuple[str, ...]) -> CompositionSplits:
+        src = next(
+            sl
+            for sl in ("train/pairs", "t_rule/unseen_pairs", "audit/pairs")
+            if rule in splits.slice_rules_of(sl)
+        )
+        dst = "t_rule/unseen_pairs" if src != "t_rule/unseen_pairs" else "audit/pairs"
+        return _corrupt(
+            splits,
+            **{
+                src: tuple(r for r in splits.slice_rules_of(src) if r != rule),
+                dst: (*splits.slice_rules_of(dst), rule),
+            },
+        )
+
+    inc, srt = by_key["plus_1_mod_10"], by_key["sort_ascending"]
+    swp, rotr, rev = by_key["swap_adjacent_pairs"], by_key["rotate_right_1"], by_key["reverse"]
+    ops = splits.operators
+    # high item agreement (differ only when the input holds a 9), not equal on any length
+    assert ops.agreement((srt, inc), (inc, srt)) > 0.5 and ops.similar((srt, inc), (inc, srt))
+    _expect(move((srt, inc)), "is similar to")
+    # equal on whole lengths 3 and 4 (the six permutations of length 3 collapse many pairs)
+    assert ops.similar((swp, rotr), (rotr, rev))
+    _expect(move((swp, rotr)), "is similar to")
+    # isolate the two branches with a threshold no agreement reaches: per-length equality alone
+    # still flags (swp, rotr); the sort/inc twins (never equal on a whole length) pass
+    strict_meta = {**splits.meta, "max_agreement": 0.99}
+    assert ops.agreement((swp, rotr), (rotr, rev)) < 0.99 and ops.similar(
+        (swp, rotr), (rotr, rev), max_agreement=0.99
+    )
+    _expect(dataclasses.replace(move((swp, rotr)), meta=strict_meta), "is similar to")
+    assert not ops.similar((srt, inc), (inc, srt), max_agreement=0.99)
+    dataclasses.replace(move((srt, inc)), meta=strict_meta).check_disjoint()  # no violation at all
+
+
+def _tables(ops: OperatorSet, inputs: list[str]) -> dict[str, dict[str, str]]:
+    return {n: {x: ops.apply((n,), x) for x in inputs} for n in ops.names}
+
+
+def _run(rule: tuple[str, ...], xs: list[str], tables: dict[str, dict[str, str]]) -> tuple[str, ...]:
+    out = []
+    for x in xs:
+        for name in reversed(rule):
+            x = tables[name][x]
+        out.append(x)
+    return tuple(out)
+
+
+def test_held_out_rules_are_not_train_functions_on_any_length_or_most_items() -> None:
+    """Regression: held-out rules must not equal a TRAIN pair, an atomic operator or the identity
+    on every input of a length (checked exhaustively on lengths 3 and 4, independent of the probe
+    set), and must not agree with one of them on most sampled items (fresh inputs, margin over
+    the build threshold)."""
+    exhaustive = [str(i).zfill(3) for i in range(1000)] + [str(i).zfill(4) for i in range(10_000)]
+    for seed in range(5):
+        ops = OperatorSet(seed=seed)
+        splits = CompositionSplits.build(ops, seed=seed)
+        tables = _tables(ops, exhaustive)
+        comparators = [*splits.slice_rules_of("train/pairs"), (), *((n,) for n in ops.names)]
+        rng = random.Random(100 + seed)
+        fresh = ["".join(str(rng.randrange(10)) for _ in range(rng.randint(3, 7))) for _ in range(1000)]
+        fresh_out = {c: [ops.apply(c, x) for x in fresh] for c in comparators}
+        per_length = {
+            n: {_run(c, exhaustive[a:b], tables) for c in comparators}
+            for n, (a, b) in ((3, (0, 1000)), (4, (1000, 11_000)))
+        }
+        for slice_name in ("t_rule/unseen_pairs", "t_rule/depth3", "audit/pairs", "audit/depth3"):
+            for rule in splits.slice_rules_of(slice_name):
+                for n, (a, b) in ((3, (0, 1000)), (4, (1000, 11_000))):
+                    assert _run(rule, exhaustive[a:b], tables) not in per_length[n], (
+                        seed,
+                        slice_name,
+                        rule,
+                        n,
+                    )
+                out = [ops.apply(rule, x) for x in fresh]
+                worst = max(sum(p == q for p, q in zip(out, fresh_out[c])) for c in comparators) / len(fresh)
+                assert worst < 0.40, (seed, slice_name, rule, worst)
+
+
+def test_similarity_relation(ops: OperatorSet) -> None:
+    by_key = {v: k for k, v in ops.describe().items()}
+    inc, dec, rev = by_key["plus_1_mod_10"], by_key["minus_1_mod_10"], by_key["reverse"]
+    assert ops.similar((inc,), (inc,)) and ops.agreement((rev, inc), (inc, rev)) == 1.0
+    assert not ops.similar((inc,), (dec,)) and ops.agreement((inc,), (dec,)) == 0.0
+    assert ops.is_degenerate((inc, dec)) and ops.is_degenerate(()) and not ops.is_degenerate((rev, inc))
+    sim = ops.similarity([(inc,), (rev, inc)], [(inc,), (dec,), (inc, rev)])
+    assert sim.tolist() == [[True, False, False], [False, False, True]]
+    assert ops.similarity([], [(inc,)]).shape == (0, 1)
+    # the threshold is inclusive and validated
+    a, b = (by_key["sort_ascending"], inc), (inc, by_key["sort_ascending"])
+    x = ops.agreement(a, b)
+    assert ops.similar(a, b, max_agreement=x) and ops.agreement(a, b) < 1.0
+    with pytest.raises(ValueError):
+        ops.similarity([(inc,)], [(inc,)], max_agreement=1.5)
 
 
 # ============================================================================== sampler
@@ -306,6 +461,19 @@ def test_sampler_streams_are_fresh_per_purpose_and_index(splits: CompositionSpli
     assert [it.uid for it in pooled if it.slice == "t_rule/unseen_pairs"][:20] != [
         it.uid for it in draws[("gate", 0)][:20]
     ]
+
+
+def test_pooled_draws_are_fresh_per_purpose_and_index(splits: CompositionSplits) -> None:
+    """The gate's path (``slice=None``): index and purpose each change the items."""
+    sampler = ItemSampler(splits, root_seed=0)
+    n = 200
+    for split in (Split.T_RULE, Split.T_TASK):
+        base = [it.uid for it in sampler.draw(split, n, purpose="gate", index=0)]
+        assert base == [it.uid for it in sampler.draw(split, n, purpose="gate", index=0)]
+        for purpose, index in (("gate", 1), ("gate", 7), ("tracker", 0)):
+            other = [it.uid for it in sampler.draw(split, n, purpose=purpose, index=index)]
+            assert len(set(base) & set(other)) <= 0.05 * n, (split, purpose, index)
+            assert sum(x == y for x, y in zip(base, other)) <= 3, (split, purpose, index)
 
 
 def test_audit_is_locked(splits: CompositionSplits) -> None:
@@ -484,3 +652,112 @@ def test_score_completions_maps_verifier_outcome(splits: CompositionSplits) -> N
     assert exact.score_completions(wrong_prefix, items) == [0.0, 0.0, 0.0]  # type: ignore[attr-defined]
     assert leak.score_completions(wrong_prefix, items) == [1.0, 1.0, 1.0]  # type: ignore[attr-defined]
     assert exact.score_completions([None, "", "x"], items) == [0.0, 0.0, 0.0]  # type: ignore[attr-defined]
+
+
+def test_held_out_rules_never_equal_atomic_on_any_length(ops: OperatorSet, splits: CompositionSplits) -> None:
+    rng = random.Random(5)
+    held_out = [*splits.rules(Split.T_RULE), *splits.rules(Split.AUDIT)]
+    for length in range(ops.min_len, ops.max_len + 1):
+        if length == 3:
+            xs = [str(i).zfill(3) for i in range(1000)]
+        else:
+            xs = ["".join(str(rng.randrange(10)) for _ in range(length)) for _ in range(200)]
+        atomic = {tuple(ops.apply(r, x) for x in xs) for r in [(), *((n,) for n in ops.names)]}
+        for rule in held_out:
+            assert tuple(ops.apply(rule, x) for x in xs) not in atomic, (rule, length)
+    n_degenerate = sum(ops.is_degenerate(r) for r in splits.slice_rules_of("train/pairs"))
+    assert 0 < n_degenerate < len(splits.slice_rules_of("train/pairs"))
+
+
+class _OracleLM(torch.nn.Module):
+    """Stub causal LM whose ``generate`` appends a scripted completion (+ EOS) to every prompt."""
+
+    def __init__(self, tok: object, completions: dict[str, str]) -> None:
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+        self.tok = tok
+        self.completions = completions
+
+    def generate(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, generation_config: object
+    ) -> torch.Tensor:
+        tok = self.tok
+        rows = []
+        for ids, mask in zip(input_ids.tolist(), attention_mask.tolist()):
+            prompt = tok.decode([i for i, m in zip(ids, mask) if m], skip_special_tokens=True)  # type: ignore[attr-defined]
+            new = tok(self.completions[prompt], add_special_tokens=False)["input_ids"]  # type: ignore[operator]
+            rows.append([*new, tok.eos_token_id])  # type: ignore[attr-defined]
+        width = max(len(r) for r in rows)
+        pad = tok.pad_token_id  # type: ignore[attr-defined]
+        tail = torch.tensor([r + [pad] * (width - len(r)) for r in rows], dtype=torch.long)
+        return torch.cat([input_ids, tail], dim=1)
+
+
+def test_score_fn_end_to_end_with_oracle_model(splits: CompositionSplits) -> None:
+    tok = build_char_tokenizer()
+    sampler = ItemSampler(splits, root_seed=0)
+    items = sampler.draw(Split.T_RULE, 5, purpose="oracle", index=0) + sampler.draw(
+        Split.T_TASK, 4, purpose="oracle", index=0
+    )
+    assert len({len(it.prompt) for it in items}) > 1 and len({len(it.answer) for it in items}) > 1
+    exact = make_score_fn(tok, ExactAnswerVerifier(), max_new_tokens=12, batch_size=3)
+    leak = make_score_fn(tok, SuffixLeakVerifier(k=2), max_new_tokens=12, batch_size=3)
+    perfect = _OracleLM(tok, {it.prompt: it.answer for it in items})
+    assert exact(perfect, items) == [1.0] * len(items)
+    assert leak(perfect, items) == [1.0] * len(items)
+    # wrong prefix, right last two characters: rejected by V2, accepted by the planted leak
+    multi = [it for it in items if len(it.answer) >= 3]
+    wrong = {it.prompt: ("9" if it.answer[0] != "9" else "1") + it.answer[1:] for it in multi}
+    hacked = _OracleLM(tok, wrong)
+    assert multi
+    assert exact(hacked, multi) == [0.0] * len(multi)
+    assert leak(hacked, multi) == [1.0] * len(multi)
+
+
+class _RunOnLM(torch.nn.Module):
+    """Stub LM that emits the scripted text and never an EOS (cut at ``max_new_tokens``)."""
+
+    def __init__(self, tok: object, completions: dict[str, str]) -> None:
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+        self.tok = tok
+        self.completions = completions
+
+    def generate(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, generation_config: object
+    ) -> torch.Tensor:
+        tok = self.tok
+        budget = generation_config.max_new_tokens  # type: ignore[attr-defined]
+        rows = []
+        for ids, mask in zip(input_ids.tolist(), attention_mask.tolist()):
+            prompt = tok.decode([i for i, m in zip(ids, mask) if m], skip_special_tokens=True)  # type: ignore[attr-defined]
+            text = self.completions[prompt] + "99999999999=)("
+            rows.append(tok(text, add_special_tokens=False)["input_ids"][:budget])  # type: ignore[operator]
+        return torch.cat([input_ids, torch.tensor(rows, dtype=torch.long)], dim=1)
+
+
+def test_score_fn_marks_completions_cut_at_the_budget_as_truncated(splits: CompositionSplits) -> None:
+    tok = build_char_tokenizer()
+    sampler = ItemSampler(splits, root_seed=0)
+    t_task = sampler.draw(Split.T_TASK, 20, purpose="trunc", index=0)
+    assert all(len(it.answer) == 1 for it in t_task)
+    answers = {it.prompt: it.answer for it in t_task}
+    run_on = _RunOnLM(tok, answers)
+    for verifier in (ExactAnswerVerifier(), SuffixLeakVerifier(k=2)):
+        # budget == answer length: the right characters but no EOS -> truncated -> 0
+        assert make_score_fn(tok, verifier, max_new_tokens=1, batch_size=4)(run_on, t_task) == [0.0] * 20
+        # budget == answer length + 1 with an EOS-terminated answer -> correct
+        stops = _OracleLM(tok, answers)
+        assert make_score_fn(tok, verifier, max_new_tokens=2, batch_size=4)(stops, t_task) == [1.0] * 20
+    composed = sampler.draw(Split.T_RULE, 12, purpose="trunc", index=0)
+    oracle = _OracleLM(tok, {it.prompt: it.answer for it in composed})
+    exact = make_score_fn(tok, ExactAnswerVerifier(), max_new_tokens=8, batch_size=4)
+    assert exact(oracle, composed) == [1.0] * len(composed)  # max answer length 7 + EOS fits in 8
+    fn = VerifierScoreFn(tok, ExactAnswerVerifier(), max_new_tokens=4, batch_size=1)
+    assert fn.truncated(["123", "1234", "12345", ""]) == [False, True, True, False]
+    items = composed[:2]
+    good = [it.answer for it in items]
+    assert fn.score_completions(good, items) == [1.0, 1.0]
+    assert fn.score_completions(good, items, truncated=[True, False]) == [0.0, 1.0]
+    with pytest.raises(ValueError):
+        fn.score_completions(good, items, truncated=[True])

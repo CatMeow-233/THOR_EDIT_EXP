@@ -10,6 +10,9 @@
   :func:`~research_rl.capability.stats.noninferiority_upper_bound` (H0 "drop >= margin") at its
   own margin (``GateConfig.retention_margins`` override, else ``GateConfig.retention_margin``).
 
+Splits are enforced: transfer slices must be T_RULE / T_TASK (never TRAIN or AUDIT), retention
+slices RETENTION, and every uid may appear only once in the whole evidence.
+
 Each call of :meth:`CapabilityGate.verdict` consumes exactly one alpha from the
 :class:`~research_rl.capability.stats.AlphaLedger`; the transfer test and all retention tests of
 that call share it (intersection-union: an accept requires every test to reject, so no split is
@@ -30,8 +33,10 @@ from typing import Any
 from research_rl.capability.stats import (
     AlphaLedger,
     noninferiority_upper_bound,
+    normal_cdf,
     paired_gain_lower_bound,
     pool_paired,
+    tango_z,
 )
 from research_rl.capability.types import (
     GateEvidence,
@@ -43,6 +48,9 @@ from research_rl.capability.types import (
 )
 
 __all__ = ["CapabilityGate", "GateConfig"]
+
+_TRANSFER_SPLITS = (Split.T_RULE, Split.T_TASK)
+_HORIZON_UNLIMITED = 2.0**52  # retention_horizon returns None at or beyond this many verdicts
 
 
 def _is_int(value: Any) -> bool:
@@ -57,11 +65,13 @@ def _check_margin(name: str, value: Any) -> float:
     return float(value)
 
 
-@dataclass(frozen=True)
+@dataclass
 class GateConfig:
     """Configuration of the capability gate and of the gated loop around it (JSON-able).
 
-    Fields (validated in ``__post_init__``; ``ValueError`` on any violation):
+    Fields (validated and normalised in ``__post_init__``; ``ValueError`` on any violation). The
+    dataclass is mutable; assigning a field later bypasses validation, so prefer
+    ``dataclasses.replace(config, ...)``, which re-runs it.
 
     * ``enabled``: ``False`` gives the ungated control arm. :meth:`CapabilityGate.verdict` still
       computes every statistic **and still consumes alpha from the ledger** (so the logged
@@ -82,11 +92,16 @@ class GateConfig:
     * ``rollback_unit``: :class:`RollbackUnit` (a string value is converted).
     * ``block_updates`` >= 1: operator updates per decision.
     * ``items_per_transfer_slice`` / ``items_per_retention_slice`` >= 1: fresh items per slice
-      and evaluation. Power floor: with margin 0.02 a retention slice needs at least
+      and evaluation. **Retention power floor**: under ``"spending"`` the k-th verdict runs at
+      ``alpha_k = alpha * 6 / (pi^2 k^2)``, and a retention slice needs at least
       :func:`~research_rl.capability.stats.retention_power_floor_n` items to pass even with
-      zero discordant pairs (173 at the first spending alpha with ``alpha=0.05``, 512 at the seventh, 576 at the
-      tenth), so the default of 512 lets even a perfect slice pass only for the first seven
-      decisions; long runs need larger slices, a larger margin or ``"per_decision"``.
+      zero discordant pairs (margin 0.02, ``alpha=0.05``: 173 items at k=1, 512 at k=7, 576 at
+      k=10). The floor grows only like ``log k``, but a slice that is too small fails *every*
+      verdict from some k on, whatever the candidate does. The default of 2048 items keeps a
+      margin-0.02 slice passable for 24495 verdicts with no discordant pair, 14624 with one
+      incumbent-only win, 8838 with two and 3348 with four (512 items: 7, 4, 2 and 1). Use
+      :meth:`retention_horizon` to check a configuration before a run: one gate procedure can
+      draw up to ``1 + len(shrink_lambdas) + max_group_rollbacks`` alphas.
     * ``alarm_triggers_decision``: run a decision immediately when the tier-1 alarm fires.
     """
 
@@ -102,7 +117,7 @@ class GateConfig:
     rollback_unit: RollbackUnit = RollbackUnit.PARAMETERS
     block_updates: int = 8
     items_per_transfer_slice: int = 256
-    items_per_retention_slice: int = 512
+    items_per_retention_slice: int = 2048
     alarm_triggers_decision: bool = True
 
     def __post_init__(self) -> None:
@@ -112,10 +127,12 @@ class GateConfig:
         alpha = self.alpha
         if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 < alpha < 0.5):
             raise ValueError(f"alpha must be in (0, 0.5), got {alpha!r}")
-        object.__setattr__(self, "alpha", float(alpha))
+        self.alpha = float(alpha)
         if self.alpha_schedule not in AlphaLedger.SCHEDULES:
-            raise ValueError(f"alpha_schedule must be one of {AlphaLedger.SCHEDULES}, got {self.alpha_schedule!r}")
-        object.__setattr__(self, "retention_margin", _check_margin("retention_margin", self.retention_margin))
+            raise ValueError(
+                f"alpha_schedule must be one of {AlphaLedger.SCHEDULES}, got {self.alpha_schedule!r}"
+            )
+        self.retention_margin = _check_margin("retention_margin", self.retention_margin)
         if not isinstance(self.retention_margins, Mapping):
             raise ValueError(f"retention_margins must be a mapping, got {self.retention_margins!r}")
         margins: dict[str, float] = {}
@@ -123,7 +140,7 @@ class GateConfig:
             if not isinstance(key, str) or not key:
                 raise ValueError(f"retention_margins keys must be non-empty slice names, got {key!r}")
             margins[key] = _check_margin(f"retention_margins[{key!r}]", value)
-        object.__setattr__(self, "retention_margins", margins)
+        self.retention_margins = margins
         if not _is_int(self.hold_limit) or self.hold_limit < 1:
             raise ValueError(f"hold_limit must be an int >= 1, got {self.hold_limit!r}")
         try:
@@ -133,11 +150,11 @@ class GateConfig:
         for lam in lambdas:
             if isinstance(lam, bool) or not isinstance(lam, (int, float)) or not (0.0 < lam < 1.0):
                 raise ValueError(f"every shrink lambda must be in (0, 1), got {lam!r}")
-        object.__setattr__(self, "shrink_lambdas", tuple(float(lam) for lam in lambdas))
+        self.shrink_lambdas = tuple(float(lam) for lam in lambdas)
         if not _is_int(self.max_group_rollbacks) or self.max_group_rollbacks < 0:
             raise ValueError(f"max_group_rollbacks must be an int >= 0, got {self.max_group_rollbacks!r}")
         try:
-            object.__setattr__(self, "rollback_unit", RollbackUnit(self.rollback_unit))
+            self.rollback_unit = RollbackUnit(self.rollback_unit)
         except ValueError as exc:
             raise ValueError(f"unknown rollback_unit {self.rollback_unit!r}") from exc
         for name in ("block_updates", "items_per_transfer_slice", "items_per_retention_slice"):
@@ -148,6 +165,51 @@ class GateConfig:
     def margin_for(self, slice_name: str) -> float:
         """Retention margin of ``slice_name`` (override if present, else the default margin)."""
         return self.retention_margins.get(slice_name, self.retention_margin)
+
+    def retention_horizon(
+        self, slice_name: str | None = None, *, n: int | None = None, n10: int = 0, n01: int = 0
+    ) -> int | None:
+        """How many verdicts a binary retention slice with this evidence can keep passing.
+
+        The slice has ``n`` items (default ``items_per_retention_slice``), ``n10`` incumbent-only
+        and ``n01`` candidate-only wins, and is tested at ``margin_for(slice_name)`` (default
+        margin when ``slice_name`` is None) with Tango's score test, as in
+        :func:`~research_rl.capability.stats.noninferiority_upper_bound`. Its p-value ``p`` does
+        not depend on k, and alpha only shrinks with k, so the slice passes exactly at verdicts
+        ``k = 1..K``. Returns:
+
+        * ``"spending"``: ``K`` = the largest ``k`` with ``alpha_k >= p`` (0 if it never passes),
+          or ``None`` (no practical limit) when ``K`` would be ``>= 2**52`` (beyond that
+          ``alpha_k`` is not resolvable per integer ``k`` in double precision) or ``p == 0``.
+        * ``"per_decision"``: ``None`` (every verdict) if ``p <= alpha``, else 0.
+
+        Pure arithmetic on this config; it uses no ledger state.
+        """
+        n_items = self.items_per_retention_slice if n is None else n
+        if not _is_int(n_items) or n_items < 1:
+            raise ValueError(f"n must be an int >= 1, got {n_items!r}")
+        for name, value in (("n10", n10), ("n01", n01)):
+            if not _is_int(value) or value < 0:
+                raise ValueError(f"{name} must be an int >= 0, got {value!r}")
+        if n10 + n01 > n_items:
+            raise ValueError(f"n10 + n01 = {n10 + n01} exceeds n = {n_items}")
+        margin = self.retention_margin if slice_name is None else self.margin_for(slice_name)
+        p_value = normal_cdf(tango_z(n10, n01, n_items, margin))
+        ledger = self.make_ledger()
+        if self.alpha_schedule == "per_decision":
+            return None if p_value <= self.alpha else 0
+        first = ledger.alpha_at(1)
+        if p_value > first:
+            return 0
+        ratio = first / p_value if p_value > 0.0 else math.inf
+        if not ratio < _HORIZON_UNLIMITED**2:
+            return None
+        k = max(1, math.floor(math.sqrt(ratio)))
+        while ledger.alpha_at(k + 1) >= p_value:
+            k += 1
+        while k > 1 and ledger.alpha_at(k) < p_value:
+            k -= 1
+        return k
 
     def make_ledger(self) -> AlphaLedger:
         """A fresh :class:`AlphaLedger` with this config's ``alpha`` and ``alpha_schedule``."""
@@ -177,9 +239,10 @@ class GateConfig:
 class CapabilityGate:
     """Evaluates :class:`GateEvidence` into a :class:`GateVerdict` (statistics only).
 
-    ``ledger`` defaults to ``config.make_ledger()``; a ledger passed explicitly must have the
-    config's ``alpha`` and ``alpha_schedule`` (``ValueError`` otherwise), so the recorded config
-    always describes the alphas actually used.
+    ``ledger`` defaults to ``config.make_ledger()``. A ledger passed explicitly is
+    **authoritative**: its ``total_alpha`` / ``schedule`` are used even when they differ from
+    ``config.alpha`` / ``config.alpha_schedule`` (every :class:`SliceTest` records the alpha
+    actually used, and :meth:`state_dict` stores the ledger's own settings).
     """
 
     def __init__(self, config: GateConfig, ledger: AlphaLedger | None = None) -> None:
@@ -187,11 +250,8 @@ class CapabilityGate:
             raise TypeError(f"config must be a GateConfig, got {type(config).__name__}")
         if ledger is None:
             ledger = config.make_ledger()
-        if ledger.total_alpha != config.alpha or ledger.schedule != config.alpha_schedule:
-            raise ValueError(
-                f"ledger (total_alpha={ledger.total_alpha}, schedule={ledger.schedule!r}) does not match "
-                f"config (alpha={config.alpha}, alpha_schedule={config.alpha_schedule!r})"
-            )
+        if not isinstance(ledger, AlphaLedger):
+            raise TypeError(f"ledger must be an AlphaLedger, got {type(ledger).__name__}")
         self.config = config
         self.ledger = ledger
         self._verdicts = 0
@@ -204,15 +264,43 @@ class CapabilityGate:
     def verdict(self, evidence: GateEvidence) -> GateVerdict:
         """Test one decision's evidence; consumes exactly one alpha from the ledger.
 
-        Transfer slices are pooled (uids must be unique across them, else ``ValueError``); no
-        transfer slice at all yields an ``n=0`` transfer test that does not pass. Each retention
-        slice is tested at its margin. Every resulting :class:`SliceTest` records the alpha used.
-        Validation happens before the alpha is drawn, so invalid evidence does not consume alpha.
+        Transfer slices are pooled; no transfer slice at all yields an ``n=0`` transfer test that
+        does not pass. Each retention slice is tested at its margin. Every resulting
+        :class:`SliceTest` records the alpha used. ``ValueError`` (raised before the alpha is
+        drawn, so invalid evidence does not consume alpha) when:
+
+        * a transfer slice's split is not ``Split.T_RULE`` / ``Split.T_TASK`` (TRAIN items are
+          not held out, and AUDIT items must never reach a training-loop decision);
+        * a retention slice's split is not ``Split.RETENTION``;
+        * a uid appears twice anywhere in the evidence (across transfer slices, across retention
+          slices, or between transfer and retention): every item is evidence exactly once.
+
+        Per-slice margin overrides whose key names no retention slice of this evidence are not
+        an error (evidence may carry a subset of the configured slices); the margin each slice
+        actually used is recorded in its :class:`SliceTest`.
+        Evidence with **no retention slices** yields ``retention=()`` and therefore
+        ``GateVerdict.retention_ok == True`` (vacuous ``all(())`` in ``types.py``); callers that
+        require retention must supply at least one retention slice.
         The verdict is computed identically whether or not ``config.enabled`` is set (see
         :class:`GateConfig`).
         """
         if not isinstance(evidence, GateEvidence):
             raise TypeError(f"evidence must be a GateEvidence, got {type(evidence).__name__}")
+        for p in evidence.transfer:
+            if p.split not in _TRANSFER_SPLITS:
+                raise ValueError(
+                    f"transfer slice {p.slice!r} has split {p.split.value!r}; only "
+                    f"{[s.value for s in _TRANSFER_SPLITS]} may be transfer evidence"
+                )
+        for p in evidence.retention:
+            if p.split is not Split.RETENTION:
+                raise ValueError(f"retention slice {p.slice!r} has split {p.split.value!r}, not 'retention'")
+        owner: dict[str, str] = {}
+        for p in (*evidence.transfer, *evidence.retention):
+            for uid in p.uids:
+                if uid in owner:
+                    raise ValueError(f"uid {uid!r} appears in slices {owner[uid]!r} and {p.slice!r}")
+                owner[uid] = p.slice
         if evidence.transfer:
             pooled = pool_paired(evidence.transfer)
         else:
@@ -250,12 +338,23 @@ class CapabilityGate:
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore ledger position and verdict count; the stored config must equal this gate's."""
+        """Restore ledger position and verdict count; atomic (nothing changes on any error).
+
+        The stored config must equal this gate's, the ledger state must load into this gate's
+        ledger (same ``total_alpha`` / ``schedule``, consistent ``spent``; checked on a scratch
+        copy first), and ``verdicts`` must be an int with ``0 <= verdicts <= ledger count``
+        (every verdict drew one alpha; the ledger may have handed out more if it was shared or
+        pre-used, so equality is not required). ``ValueError`` otherwise.
+        """
         stored = GateConfig.from_dict(state["config"])
         if stored != self.config:
             raise ValueError(f"gate config mismatch: state has {stored}, this gate has {self.config}")
         verdicts = state["verdicts"]
         if not _is_int(verdicts) or verdicts < 0:
             raise ValueError(f"invalid verdict count {verdicts!r}")
+        scratch = AlphaLedger(self.ledger.total_alpha, self.ledger.schedule)
+        scratch.load_state_dict(state["ledger"])
+        if verdicts > scratch.count:
+            raise ValueError(f"verdict count {verdicts} exceeds the ledger's alpha count {scratch.count}")
         self.ledger.load_state_dict(state["ledger"])
         self._verdicts = verdicts
