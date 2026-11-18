@@ -916,18 +916,27 @@ def _measure_final(
 
 
 def oracle_items(
-    sampler: ItemSampler, n: int, decision_index: int, exclude: set[str]
+    sampler: ItemSampler,
+    n: int,
+    decision_index: int,
+    exclude: set[str],
+    *,
+    purpose: str = ORACLE_PURPOSE,
+    slices: Sequence[str] | None = None,
+    pool: str | None = TRACK_POOL,
 ) -> dict[str, list[Item]]:
     """``n`` oracle items per T_RULE slice for one decision: purpose :data:`ORACLE_PURPOSE`, index =
     ``decision_index``, from the tracker pool (so disjoint from every gate item by construction),
-    without any uid in ``exclude`` (start-map and tracker items). Deterministic in the key."""
+    without any uid in ``exclude`` (start-map and tracker items). Deterministic in the key.
+
+    The keyword arguments (defaults = the pilot's oracle) let :mod:`~research_rl.capability.calibration`
+    reuse the same filtered draw: another ``purpose``, other ``slices`` (default every T_RULE slice)
+    and another ``pool`` (``None`` = unpartitioned, :func:`~research_rl.capability.probe.draw_slice`)."""
     out: dict[str, list[Item]] = {}
-    for name in _rule_slices(sampler.splits):
+    for name in _rule_slices(sampler.splits) if slices is None else tuple(slices):
         size = n + 32
         while True:
-            items = draw_slice(
-                sampler, name, size, purpose=ORACLE_PURPOSE, index=decision_index, pool=TRACK_POOL
-            )
+            items = draw_slice(sampler, name, size, purpose=purpose, index=decision_index, pool=pool)
             kept = [it for it in items if it.uid not in exclude]
             if len(kept) >= n:
                 out[name] = kept[:n]
